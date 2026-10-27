@@ -96,6 +96,64 @@ verify points=20000 id_mismatch=2 (ties=2) dist2_mismatch=0 worst_rel=0
 - 所以两边的指纹 `hash` 不同（hash 里含三角形 id），这不是错误。GPU 版本要求的是
   与 **quarry 自己的** tie-break 规则一致（距离相同取场景序号最小），而非与 Embree 一致。
 
+### GPU 后端：LBVH 构建 + 光线遍历（2026-10-27）
+
+`gpu_bench.exe`，与 CPU/Embree 同一场景、同一射线、同一 seed。构建时间只计
+GPU 上的建树（不含 H2D 上传与射线缓冲分配），遍历为 5 轮中位数，每次先校对
+全部射线的命中位与 `t` 位模式。
+
+| 三角形 | 射线 | 构建 | 遍历 | 吞吐 | 平均节点测试 | 平均三角形测试 |
+|---|---|---|---|---|---|---|
+| 8,192 | 200,000 | 1.61 ms | 2.03 ms | 98.44 Mrays/s | 29.9 | 1.9 |
+| 131,072 | 1,000,000 | 2.94 ms | 14.40 ms | 69.45 Mrays/s | 38.7 | 1.9 |
+| 2,097,152 | 1,000,000 | 24.38 ms | 33.75 ms | 29.63 Mrays/s | 47.2 | 1.9 |
+
+对外比较（对手数字取自本文件前面的 Embree 4.4.1 实测，同一场景与射线）：
+
+| 三角形 | GPU | Embree 1T | Embree 32T packet | 对 1T | 对 32T | GPU 构建 / Embree 构建 |
+|---|---|---|---|---|---|---|
+| 8,192 | 98.44 | 8.65 | 60.98 | 11.4× | **1.61×** | 1.61 / 2.13 ms |
+| 131,072 | 69.45 | 4.56 | 96.45 | 15.2× | **0.72×** | 2.94 / 5.5 ms |
+| 2,097,152 | 29.63 | 1.73 | 19.69 | 17.1× | **1.50×** | 24.38 / 68 ms |
+
+构建分阶段（ms）：
+
+| 三角形 | Morton | 排序 | 散射 | 建内部节点 | refit | 合计 |
+|---|---|---|---|---|---|---|
+| 8,192 | 0.84 | 0.36 | 0.02 | 0.08 | 0.32 | 1.61 |
+| 131,072 | 0.61 | 0.67 | 0.15 | 0.30 | 1.20 | 2.94 |
+| 2,097,152 | 1.63 | 3.38 | 2.25 | 3.07 | 14.05 | 24.38 |
+
+读法：
+
+1. **小场景核启动与队列延迟占主导。** 8k 三角形时 GPU 仍打出 98 Mrays/s，但只比
+   Embree 32 线程快 1.6×——射线只有 20 万条，填不满 24 SM。
+2. **131k 是 GPU 的劣势区间（0.72×）。** 整个 2 MB 场景塞进 CPU L2/L3，Embree 的
+   32 线程 packet 遍历几乎不碰内存；GPU 反而要为每条射线付 HBM 延迟。这不是实现
+   缺陷，是负载形状决定的，也是本文件第 1 条结论的另一面。
+3. **2M 反超：1.50× Embree 32T、17× 单线程。** 场景超出 CPU 缓存后，Embree 的节点
+   访问变成随机 DRAM 读取，而 GPU 有 1M 条射线在飞，延迟被完全藏住。
+4. **构建从 10× 落后变成 2.8× 领先。** LBVH 的并行排序比 SAH 的中位数切分更适合
+   GPU；refit 占 2M 场景构建的 58%（31 个深度桶各一次 kernel 启动），是下一个
+   优化点，但当前已比 Embree `rtcCommitScene` 快。
+5. **栈深度不是瓶颈。** 把每线程栈从 64 项压到 32 项，2M 场景遍历 33.74 ms vs
+   33.75 ms，无差别——kernel 受限于显存带宽/延迟，不是占用率。栈已恢复 64
+   （2M 场景树深 31，32 项在一般场景不安全）。
+
+正确性：三个规模全部通过结构校验（每个内部节点包围盒是子节点的逐位并集、每个
+叶子盒逐位等于三角形包围盒、每个非根节点恰好被引用一次、根盒逐位等于场景包围盒），
+且 100% 射线的命中位与 `t` 位模式与 CPU BVH 一致：
+
+```text
+8k    verify rays=200000  hit_mismatch=0 t_mismatch=0  hash=0xd81f6da710bb9800 (cpu==gpu)
+131k  verify rays=1000000 hit_mismatch=0 t_mismatch=0  hash=0xf4a49afdcc3fa8df (cpu==gpu)
+2M    verify rays=1000000 hit_mismatch=0 t_mismatch=0  hash=0xa979843d01b01033 (cpu==gpu)
+```
+
+逐位一致靠的是：几何与求交代码在 host/device 之间共用同一份头文件（`QUARRY_HD`），
+nvcc 关掉 FMA 融合（`--fmad=false`），遍历的节点测试顺序不影响结果（每条射线
+维护自己的 bestT，命中取严格更近者）。
+
 ## 结论
 
 1. **CPU 吞吐随场景大小塌陷一个数量级。** 13 万三角形受缓存保护，32 线程能到 96 Mrays/s；200 万三角形掉到 19.7，属于结构性访存受限，增加线程无用。
@@ -111,6 +169,10 @@ verify points=20000 id_mismatch=2 (ties=2) dist2_mismatch=0 worst_rel=0
 7. **单线程 closest 查询已和 Embree 同档（0.77–0.82×），不需要再优化 CPU 路径。**
    CPU 侧欠的是多线程（11×）和构建（9.5×）；这两项在 GPU 上会同时被改写，
    所以 CPU 参考实现停在"正确性基线"就够了。
+8. **GPU 的价值随场景大小增长，不是无条件 3×。** 131k 时 0.72×、2M 时 1.50×
+   Embree 32T，拐点就是 CPU 缓存装不下场景的位置。对外表述必须带规模口径。
+9. **GPU 构建已经全面领先**（1.3×/1.9×/2.8× Embree），因为 LBVH 天然并行；
+   下一轮把 refit 从"每个深度一次启动"改成单 kernel 的并行 pull 可以再砍一半。
 
 ## 正确性交叉核对
 
@@ -160,6 +222,10 @@ bench\embree_bench.exe --query closest --grid 256  --points 20000 --threads 32 -
 bench\embree_bench.exe --query closest --grid 1024 --points 20000 --threads 1  --runs 5
 bench\embree_bench.exe --query closest --grid 1024 --points 20000 --threads 32 --runs 5
 bench\embree_bench.exe --query closest --grid 256  --points 20000 --threads 1 --verify 20000
+
+build\gpu_bench.exe --grid 64   --rays 200000  --runs 5 --stats
+build\gpu_bench.exe --grid 256  --rays 1000000 --runs 5 --stats
+build\gpu_bench.exe --grid 1024 --rays 1000000 --runs 5 --stats
 ```
 
 ## 已知缺口
@@ -167,6 +233,10 @@ bench\embree_bench.exe --query closest --grid 256  --points 20000 --threads 1 --
 - 只有两种几何（地形网格、随机三角形），缺非均匀模型（Stanford Dragon / Lucy）
 - 命中率只有 100%（垂直向下）和约 31%（远处随机朝向），缺多层遮挡
 - 只有一个 GPU 型号，每瓦数据要等 M1
+- GPU 侧还只有射线求交：closest/kNN/radius 的 GPU 版本未开工
+- GPU 遍历还没做射线排序（Morton 序）与内联子节点包围盒，这是 131k 落后
+  Embree 32T 的两个直接原因
+- GPU 外部对照只有 CPU 侧 Embree，Warp `bvh.ray_trace` 对照待 M1
 - 查询外部对照只有 CPU 侧（Embree `rtcPointQuery`），GPU 侧 Warp `bvh.query_closest` 待 M1 接入
 - kNN / radius 还没有外部对照，Embree 没有这两种查询的原生入口
 - 第一轮结果（不同场景、20 万条射线）已作废，勿引用

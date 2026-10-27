@@ -9,3 +9,5 @@ out/
 compile_commands.json
 
 *.dll
+*.lib
+*.exp

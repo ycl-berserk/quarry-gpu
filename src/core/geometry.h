@@ -4,19 +4,28 @@
 #include <cmath>
 #include <limits>
 
+// 这份头文件同时被 CPU 参考实现和 CUDA kernel 包含：nvcc 下把 inline 函数标成
+// __host__ __device__，两端就是同一份求交算术（同样的运算顺序、同样的舍入），
+// CPU/GPU 的指纹对拍才有意义。
+#if defined(__CUDACC__)
+#define QUARRY_HD __host__ __device__
+#else
+#define QUARRY_HD
+#endif
+
 // 本项目所有几何都用 float：GPU 上 float 是默认精度，CPU 参考实现保持一致，
 // 否则跨端比较时会混入精度差异。
 struct Vec3 {
     float x = 0.0f, y = 0.0f, z = 0.0f;
 };
 
-inline Vec3 operator+(const Vec3& a, const Vec3& b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
-inline Vec3 operator-(const Vec3& a, const Vec3& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
-inline Vec3 operator-(const Vec3& a) { return {-a.x, -a.y, -a.z}; }
-inline Vec3 operator*(const Vec3& a, float s) { return {a.x * s, a.y * s, a.z * s}; }
-inline Vec3 operator*(float s, const Vec3& a) { return a * s; }
-inline float dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-inline Vec3 cross(const Vec3& a, const Vec3& b) {
+QUARRY_HD inline Vec3 operator+(const Vec3& a, const Vec3& b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+QUARRY_HD inline Vec3 operator-(const Vec3& a, const Vec3& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+QUARRY_HD inline Vec3 operator-(const Vec3& a) { return {-a.x, -a.y, -a.z}; }
+QUARRY_HD inline Vec3 operator*(const Vec3& a, float s) { return {a.x * s, a.y * s, a.z * s}; }
+QUARRY_HD inline Vec3 operator*(float s, const Vec3& a) { return a * s; }
+QUARRY_HD inline float dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+QUARRY_HD inline Vec3 cross(const Vec3& a, const Vec3& b) {
     return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
 }
 inline float length(const Vec3& a) { return std::sqrt(dot(a, a)); }
@@ -24,7 +33,7 @@ inline Vec3 normalize(const Vec3& a) {
     const float l = length(a);
     return l > 0.0f ? a * (1.0f / l) : Vec3{};
 }
-inline float component(const Vec3& v, int axis) {
+QUARRY_HD inline float component(const Vec3& v, int axis) {
     return axis == 0 ? v.x : (axis == 1 ? v.y : v.z);
 }
 
@@ -36,26 +45,26 @@ struct AABB {
             -std::numeric_limits<float>::infinity(),
             -std::numeric_limits<float>::infinity()};
 
-    void extend(const Vec3& p) {
-        mn.x = std::min(mn.x, p.x);
-        mn.y = std::min(mn.y, p.y);
-        mn.z = std::min(mn.z, p.z);
-        mx.x = std::max(mx.x, p.x);
-        mx.y = std::max(mx.y, p.y);
-        mx.z = std::max(mx.z, p.z);
+    QUARRY_HD void extend(const Vec3& p) {
+        mn.x = p.x < mn.x ? p.x : mn.x;
+        mn.y = p.y < mn.y ? p.y : mn.y;
+        mn.z = p.z < mn.z ? p.z : mn.z;
+        mx.x = p.x > mx.x ? p.x : mx.x;
+        mx.y = p.y > mx.y ? p.y : mx.y;
+        mx.z = p.z > mx.z ? p.z : mx.z;
     }
 
-    void extend(const AABB& b) {
+    QUARRY_HD void extend(const AABB& b) {
         if (!b.valid()) return;
         extend(b.mn);
         extend(b.mx);
     }
 
-    bool valid() const { return mn.x <= mx.x && mn.y <= mx.y && mn.z <= mx.z; }
-    Vec3 center() const { return (mn + mx) * 0.5f; }
-    Vec3 extent() const { return mx - mn; }
+    QUARRY_HD bool valid() const { return mn.x <= mx.x && mn.y <= mx.y && mn.z <= mx.z; }
+    QUARRY_HD Vec3 center() const { return (mn + mx) * 0.5f; }
+    QUARRY_HD Vec3 extent() const { return mx - mn; }
 
-    float surfaceArea() const {
+    QUARRY_HD float surfaceArea() const {
         if (!valid()) return 0.0f;
         const Vec3 d = mx - mn;
         return 2.0f * (d.x * d.y + d.y * d.z + d.z * d.x);
@@ -73,7 +82,7 @@ struct Ray {
 struct Tri {
     Vec3 a, b, c;
 
-    AABB bounds() const {
+    QUARRY_HD AABB bounds() const {
         AABB box;
         box.extend(a);
         box.extend(b);
@@ -90,14 +99,14 @@ struct RayHit {
 };
 
 // Möller–Trumbore。det 很小时视为平行；t 必须落在 [tMin, tMax]。
-inline bool intersectTriangle(const Ray& ray, const Tri& tri, float& tOut) {
+QUARRY_HD inline bool intersectTriangle(const Ray& ray, const Tri& tri, float& tOut) {
     constexpr float kEps = 1e-7f;
 
     const Vec3 e1 = tri.b - tri.a;
     const Vec3 e2 = tri.c - tri.a;
     const Vec3 p = cross(ray.dir, e2);
     const float det = dot(e1, p);
-    if (std::fabs(det) < kEps) return false;
+    if (fabsf(det) < kEps) return false;
 
     const float inv = 1.0f / det;
     const Vec3 tv = ray.origin - tri.a;
@@ -128,14 +137,14 @@ struct ClosestHit {
 
 // 查询结果统一按 (平方距离, 场景索引) 升序：距离并列时顺序也必须可复现，
 // 否则 CPU 和 GPU 的指纹对不上。
-inline bool closerHit(const ClosestHit& a, const ClosestHit& b) {
+QUARRY_HD inline bool closerHit(const ClosestHit& a, const ClosestHit& b) {
     return a.dist2 < b.dist2 || (a.dist2 == b.dist2 && a.triangle < b.triangle);
 }
 
 // Ericson, Real-Time Collision Detection 5.1.5：先把平面外区域划成 7 块，
 // 落在哪块就投影到对应的顶点/边/面。三次叉积换来的是一串点乘，
 // 没有除法直到最后一步，GPU 上也好移植。
-inline ClosestHit closestPointOnTriangle(const Vec3& p, const Tri& tri) {
+QUARRY_HD inline ClosestHit closestPointOnTriangle(const Vec3& p, const Tri& tri) {
     const Vec3 ab = tri.b - tri.a;
     const Vec3 ac = tri.c - tri.a;
     const Vec3 ap = p - tri.a;
@@ -199,7 +208,7 @@ inline ClosestHit closestPointOnTriangle(const Vec3& p, const Tri& tri) {
 }
 
 // 点到 AABB 的平方距离。给最近点遍历当优先队列的键，也给 kNN 剪枝当下界。
-inline float distanceSquaredToAABB(const Vec3& p, const AABB& box) {
+QUARRY_HD inline float distanceSquaredToAABB(const Vec3& p, const AABB& box) {
     float d2 = 0.0f;
     for (int axis = 0; axis < 3; ++axis) {
         const float v = component(p, axis);
@@ -217,7 +226,7 @@ inline float distanceSquaredToAABB(const Vec3& p, const AABB& box) {
 }
 
 // AABB slab 测试。tMax 传入当前最近命中距离，用于剪枝。
-inline bool intersectAABB(const Ray& ray, const AABB& box, float tMax, float& tEnter) {
+QUARRY_HD inline bool intersectAABB(const Ray& ray, const AABB& box, float tMax, float& tEnter) {
     float t0 = ray.tMin;
     float t1 = tMax;
 
@@ -227,7 +236,7 @@ inline bool intersectAABB(const Ray& ray, const AABB& box, float tMax, float& tE
         const float lo = component(box.mn, axis);
         const float hi = component(box.mx, axis);
 
-        if (std::fabs(d) < 1e-20f) {
+        if (fabsf(d) < 1e-20f) {
             if (o < lo || o > hi) return false;
             continue;
         }
@@ -235,10 +244,14 @@ inline bool intersectAABB(const Ray& ray, const AABB& box, float tMax, float& tE
         const float inv = 1.0f / d;
         float ta = (lo - o) * inv;
         float tb = (hi - o) * inv;
-        if (ta > tb) std::swap(ta, tb);
+        if (ta > tb) {
+            const float tmp = ta;
+            ta = tb;
+            tb = tmp;
+        }
 
-        t0 = std::max(t0, ta);
-        t1 = std::min(t1, tb);
+        t0 = ta > t0 ? ta : t0;
+        t1 = tb < t1 ? tb : t1;
         if (t0 > t1) return false;
     }
 

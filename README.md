@@ -4,7 +4,9 @@
 
 GPU 原生空间查询引擎：构建加速结构（BVH / 八叉树 / 哈希网格），支持射线求交、kNN、半径查询、AABB 查询，图元覆盖三角形、点云、高斯，并支持增量更新。
 
-许可证 Apache-2.0（见 `LICENSE`）。代码目前只有 CPU 参考实现，GPU 部分从 M0 开始。
+许可证 Apache-2.0（见 `LICENSE`）。CPU 参考实现已完整；GPU 侧（CUDA 12.4，sm_89）已有
+并行 LBVH 构建与光线遍历，最近点 / kNN / 半径的 GPU 版本在推进中。没有 CUDA 工具链时
+自动降级为纯 CPU 构建，CI 与本文档的 CPU 数字不受影响。
 
 ## 现在能跑什么
 
@@ -15,6 +17,8 @@ build\quarry.exe run --scene terrain --grid 256 --rays 1000000 --engine bvh
 build\quarry.exe query --type closest --grid 256 --points 20000 --stats
 build\quarry.exe query --type knn --k 16 --grid 256 --points 20000
 build\quarry.exe query --type radius --radius 2.0 --grid 256 --points 20000
+
+build\gpu_bench.exe --grid 256 --rays 1000000 --runs 5 --stats   :: GPU 建树 + 遍历，逐条对拍 CPU
 ```
 
 输出包含一个**正确性指纹**（每条射线的命中标志 + t 值，按 FNV-1a 折叠）：
@@ -36,6 +40,7 @@ fingerprint queries=20000 results=20000 sum_dist2=392670.867797 hash=0x254ce454a
 ```
 
 GPU 版本必须给出**同样的 hits 和 hash**。这是项目里最硬的一条约束，比任何吞吐数字都重要。
+三个规模（8k / 131k / 2M）上 GPU 与 CPU 的指纹已逐位相同，包括每一条射线的 `t` 位模式。
 
 ## 与 Embree 同条件对比
 
@@ -59,6 +64,22 @@ bench\embree_bench.exe --grid 256 --rays 500 --threads 1 --verify 500
 i9-14900HX（24 核 32 线程），1M 条射线，垂直向下，命中率 100%，5 轮中位数。
 
 注意 CPU 基线随场景大小塌陷一个数量级：13 万三角形能跑 96 Mrays/s，200 万只有 19.7。前者受缓存保护，后者结构性访存受限。**"GPU 快 3×"只在大场景口径下讨论**；小场景的价值是 CPU 占用为零。
+
+### GPU 后端
+
+RTX 4060 Laptop（24 SM，50 W 功耗墙），同一场景、同一射线、同一 seed：
+
+| 三角形 | GPU 遍历 | GPU 构建 | Embree 1T | Embree 32T packet | 对 1T | 对 32T |
+|---|---|---|---|---|---|---|
+| 8,192 | 98.44 Mrays/s | 1.61 ms | 8.65 | 60.98 | 11.4× | 1.61× |
+| 131,072 | 69.45 Mrays/s | 2.94 ms | 4.56 | 96.45 | 15.2× | 0.72× |
+| 2,097,152 | 29.63 Mrays/s | 24.38 ms | 1.73 | 19.69 | 17.1× | 1.50× |
+
+- **拐点在 CPU 缓存边界**：13 万三角形整个场景进 L3，Embree 32 线程无内存压力，GPU 落后；
+  200 万三角形超出缓存后 GPU 反超 1.5×。对外表述必须带规模口径。
+- **构建全面领先**（1.3× / 1.9× / 2.8× Embree `rtcCommitScene`），LBVH 的并行排序
+  天然适合 GPU。2M 构建里 refit 占 14.05/24.38 ms，是下一个优化目标。
+- 结论来自 `gpu_bench.exe` 的实测，完整分阶段数据与反例记录见 `docs/baseline.md`。
 
 ### 最近点查询
 
@@ -91,18 +112,21 @@ i9-14900HX（24 核 32 线程），1M 条射线，垂直向下，命中率 100%�
 ## 目录
 
 ```text
-src/core/     几何、场景生成、射线的可复现输入
+src/core/     几何、场景生成、射线的可复现输入（host/device 共用）
 src/cpu/      暴力法真值 + 朴素 BVH 参照
+src/gpu/      CUDA：并行 LBVH 构建（lbvh.cu）、光线遍历（raycast.cu）
 src/cli/      quarry 命令行
-bench/        Embree 对照程序（同一份输入）
+bench/        Embree 对照程序与 gpu_bench（同一份输入）
 tests/        自测入口
 learn/        教程配套的单文件练习
 ```
 
 ## 已知限制
 
-- 只有中位数切分，没有 SAH
-- 只有 CPU 单线程路径
+- CPU 参考实现只有中位数切分、只有单线程
+- GPU 侧目前只有射线求交；closest / kNN / radius 的 GPU 版本未开工
+- GPU 遍历尚未做射线排序（Morton 序）与内联子节点包围盒，这是 13 万三角形
+  落后 Embree 32T（0.72×）的两个直接原因
 - 场景类型只有地形网格和随机三角形，缺非均匀模型（Dragon/Lucy）与多层遮挡
 - 最近点查询已和 Embree 对拍（单线程同档，多线程差 11×）；kNN / 半径还没有外部对照，
   因为对标实现不提供这两种原生入口；GPU 侧 Warp 对照待 M1
