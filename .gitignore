@@ -1,0 +1,11 @@
+build/
+out/
+*.exe
+*.obj
+*.pdb
+*.ilk
+.vs/
+.cache/
+compile_commands.json
+
+*.dll
