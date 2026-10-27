@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -23,7 +24,9 @@ struct Options {
     int grid = 1024;
     int randomTris = 0;
     std::string scene = "terrain";
+    std::string query = "rays";  // rays | closest
     int rays = 200000;
+    int points = 20000;
     int threads = 1;
     int runs = 5;
     bool packets = false;
@@ -38,12 +41,14 @@ void printUsage() {
         "  --scene terrain|random|mixed   default terrain\n"
         "  --grid N                       三角形数 = 2*N^2\n"
         "  --random-tris N\n"
+        "  --query rays|closest           default rays\n"
         "  --rays N                       default 200000\n"
+        "  --points N                     closest 模式的查询点数，default 20000\n"
         "  --threads N                    default 1\n"
         "  --runs N                       default 5\n"
         "  --mode down|random             default down\n"
-        "  --packets                      use rtcIntersect4\n"
-        "  --verify N                     与 Möller–Trumbore 暴力法交叉核对 N 条射线\n");
+        "  --packets                      use rtcIntersect4（只对 rays 有效）\n"
+        "  --verify N                     与暴力法交叉核对 N 条射线 / N 个查询点\n");
 }
 
 bool parseArgs(int argc, char** argv, Options& opt) {
@@ -72,6 +77,14 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             const char* v = value();
             if (!v) return false;
             opt.rays = std::atoi(v);
+        } else if (arg == "--query") {
+            const char* v = value();
+            if (!v) return false;
+            opt.query = v;
+        } else if (arg == "--points") {
+            const char* v = value();
+            if (!v) return false;
+            opt.points = std::atoi(v);
         } else if (arg == "--threads") {
             const char* v = value();
             if (!v) return false;
@@ -97,6 +110,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
     }
     if (opt.scene == "random" && opt.randomTris == 0) opt.randomTris = 200000;
     if (opt.scene == "mixed" && opt.randomTris == 0) opt.randomTris = 50000;
+    if (opt.query != "rays" && opt.query != "closest") {
+        std::fprintf(stderr, "unknown query mode: %s\n", opt.query.c_str());
+        return false;
+    }
     return true;
 }
 
@@ -171,6 +188,46 @@ void cast4(RTCScene scene, const Ray* rays, RayHit* out4) {
     }
 }
 
+struct PointQueryData {
+    const std::vector<Tri>* tris = nullptr;
+    ClosestHit best;
+};
+
+// Embree 只负责"哪些三角形的包围盒落在这个球里"，精确距离还是自己算。
+// 返回 true 表示半径变了，Embree 会据此收紧后续遍历；这正是最优优先的等价物。
+bool pointQueryFunc(RTCPointQueryFunctionArguments* args) {
+    auto* data = static_cast<PointQueryData*>(args->userPtr);
+    RTCPointQuery* query = args->query;
+    const Vec3 p{query->x, query->y, query->z};
+
+    ClosestHit h = closestPointOnTriangle(p, (*data->tris)[args->primID]);
+    h.triangle = static_cast<int>(args->primID);
+    if (!data->best.found || closerHit(h, data->best)) data->best = h;
+
+    if (h.dist2 < query->radius * query->radius) {
+        query->radius = std::sqrt(h.dist2);
+        return true;
+    }
+    return false;
+}
+
+ClosestHit closestPointEmbree(RTCScene scene, const std::vector<Tri>& tris, const Vec3& p) {
+    RTCPointQueryContext context;
+    rtcInitPointQueryContext(&context);
+
+    RTCPointQuery query{};
+    query.x = p.x;
+    query.y = p.y;
+    query.z = p.z;
+    query.radius = std::numeric_limits<float>::infinity();
+    query.time = 0.0f;
+
+    PointQueryData data;
+    data.tris = &tris;
+    rtcPointQuery(scene, &query, &context, pointQueryFunc, &data);
+    return data.best;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -182,7 +239,9 @@ int main(int argc, char** argv) {
 
     const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed};
     const Scene scene = buildScene(spec);
-    const std::vector<Ray> rays = makeRays(scene.bounds, opt.mode, opt.rays, opt.seed);
+    const std::vector<Ray> rays =
+        opt.query == "rays" ? makeRays(scene.bounds, opt.mode, opt.rays, opt.seed)
+                            : std::vector<Ray>{};
     if (scene.tris.empty()) {
         std::fprintf(stderr, "empty scene\n");
         return 1;
@@ -219,6 +278,84 @@ int main(int argc, char** argv) {
     rtcCommitScene(embreeScene);
     const double buildMs = nowMs() - tBuild0;
     checkDevice(device);
+
+    if (opt.query == "closest") {
+        const std::vector<Vec3> points = makeQueryPoints(scene.bounds, opt.points, opt.seed);
+        std::vector<ClosestHit> results(points.size());
+
+        std::vector<double> timingRuns;
+        timingRuns.reserve(static_cast<size_t>(opt.runs));
+        for (int run = 0; run < opt.runs; ++run) {
+            const int chunk =
+                (static_cast<int>(points.size()) + opt.threads - 1) / opt.threads;
+
+            const double t0 = nowMs();
+            std::vector<std::thread> workers;
+            for (int w = 0; w < opt.threads; ++w) {
+                const int begin = w * chunk;
+                const int end = std::min(static_cast<int>(points.size()), begin + chunk);
+                if (begin >= end) break;
+
+                workers.emplace_back([&, begin, end]() {
+                    for (int i = begin; i < end; ++i) {
+                        results[i] = closestPointEmbree(embreeScene, scene.tris, points[i]);
+                    }
+                });
+            }
+            for (auto& w : workers) w.join();
+            timingRuns.push_back(nowMs() - t0);
+        }
+
+        std::sort(timingRuns.begin(), timingRuns.end());
+        const double median = timingRuns[timingRuns.size() / 2];
+
+        QueryStats stats;
+        for (const ClosestHit& h : results) stats.add(h);
+
+        std::printf("scene=%s tris=%zu points=%d threads=%d\n", opt.scene.c_str(), numTris,
+                    opt.points, opt.threads);
+        std::printf("build_ms=%.2f runs=%d median_ms=%.2f min_ms=%.2f max_ms=%.2f Mqueries_s=%.2f\n",
+                    buildMs, opt.runs, median, timingRuns.front(), timingRuns.back(),
+                    median > 0.0 ? points.size() / (median * 1e3) : 0.0);
+        std::printf("embree %s\n", stats.summary().c_str());
+
+        if (opt.verify > 0) {
+            const int count = std::min(opt.verify, static_cast<int>(points.size()));
+            int idMismatch = 0;
+            int tieMismatch = 0;
+            int distMismatch = 0;
+            float worstRel = 0.0f;
+            for (int i = 0; i < count; ++i) {
+                const ClosestHit a = closestPointBrute(scene, points[i]);
+                const ClosestHit b = closestPointEmbree(embreeScene, scene.tris, points[i]);
+                if (a.found != b.found || a.triangle != b.triangle) {
+                    ++idMismatch;
+                    // 等距不同的三角形是合法的"两个正确答案"，只要距离一致就不算错。
+                    if (a.found && b.found && a.dist2 == b.dist2) ++tieMismatch;
+                }
+                if (a.found != b.found) {
+                    ++distMismatch;
+                    continue;
+                }
+                if (!a.found) continue;
+                const float rel = std::fabs(a.dist2 - b.dist2) / std::max(1.0f, a.dist2);
+                worstRel = std::max(worstRel, rel);
+                if (rel > 1e-6f) ++distMismatch;
+            }
+            std::printf(
+                "verify points=%d id_mismatch=%d (ties=%d) dist2_mismatch=%d worst_rel=%.3g\n",
+                count, idMismatch, tieMismatch, distMismatch, worstRel);
+            if (distMismatch || idMismatch != tieMismatch) {
+                rtcReleaseScene(embreeScene);
+                rtcReleaseDevice(device);
+                return 2;
+            }
+        }
+
+        rtcReleaseScene(embreeScene);
+        rtcReleaseDevice(device);
+        return 0;
+    }
 
     std::vector<double> timings;
     timings.reserve(static_cast<size_t>(opt.runs));

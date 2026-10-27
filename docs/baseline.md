@@ -61,6 +61,41 @@
 | kNN k=16 | 4.04 ms/查询 | 7.0 µs | 576× |
 | radius r=2.0 | 2.16 ms/查询 | 5.8 µs | 374× |
 
+### 外部对照：Embree 4.4.1 `rtcPointQuery`（2026-10-27）
+
+同一份场景生成器、同一批查询点（`--seed` 相同），20,000 个点，5 轮中位数。
+Embree 走 `rtcPointQuery` + 回调收紧半径（半径从 ∞ 开始，找到第一个三角形后逐步收缩，
+等价于 BVH 的最优优先遍历）。
+
+| 三角形 | 实现 | 线程 | 构建 | 时间 | 吞吐 | 对 Embree 单线程 |
+|---|---|---|---|---|---|---|
+| 131,072 | quarry BVH | 1 | 58.5 ms | 111.6 ms | 0.18 Mq/s | 0.77× |
+| 131,072 | Embree | 1 | 14.7 ms | 85.5 ms | 0.23 Mq/s | 1.00× |
+| 131,072 | Embree | 32 | 11.0 ms | 10.3 ms | 1.93 Mq/s | 10.8× |
+| 2,097,152 | quarry BVH | 1 | 1166 ms | 394.1 ms | 0.05 Mq/s | 0.82× |
+| 2,097,152 | Embree | 1 | 123.6 ms | 323.2 ms | 0.06 Mq/s | 1.00× |
+| 2,097,152 | Embree | 32 | 92.8 ms | 34.1 ms | 0.59 Mq/s | 11.6× |
+
+读法：
+
+1. **单线程上 quarry 与 Embree 同档（0.77× / 0.82×）。** 点查询在 Embree 里也是标量
+   回调路径，没有 SIMD 可吃；两边瓶颈都是随机访存，不是指令数。
+2. **差距全在多线程。** Embree 32 线程拉出 11×，quarry 只有单线程路径。这正是 M0 要
+   用 GPU 抢的位置——把 10 万条随机查询的延迟同时挂起来。
+3. 构建仍差 9.5×（1166 vs 124 ms，2M 场景），中位数切分 vs SAH 的预期结果。
+
+逐条对拍（`--verify 20000`）：
+
+```text
+verify points=20000 id_mismatch=2 (ties=2) dist2_mismatch=0 worst_rel=0
+```
+
+- 20,000 个点的平方距离**逐位相同**，`sum_dist2` 两边都是 392670.867797（131k）/ 393145.161104（2M）。
+- 三角形 id 一致 19,998/20,000。剩下 2 个是地形平面上的**等距平局**：查询点正好落在
+  多个三角形共享的位置，两边各选了一个正确答案，距离完全相同。
+- 所以两边的指纹 `hash` 不同（hash 里含三角形 id），这不是错误。GPU 版本要求的是
+  与 **quarry 自己的** tie-break 规则一致（距离相同取场景序号最小），而非与 Embree 一致。
+
 ## 结论
 
 1. **CPU 吞吐随场景大小塌陷一个数量级。** 13 万三角形受缓存保护，32 线程能到 96 Mrays/s；200 万三角形掉到 19.7，属于结构性访存受限，增加线程无用。
@@ -73,6 +108,9 @@
    而不是靠单线程把指令数压下去。M0 的对照实验必须以这个口径设计。
 6. **kNN 的剪枝阈值靠第 k 近距离，随机三角形场景里收敛很慢**（264 次节点测试，
    比 closest 多 63%）。点云和稠密表面会更极端，这里需要一个"提前退出"策略。
+7. **单线程 closest 查询已和 Embree 同档（0.77–0.82×），不需要再优化 CPU 路径。**
+   CPU 侧欠的是多线程（11×）和构建（9.5×）；这两项在 GPU 上会同时被改写，
+   所以 CPU 参考实现停在"正确性基线"就够了。
 
 ## 正确性交叉核对
 
@@ -116,6 +154,12 @@ bench\embree_bench.exe --grid 256  --rays 1000000 --threads 1  --runs 5
 bench\embree_bench.exe --grid 256  --rays 1000000 --threads 32 --packets --runs 5
 bench\embree_bench.exe --grid 1024 --rays 1000000 --threads 1  --runs 5
 bench\embree_bench.exe --grid 1024 --rays 1000000 --threads 32 --packets --runs 5
+
+bench\embree_bench.exe --query closest --grid 256  --points 20000 --threads 1  --runs 5
+bench\embree_bench.exe --query closest --grid 256  --points 20000 --threads 32 --runs 5
+bench\embree_bench.exe --query closest --grid 1024 --points 20000 --threads 1  --runs 5
+bench\embree_bench.exe --query closest --grid 1024 --points 20000 --threads 32 --runs 5
+bench\embree_bench.exe --query closest --grid 256  --points 20000 --threads 1 --verify 20000
 ```
 
 ## 已知缺口
@@ -123,5 +167,6 @@ bench\embree_bench.exe --grid 1024 --rays 1000000 --threads 32 --packets --runs 
 - 只有两种几何（地形网格、随机三角形），缺非均匀模型（Stanford Dragon / Lucy）
 - 命中率只有 100%（垂直向下）和约 31%（远处随机朝向），缺多层遮挡
 - 只有一个 GPU 型号，每瓦数据要等 M1
-- 查询只有内部对照（暴力法），缺外部对照：Embree `rtcPointQuery`（CPU）、Warp `bvh.query_closest`（GPU）
+- 查询外部对照只有 CPU 侧（Embree `rtcPointQuery`），GPU 侧 Warp `bvh.query_closest` 待 M1 接入
+- kNN / radius 还没有外部对照，Embree 没有这两种查询的原生入口
 - 第一轮结果（不同场景、20 万条射线）已作废，勿引用
