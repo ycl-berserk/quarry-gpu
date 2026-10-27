@@ -1,5 +1,7 @@
 # quarry
 
+[![CI](https://github.com/ycl-berserk/quarry-gpu/actions/workflows/build.yml/badge.svg)](https://github.com/ycl-berserk/quarry-gpu/actions/workflows/build.yml)
+
 GPU 原生空间查询引擎：构建加速结构（BVH / 八叉树 / 哈希网格），支持射线求交、kNN、半径查询、AABB 查询，图元覆盖三角形、点云、高斯，并支持增量更新。
 
 许可证 Apache-2.0（见 `LICENSE`）。代码目前只有 CPU 参考实现，GPU 部分从 M0 开始。
