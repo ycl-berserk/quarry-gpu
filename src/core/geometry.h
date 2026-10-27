@@ -226,9 +226,11 @@ QUARRY_HD inline float distanceSquaredToAABB(const Vec3& p, const AABB& box) {
 }
 
 // AABB slab 测试。tMax 传入当前最近命中距离，用于剪枝。
+// 盒入口 t 和三角形 t 由不同表达式算出，可能差几个 ulp；剪枝阈值留一点余量，
+// 否则会把"盒入口略大于 best、三角形本身略小于 best"的真实命中挡在门外。
 QUARRY_HD inline bool intersectAABB(const Ray& ray, const AABB& box, float tMax, float& tEnter) {
     float t0 = ray.tMin;
-    float t1 = tMax;
+    float t1 = tMax * (1.0f + 1e-6f) + 1e-6f;
 
     for (int axis = 0; axis < 3; ++axis) {
         const float o = component(ray.origin, axis);

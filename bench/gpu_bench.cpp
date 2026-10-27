@@ -37,6 +37,9 @@ struct Options {
     bool verify = true;
     bool cpu = true;
     bool stats = false;
+    enum class RaySort { None, Host, Gpu, GpuDir };
+    RaySort raySort = RaySort::None;
+    int diagRay = -1;
 };
 
 void printUsage() {
@@ -51,6 +54,10 @@ void printUsage() {
         "  --runs N                       计时轮数，取中位数，default 5\n"
         "  --seed N                       default 1\n"
         "  --stats                        额外跑一轮带计数的遍历\n"
+        "  --ray-sort                     GPU 内按原点 Morton 序重排射线（端到端计时）\n"
+        "  --ray-sort-dir                 GPU 内按方向 Morton 序重排（次生射线用）\n"
+        "  --ray-sort-host                主机排序后上传，只测遍历收益（对照实验）\n"
+        "  --diag-ray N                   打印第 N 条射线的 CPU/GPU/暴力三方命中\n"
         "  --verify / --no-verify         是否逐条射线对拍（default verify）\n"
         "  --no-cpu                       跳过 CPU 参考遍历（大场景省时间）\n");
 }
@@ -96,6 +103,16 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             opt.mode = std::strcmp(v, "random") == 0 ? RayMode::Random : RayMode::Down;
         } else if (arg == "--stats") {
             opt.stats = true;
+        } else if (arg == "--ray-sort") {
+            opt.raySort = Options::RaySort::Gpu;
+        } else if (arg == "--ray-sort-dir") {
+            opt.raySort = Options::RaySort::GpuDir;
+        } else if (arg == "--ray-sort-host") {
+            opt.raySort = Options::RaySort::Host;
+        } else if (arg == "--diag-ray") {
+            const char* v = needValue("--diag-ray");
+            if (!v) return false;
+            opt.diagRay = std::atoi(v);
         } else if (arg == "--verify") {
             opt.verify = true;
         } else if (arg == "--no-verify") {
@@ -128,6 +145,26 @@ double median(std::vector<double> v) {
     return v[v.size() / 2];
 }
 
+// 21 位/轴的 Morton 码：把原点量化到场景包围盒，让相邻线程落在同一块空间里。
+uint64_t mortonKey(const Vec3& p, const AABB& b) {
+    constexpr int kBits = 21;
+    constexpr float kMax = static_cast<float>((1u << kBits) - 1);
+    auto quantize = [](float v, float lo, float hi) -> uint32_t {
+        if (!(hi > lo)) return 0;
+        float f = (v - lo) / (hi - lo);
+        f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+        return static_cast<uint32_t>(f * kMax + 0.5f);
+    };
+    const uint32_t q[3] = {quantize(p.x, b.mn.x, b.mx.x), quantize(p.y, b.mn.y, b.mx.y),
+                           quantize(p.z, b.mn.z, b.mx.z)};
+    uint64_t key = 0;
+    for (int i = kBits - 1; i >= 0; --i) {
+        key = (key << 3) | (((q[0] >> i) & 1u) << 2) | (((q[1] >> i) & 1u) << 1) |
+              ((q[2] >> i) & 1u);
+    }
+    return key;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -136,6 +173,7 @@ int main(int argc, char** argv) {
         printUsage();
         return argc > 1 ? 1 : 0;
     }
+    int exitCode = 0;
 
     std::string device;
     if (!gpuDescribe(&device)) {
@@ -151,9 +189,17 @@ int main(int argc, char** argv) {
     const Scene scene = buildScene(spec);
     const std::vector<Ray> rays = makeRays(scene.bounds, opt.mode, opt.rays, opt.seed);
 
-    std::printf("scene=%s tris=%zu rays=%zu mode=%s seed=%llu\n", opt.scene.c_str(),
+    const char* orderName = opt.raySort == Options::RaySort::Gpu    ? "morton-gpu"
+                            : opt.raySort == Options::RaySort::GpuDir ? "morton-dir-gpu"
+                            : opt.raySort == Options::RaySort::Host ? "morton-host"
+                                                                    : "input";
+    std::printf("scene=%s tris=%zu rays=%zu mode=%s seed=%llu ray_order=%s\n", opt.scene.c_str(),
                 scene.tris.size(), rays.size(), rayModeName(opt.mode),
-                static_cast<unsigned long long>(opt.seed));
+                static_cast<unsigned long long>(opt.seed), orderName);
+    const bool hostSorted = opt.raySort == Options::RaySort::Host;
+    const RayOrder gpuOrder = opt.raySort == Options::RaySort::Gpu      ? RayOrder::Morton
+                              : opt.raySort == Options::RaySort::GpuDir ? RayOrder::MortonDirection
+                                                                        : RayOrder::Input;
 
     // ---- CPU 参考 ----
     BVH cpuBVH;
@@ -190,16 +236,33 @@ int main(int argc, char** argv) {
     std::printf("gpu tree %s%s\n", treeError.empty() ? "PASS" : "FAIL: ", treeError.c_str());
     if (!treeError.empty()) return 4;
 
+    // ---- 可选：按原点 Morton 序重排射线，只影响遍历顺序，不影响逐条结果 ----
+    std::vector<Ray> uploadRays = rays;
+    std::vector<int> sortedToOrig;
+    if (hostSorted) {
+        const double sortStart = nowMs();
+        std::vector<uint64_t> keys(rays.size());
+        for (size_t i = 0; i < rays.size(); ++i) keys[i] = mortonKey(rays[i].origin, scene.bounds);
+        sortedToOrig.resize(rays.size());
+        for (size_t i = 0; i < rays.size(); ++i) sortedToOrig[i] = static_cast<int>(i);
+        std::sort(sortedToOrig.begin(), sortedToOrig.end(), [&](int a, int b) {
+            return keys[a] != keys[b] ? keys[a] < keys[b] : a < b;
+        });
+        for (size_t i = 0; i < rays.size(); ++i) uploadRays[i] = rays[sortedToOrig[i]];
+        std::printf("ray_sort host_ms=%.2f\n", nowMs() - sortStart);
+    }
+
     const double uploadStart = nowMs();
-    GpuRayBuffer rayBuf = uploadRaysGPU(rays);
+    GpuRayBuffer rayBuf = uploadRaysGPU(uploadRays);
     const double uploadMs = nowMs() - uploadStart;
     std::printf("upload_ms=%.2f\n", uploadMs);
 
     // 预热：第一次 kernel 会带上上下文初始化
-    raycastGPU(gpu, rayBuf);
+    raycastGPU(gpu, rayBuf, false, gpuOrder);
 
     std::vector<double> gpuTimes;
-    for (int run = 0; run < opt.runs; ++run) gpuTimes.push_back(raycastGPU(gpu, rayBuf));
+    for (int run = 0; run < opt.runs; ++run)
+        gpuTimes.push_back(raycastGPU(gpu, rayBuf, false, gpuOrder));
     const double gpuMedian = median(gpuTimes);
     const double gpuBest = *std::min_element(gpuTimes.begin(), gpuTimes.end());
     const double gpuWorst = *std::max_element(gpuTimes.begin(), gpuTimes.end());
@@ -209,21 +272,37 @@ int main(int argc, char** argv) {
                 gpuMedian > 0.0 ? static_cast<double>(rays.size()) / (gpuMedian * 1e3) : 0.0);
 
     if (opt.stats) {
-        raycastGPU(gpu, rayBuf, true);
+        raycastGPU(gpu, rayBuf, true, gpuOrder);
         const GpuTraversalStats st = lastTraversalStatsGPU();
         const double n = static_cast<double>(rays.size());
-        std::printf("gpu traversal avg_node_tests=%.1f avg_tri_tests=%.1f stack_overflows=%llu\n",
+        std::printf("gpu traversal avg_node_tests=%.1f avg_tri_tests=%.1f stack_overflows=%llu "
+                    "ray_sort_ms=%.2f\n",
                     static_cast<double>(st.nodeTests) / n, static_cast<double>(st.triTests) / n,
-                    static_cast<unsigned long long>(st.stackOverflows));
+                    static_cast<unsigned long long>(st.stackOverflows), st.sortMs);
         if (st.stackOverflows != 0) {
             std::printf("gpu traversal FAIL: stack overflow\n");
             return 5;
         }
     }
 
-    // ---- GPU 指纹 ----
+    // ---- GPU 指纹（重排过就先还原成原始射线顺序再折叠） ----
     std::vector<uint64_t> gpuPerRay;
-    const RayStats gpuStats = summarizeGPU(rayBuf, opt.verify ? &gpuPerRay : nullptr);
+    RayStats gpuStats = summarizeGPU(rayBuf, (opt.verify || hostSorted) ? &gpuPerRay : nullptr);
+    if (hostSorted) {
+        std::vector<uint64_t> inOrigOrder(rays.size());
+        for (size_t i = 0; i < rays.size(); ++i) inOrigOrder[sortedToOrig[i]] = gpuPerRay[i];
+        gpuPerRay = std::move(inOrigOrder);
+        gpuStats = RayStats{};
+        for (uint64_t v : gpuPerRay) {
+            RayHit h;
+            h.hit = (v >> 32) != 0;
+            if (h.hit) {
+                const uint32_t bits = static_cast<uint32_t>(v);
+                std::memcpy(&h.t, &bits, sizeof(bits));
+            }
+            gpuStats.add(h);
+        }
+    }
     std::printf("fingerprint gpu %s\n", gpuStats.summary().c_str());
 
     // ---- CPU 参考遍历 ----
@@ -282,14 +361,43 @@ int main(int argc, char** argv) {
                     tMismatch);
         if (worstIdx >= 0) std::printf(" worst_rel=%.3g at ray %d", worstRel, worstIdx);
         std::printf("\n");
-        if (hitMismatch || tMismatch) {
-            destroyRayBufferGPU(rayBuf);
-            destroyBVHGPU(gpu);
-            return 6;
+        if (hitMismatch || tMismatch) exitCode = 6;
+    }
+
+    // ---- 单条射线三方对拍：CPU BVH / GPU BVH / 暴力 ----
+    if (opt.diagRay >= 0 && opt.diagRay < static_cast<int>(rays.size())) {
+        const int i = opt.diagRay;
+        RayHit bf;
+        bf.t = rays[i].tMax;
+        for (size_t k = 0; k < scene.tris.size(); ++k) {
+            float t;
+            if (intersectTriangle(rays[i], scene.tris[k], t) && t < bf.t) {
+                bf.hit = true;
+                bf.t = t;
+                bf.triangle = static_cast<int>(k);
+            }
         }
+        auto printHit = [](const char* who, uint64_t v) {
+            const bool hit = (v >> 32) != 0;
+            uint32_t bits = static_cast<uint32_t>(v);
+            float t = 0.0f;
+            std::memcpy(&t, &bits, sizeof(t));
+            std::printf("diag %s hit=%d t=%.9g bits=0x%08x\n", who, hit ? 1 : 0, t, bits);
+        };
+        std::printf("diag ray=%d\n", i);
+        if (!cpuPerRay.empty()) printHit("cpu", cpuPerRay[i]);
+        if (!gpuPerRay.empty()) printHit("gpu", gpuPerRay[i]);
+        uint64_t bfv = 0;
+        if (bf.hit) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &bf.t, sizeof(bits));
+            bfv = (uint64_t{1} << 32) | bits;
+        }
+        printHit("brute", bfv);
+        std::printf("diag brute triangle=%d\n", bf.triangle);
     }
 
     destroyRayBufferGPU(rayBuf);
     destroyBVHGPU(gpu);
-    return 0;
+    return exitCode;
 }

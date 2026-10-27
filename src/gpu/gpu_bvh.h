@@ -33,9 +33,10 @@ struct GpuBuildTimings {
 
 // 射线与结果都常驻显存：计时只包住 kernel，不含 H2D/D2H。
 struct GpuRayBuffer {
-    void* d_rays = nullptr;     // Ray[]
-    void* d_results = nullptr;  // uint64_t[]，每条射线 (hit<<32 | t 的位表示)
+    void* d_rays = nullptr;         // Ray[]
+    void* d_results = nullptr;      // uint64_t[]，每条射线 (hit<<32 | t 的位表示)
     int count = 0;
+    void* d_sortScratch = nullptr;  // 内部：Morton 序重排的暂存区，复用避免每轮重新分配
 };
 
 // 返回设备名与计算能力；没有可用设备时返回 false 并写 why。
@@ -48,8 +49,15 @@ void destroyBVHGPU(GpuBVH& bvh);
 GpuRayBuffer uploadRaysGPU(const std::vector<Ray>& rays);
 void destroyRayBufferGPU(GpuRayBuffer& buf);
 
+// 遍历前的射线排序。Input 保持上传顺序；Morton 按原点、MortonDirection 按方向
+// 做 63 位 Morton 序重排，让同一 warp 的射线命中同一块 BVH——结果原样散回原下标，
+// 逐条输出与排序无关。排序的建码、CUB 排序、重排和散回都算在返回值里。
+// 原点序适合主射线（相机/竖直射线），方向序适合原点分散的次生射线。
+enum class RayOrder { Input, Morton, MortonDirection };
+
 // 跑一遍遍历，返回 kernel 毫秒数（CUDA event 计时，不含拷贝）。
-double raycastGPU(const GpuBVH& bvh, GpuRayBuffer& buf, bool collectStats = false);
+double raycastGPU(const GpuBVH& bvh, GpuRayBuffer& buf, bool collectStats = false,
+                  RayOrder order = RayOrder::Input);
 
 // 把显存里的逐射线结果按射线顺序折叠成指纹；perRay 非空时顺便拷回主机。
 RayStats summarizeGPU(const GpuRayBuffer& buf, std::vector<uint64_t>* perRay = nullptr);
@@ -59,6 +67,7 @@ struct GpuTraversalStats {
     uint64_t nodeTests = 0;
     uint64_t triTests = 0;
     uint64_t stackOverflows = 0;
+    double sortMs = 0.0;  // 上一次遍历里排序/重排的耗时，Input 顺序为 0
 };
 GpuTraversalStats lastTraversalStatsGPU();
 
