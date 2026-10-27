@@ -15,7 +15,7 @@
 
 namespace {
 
-constexpr int kBlock = 256;
+constexpr int kBlock = 512;
 constexpr int kStack = 64;  // 每层最多压一个远端子节点，depth<=63 的树不会溢出
 
 void cudaOk(cudaError_t err, const char* what) {
