@@ -231,6 +231,78 @@ nvcc 关掉 FMA 融合（`--fmad=false`），遍历顺序不影响结果（每�
 bestT，命中取严格更近者），**且盒测试的剪枝阈值留了浮点余量**——少了最后一条，
 `t` 在 ulp 级就会与访问顺序相关（见上面随机射线的 4 ulp 案例）。
 
+### GPU 点查询：closest / kNN / 半径（2026-10-28）
+
+`gpu_query_bench.exe`，20,000 个查询点，位置与 CPU/Embree 的 `makeQueryPoints` 相同。
+GPU 时间是 CUDA event 包住的 kernel（结果常驻显存，不含 H2D/D2H）；closest 5 轮、
+kNN / radius 3 轮中位数。所有数字与同一次会话里跑的 Embree 对照（下表 Embree 列）。
+
+closest（GPU 每线程一个查询点，显式栈 DFS；剪枝规则和 CPU 相同，并列取场景索引小者）：
+
+| 三角形 | GPU | CPU 1T | Embree 1T | Embree 32T | GPU / Embree 32T | 平均节点 / 三角形测试 |
+|---|---|---|---|---|---|---|
+| 8,192 | 0.421 ms (47.56 Mq/s) | 0.69 | 0.94 | 5.19 | **9.2×** | 74.9 / 13.4 |
+| 131,072 | 1.190 ms (16.81 Mq/s) | 0.22 | 0.24 | 2.52 | **6.7×** | 167.4 / 36.4 |
+| 2,097,152 | 6.772 ms (2.95 Mq/s) | 0.07 | 0.06 | 0.53 | **5.6×** | 477.3 / 124.1 |
+| 1,000,000 random | 3.206 ms (6.24 Mq/s) | 0.05 | 0.02 | 0.27 | **23.4×** | 347.7 / 60.9 |
+
+kNN k=16（每线程维护按 (dist2, 索引) 升序的定长表，上限 32；满 k 后按第 k 近剪枝）：
+
+| 三角形 | GPU | CPU 1T | GPU / CPU | 平均节点 / 三角形测试 |
+|---|---|---|---|---|
+| 8,192 | 2.599 ms (7.70 Mq/s) | 0.29 | 8.9× | 180.0 / 60.6 |
+| 131,072 | 4.698 ms (4.26 Mq/s) | 0.16 | 26.7× | 303.7 / 100.0 |
+| 2,097,152 | 12.231 ms (1.64 Mq/s) | 0.06 | 29.0× | 684.1 / 222.7 |
+
+radius（CSR 两遍遍历：计数 → 前缀和 → 填充 → 段内排序；结果条数上不封顶）：
+
+| 三角形 | 半径 | GPU | CPU 1T | GPU / CPU | 结果数/查询 | 平均节点测试 |
+|---|---|---|---|---|---|---|
+| 8,192 | 2.0 | 0.912 ms (21.92 Mq/s) | 0.93 | 23.7× | 4.3 | 32.4 |
+| 131,072 | 2.0 | 2.534 ms (7.89 Mq/s) | 0.20 | 40.4× | 39.5 | 124.2 |
+| 2,097,152 | 0.5 | 1.855 ms (10.78 Mq/s) | 0.72 | 14.9× | 9.7 | 35.6 |
+
+读法：
+
+1. **GPU closest 全面超过 Embree 32 线程**（9.2× / 6.7× / 5.6×，随机 1M 到 23.4×）。
+   GPU 的 DFS 反而比 CPU 最优优先遍历做了更多节点测试（2M 477 vs 135），但几千个
+   查询同时挂起，把单次访问的 70–100 ns 延迟藏掉了——这正是 10-27 的 CPU 结论里
+   预期由 GPU 改写的那一项。
+2. **kNN 的倍数随规模上升**（8.9× → 29×）：CPU 的第 k 近阈值收敛慢，kNN 的节点数
+   随规模涨得比 closest 快（684 vs 477，2M），但 GPU 上这些额外节点几乎是免费并行。
+3. **radius 是三者里最慢的路径**，因为它要遍历两遍、还要一次前缀和与段内排序。
+   第一版用 CUB 分段基数排序在两万个短段上花了 13 ms；换成每 warp 一个双调网络
+   （段长 ≤ 256，cap 取 2 的幂，尾部补 UINT64_MAX）后排序段降到 ~0.46 ms。
+   超过 256 条的长段（例如半径设到包住整个场景）退回 CUB 分段排序，正确但慢。
+4. **radius 的计时含一次流水线中间的 D2H 同步**：CSR 总长度只有算完前缀和才知道，
+   不同步就没法给填充缓冲定价。closest / kNN 没有这笔开销。
+5. **kNN / radius 没有 Embree 原生入口可对拍**（`rtcPointQuery` 只做最近点），
+   外部对照只有 closest。kNN / radius 的 GPU 正确性靠与自家 CPU 参考逐位对拍，
+   以及后续 Warp 对照补齐。
+
+逐位对拍（20,000 点，GPU 对 CPU 参考 BVH）：
+
+```text
+8k     closest tri_mismatch=0 dist2_mismatch=0  hash=0xcb166f675fbdaf7f (cpu==gpu)
+131k   closest tri_mismatch=0 dist2_mismatch=0  hash=0x254ce454a3bba31f (cpu==gpu)
+2M     closest tri_mismatch=0 dist2_mismatch=0  hash=0x9eef1b6e10b68ca2 (cpu==gpu)
+8k     kNN k=16 count_mismatch=0 tri_mismatch=0 dist2_mismatch=0
+131k   kNN k=16 count_mismatch=0 tri_mismatch=0 dist2_mismatch=0
+2M     kNN k=16 count_mismatch=0 tri_mismatch=0 dist2_mismatch=0
+8k     radius r=2.0 count_mismatch=0 tri_mismatch=0 dist2_mismatch=0
+131k   radius r=2.0 count_mismatch=0 tri_mismatch=0 dist2_mismatch=0
+2M     radius r=0.5 count_mismatch=0 tri_mismatch=0 dist2_mismatch=0
+```
+
+kNN / radius 的指纹是"先折叠结果条数、再逐条折叠 (dist2 位模式, 索引)", CPU 与 GPU
+逐位相同；k=1、k=32 和"半径大到每点几千条"的兜底路径也分别验证过。
+
+**绝对值受电源状态影响明显。** 同一二进制换一个会话，131k 的 kNN 可报 4.7 ms 也可报
+11.3 ms、半径 2.5 也可报 5.4 ms，指纹完全不变——上表倍数是同一次会话里与 Embree /
+CPU 参考连续跑出来的，绝对毫秒只在那一批内可比。新机器或插电状态下复现会更快，
+慢下来时先看是不是在电池/功耗墙上，而不是先怀疑代码。
+
+
 ## 结论
 
 1. **CPU 吞吐随场景大小塌陷一个数量级。** 13 万三角形受缓存保护，32 线程能到 96 Mrays/s；200 万三角形掉到 19.7，属于结构性访存受限，增加线程无用。
@@ -251,8 +323,12 @@ bestT，命中取严格更近者），**且盒测试的剪枝阈值留了浮点�
    1.98× / 6.37×。但同一套排序用在非相干次生射线上反而亏 2 ms，只对主射线开启。
    对外表述必须同时带场景大小、射线类型和是否含排序。
 9. **GPU 构建已经全面领先**（1.3×/1.9×/2.8× Embree，10-27 同场口径）；refit 重写
-   后同场 A/B 再快 2.1–2.7×（2M 6.2→2.7 ms），整树构建约 1.5×。下一步不是继续
-   抠 refit，而是 M1 的增量更新与点/高斯图元。
+   后同场 A/B 再快 2.1–2.7×（2M 6.2→2.7 ms），整树构建约 1.5×。
+10. **GPU 点查询把延迟受限的负载改写成吞吐受限**：closest 9.2× / 6.7× / 5.6×
+    Embree 32T（随机 1M 23.4×），kNN 与 radius 相对 CPU 参考是 9–40×。三者共用
+    "每线程一个显式栈"的骨架，差别只在剪枝阈值；radius 的代价是多一遍遍历和 CSR
+    布局，短段的段内排序必须用 warp 双调，CUB 分段基数排序在两万个短段上是负结果。
+    下一步是 M1 剩余项（Warp 对照、pybind11、增量更新、点/高斯图元）。
 
 ## 正确性交叉核对
 
@@ -310,6 +386,14 @@ build\gpu_bench.exe --grid 256  --rays 1000000 --runs 5 --stats --ray-sort
 build\gpu_bench.exe --grid 1024 --rays 1000000 --runs 5 --stats --ray-sort
 build\gpu_bench.exe --grid 1024 --rays 1000000 --runs 5 --mode random --ray-sort
 build\gpu_bench.exe --grid 1024 --rays 1000000 --runs 1 --mode random --diag-ray 98645
+
+build\gpu_query_bench.exe --grid 64   --points 20000 --runs 5 --stats
+build\gpu_query_bench.exe --grid 256  --points 20000 --runs 5 --stats
+build\gpu_query_bench.exe --grid 1024 --points 20000 --runs 5 --stats
+build\gpu_query_bench.exe --grid 256  --points 20000 --query knn --k 16 --runs 3 --stats
+build\gpu_query_bench.exe --grid 1024 --points 20000 --query knn --k 16 --runs 3 --stats
+build\gpu_query_bench.exe --grid 256  --points 20000 --query radius --radius 2.0 --runs 3 --stats
+build\gpu_query_bench.exe --grid 1024 --points 20000 --query radius --radius 0.5 --runs 3 --stats
 ```
 
 ## 已知缺口
@@ -317,11 +401,12 @@ build\gpu_bench.exe --grid 1024 --rays 1000000 --runs 1 --mode random --diag-ray
 - 只有两种几何（地形网格、随机三角形），缺非均匀模型（Stanford Dragon / Lucy）
 - 命中率只有 100%（垂直向下）和约 31%（远处随机朝向），缺多层遮挡
 - 只有一个 GPU 型号，每瓦数据要等 M1
-- GPU 侧还只有射线求交：closest/kNN/radius 的 GPU 版本未开工
+- GPU 侧已覆盖射线求交与 closest / kNN / radius；kNN 的 k 上限 32（每线程定长表），
+  radius 每条查询的结果数不设上限但长段会退回 CUB 分段排序
 - 射线排序已完成（原点/方向 Morton 序），但只对相干主射线有效；非相干射线需要
   "先粗遍历取命中点、再按命中点排序"的两遍方案，未做
 - 内联子节点包围盒（64B 布局）实测是负结果，已回退；131k 的差距靠射线排序解决
 - GPU 外部对照只有 CPU 侧 Embree，Warp `bvh.ray_trace` 对照待 M1
-- 查询外部对照只有 CPU 侧（Embree `rtcPointQuery`），GPU 侧 Warp `bvh.query_closest` 待 M1 接入
-- kNN / radius 还没有外部对照，Embree 没有这两种查询的原生入口
+- 点查询外部对照只有 closest（Embree `rtcPointQuery`）；kNN / radius 在 Embree 里
+  没有原生入口，GPU 侧 Warp 对照待 M1 接入
 - 第一轮结果（不同场景、20 万条射线）已作废，勿引用

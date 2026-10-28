@@ -5,7 +5,7 @@
 GPU 原生空间查询引擎：构建加速结构（BVH / 八叉树 / 哈希网格），支持射线求交、kNN、半径查询、AABB 查询，图元覆盖三角形、点云、高斯，并支持增量更新。
 
 许可证 Apache-2.0（见 `LICENSE`）。CPU 参考实现已完整；GPU 侧（CUDA 12.4，sm_89）已有
-并行 LBVH 构建与光线遍历，最近点 / kNN / 半径的 GPU 版本在推进中。没有 CUDA 工具链时
+并行 LBVH 构建、光线遍历，以及 closest / kNN / radius 三条点查询路径。没有 CUDA 工具链时
 自动降级为纯 CPU 构建，CI 与本文档的 CPU 数字不受影响。
 
 ## 现在能跑什么
@@ -19,6 +19,9 @@ build\quarry.exe query --type knn --k 16 --grid 256 --points 20000
 build\quarry.exe query --type radius --radius 2.0 --grid 256 --points 20000
 
 build\gpu_bench.exe --grid 256 --rays 1000000 --runs 5 --stats   :: GPU 建树 + 遍历，逐条对拍 CPU
+build\gpu_query_bench.exe --grid 256 --points 20000 --runs 5 --stats          :: GPU 最近点，逐点对拍 CPU
+build\gpu_query_bench.exe --grid 256 --points 20000 --query knn --k 16        :: GPU kNN
+build\gpu_query_bench.exe --grid 256 --points 20000 --query radius --radius 2.0  :: GPU 半径查询
 ```
 
 输出包含一个**正确性指纹**（每条射线的命中标志 + t 值，按 FNV-1a 折叠）：
@@ -86,17 +89,26 @@ RTX 4060 Laptop（24 SM，50 W 功耗墙），同一场景、同一射线、同�
 - 输入序遍历仍然对拍不到 Embree 的 packet 模式（131k 0.74×），对外表述必须带口径。
 - 结论来自 `gpu_bench.exe` 的实测，完整分阶段数据与反例记录见 `docs/baseline.md`。
 
-### 最近点查询
+### 点查询（GPU）
 
-`--query closest`，同一批 2 万个随机查询点，Embree 侧走 `rtcPointQuery`：
+`gpu_query_bench.exe`，20,000 个随机查询点，同一份场景与查询点。closest 与同次会话的
+Embree `rtcPointQuery` 对照；kNN / radius 在 Embree 里没有原生入口，只与 CPU 参考对拍：
 
-| 三角形 | quarry BVH（1 线程） | Embree（1 线程） | Embree（32 线程） |
-|---|---|---|---|
-| 13.1 万 | 0.18 Mq/s | 0.23 Mq/s | 1.93 Mq/s |
-| 200 万 | 0.05 Mq/s | 0.06 Mq/s | 0.59 Mq/s |
+| 三角形 | closest | kNN k=16 | radius | Embree 1T | Embree 32T | closest / 32T |
+|---|---|---|---|---|---|---|
+| 8,192 | 47.56 Mq/s | 7.70 Mq/s | 21.92 Mq/s (r=2.0) | 0.94 | 5.19 | **9.2×** |
+| 131,072 | 16.81 Mq/s | 4.26 Mq/s | 7.89 Mq/s (r=2.0) | 0.24 | 2.52 | **6.7×** |
+| 2,097,152 | 2.95 Mq/s | 1.64 Mq/s | 10.78 Mq/s (r=0.5) | 0.06 | 0.53 | **5.6×** |
+| 1,000,000 random | 6.24 Mq/s | — | — | 0.02 | 0.27 | **23.4×** |
 
-单线程与 Embree 同档（0.77× / 0.82×）——点查询在两边都是标量随机访存受限；
-差距全在多线程。2 万个点的平方距离逐位相同，只有 2 个等距平局选了不同三角形。
+- 三条路径共用**每线程一个显式栈**的 DFS，剪枝规则与 CPU 参考完全一致（下界等于
+  当前最优时仍入栈、并列取场景索引小者），所以 20,000 个点的结果逐位相同。
+- closest 的 GPU DFS 反而比 CPU 最优优先遍历多测节点（2M 477 vs 135），但几千个查询
+  并发把单次 70–100 ns 的冷缓存延迟藏掉了，这正是点查询最该由 GPU 改写的地方。
+- kNN 每线程维护按 `(dist2, 索引)` 升序的定长表（k ≤ 32），满 k 后按第 k 近剪枝；
+  radius 走 CSR 两遍遍历 + 前缀和，段内排序用每 warp 一个双调网络（长段退回 CUB）。
+- radius 的计时含一次流水线中间的同步（CSR 总长度要先算完前缀和才知道）。
+  kNN / radius 的 CPU 参考是 0.2–0.9 Mq/s，GPU 快 9–40×。
 
 ## 我们做什么 / 不做什么
 
@@ -119,7 +131,7 @@ RTX 4060 Laptop（24 SM，50 W 功耗墙），同一场景、同一射线、同�
 ```text
 src/core/     几何、场景生成、射线的可复现输入（host/device 共用）
 src/cpu/      暴力法真值 + 朴素 BVH 参照
-src/gpu/      CUDA：并行 LBVH 构建（lbvh.cu）、光线遍历（raycast.cu）
+src/gpu/      CUDA：并行 LBVH 构建（lbvh.cu）、光线遍历（raycast.cu）、点查询（query.cu）
 src/cli/      quarry 命令行
 bench/        Embree 对照程序与 gpu_bench（同一份输入）
 tests/        自测入口
@@ -129,9 +141,10 @@ learn/        教程配套的单文件练习
 ## 已知限制
 
 - CPU 参考实现只有中位数切分、只有单线程
-- GPU 侧目前只有射线求交；closest / kNN / radius 的 GPU 版本未开工
+- GPU 侧已覆盖射线求交与 closest / kNN / radius 三条点查询；kNN 的 k 上限 32，
+  radius 的结果条数不设上限（长段退回 CUB 分段排序）
 - GPU 射线排序已实现，但只对相干主射线有效；非相干射线需要两遍遍历（先取命中点
   再排序），未做。内联子节点包围盒（64B 布局）实测为负结果，已回退
 - 场景类型只有地形网格和随机三角形，缺非均匀模型（Dragon/Lucy）与多层遮挡
-- 最近点查询已和 Embree 对拍（单线程同档，多线程差 11×）；kNN / 半径还没有外部对照，
-  因为对标实现不提供这两种原生入口；GPU 侧 Warp 对照待 M1
+- closest 的 GPU 版本已和 Embree 32 线程对拍（5.6–23.4×）；kNN / 半径没有 Embree
+  原生入口，GPU 侧的 Warp 对照待补齐

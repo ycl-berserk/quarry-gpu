@@ -50,6 +50,7 @@ if(QUARRY_GPU)
         add_library(quarry_gpu STATIC
             src/gpu/lbvh.cu
             src/gpu/raycast.cu
+            src/gpu/query.cu
         )
         target_include_directories(quarry_gpu PUBLIC src)
         target_link_libraries(quarry_gpu PUBLIC quarry_core PRIVATE CUDA::cudart)
@@ -66,6 +67,9 @@ if(QUARRY_GPU)
 
         add_executable(gpu_bench bench/gpu_bench.cpp)
         target_link_libraries(gpu_bench PRIVATE quarry_gpu)
+
+        add_executable(gpu_query_bench bench/gpu_query_bench.cpp)
+        target_link_libraries(gpu_query_bench PRIVATE quarry_gpu)
         message(STATUS "CUDA ${CUDAToolkit_VERSION} found: building quarry_gpu (sm_${QUARRY_CUDA_ARCH})")
     else()
         message(STATUS "CUDA not found: building CPU-only")
