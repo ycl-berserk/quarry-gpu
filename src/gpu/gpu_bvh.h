@@ -20,6 +20,14 @@ struct GpuBVH {
     int triCount = 0;
     int nodeCount = 0;
     int depth = 0;
+
+    // refit 用的内部节点重放顺序：按 (深度, 编号) 排好，配合 refitOffsets 逐层发射。
+    // 拓扑不变时它也不变，所以建树时算一次、之后每次 refit 直接复用。
+    void* d_refitOrder = nullptr;
+    std::vector<int> refitOffsets;  // 第 d 层的内部节点在 d_refitOrder 里的 [off[d], off[d+1])
+    std::vector<int> primSlot;      // 场景索引 -> 叶子槽，只上传改动三角形时用
+    void* d_stage = nullptr;        // 全量 refit 的上传暂存区，首次用到才分配
+    int stageCount = 0;
 };
 
 struct GpuBuildTimings {
@@ -48,6 +56,27 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings = nullptr);
 // 在计时构建之前空跑一个小 kernel：CUDA 默认懒加载模块，第一次启动 kernel 才会
 // 把整个 cubin 载入设备（~2 ms），不算这一次就把它记到构建头上。
 void warmupBuildGPU();
+
+// ---- 增量更新（M3 的第一块）----
+// 拓扑冻结：只重算叶子盒、再自底向上合并内部节点，树的形状和三角形归属都不变。
+// 因此第 i 个三角形必须还是建树时那个面片（数量相同、顺序不变），否则抛异常。
+// 盒仍然是精确的并集，所以查询结果照样逐位正确；代价是盒子随位移变松、剪枝变差，
+// 位移大到一定程度就该整树重建。
+struct GpuRefitTimings {
+    double uploadMs = 0.0;  // H2D（全量或只上传改动的三角形）
+    double gatherMs = 0.0;  // 按 primIds 重排进叶子顺序 + 重写叶子盒
+    double treeMs = 0.0;    // 逐层合并内部节点
+    double totalMs = 0.0;
+    int updated = 0;        // 本次上传的三角形数
+};
+
+// 全量重传：场景整体动过（或调用方手里只有一份新数组）。
+double refitBVHGPU(GpuBVH& bvh, const Scene& scene, GpuRefitTimings* timings = nullptr);
+
+// 只上传 dirty 里的场景三角形索引（scene 仍传完整的数组）。盒子照旧逐层合并——
+// 合并本身与改动量无关，省下来的是传输。
+double refitBVHGPU(GpuBVH& bvh, const Scene& scene, const std::vector<int>& dirty,
+                   GpuRefitTimings* timings = nullptr);
 
 void destroyBVHGPU(GpuBVH& bvh);
 

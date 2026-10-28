@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -205,6 +206,14 @@ __global__ void leafInitKernel(GpuBVHNode* __restrict__ nodes, const Tri* __rest
     setNodeBox(leaf, sortedTris[k].bounds());
     leaf.left = -(k + 1);
     leaf.right = 1;
+}
+
+// refit 的第一步：调用方给的是场景顺序的三角形，树里存的是叶子顺序。
+// primIds 是建树时定下的叶子槽 -> 场景索引，所以重排不需要在主机上做置换。
+__global__ void gatherTrisKernel(const Tri* __restrict__ src, const int* __restrict__ primIds,
+                                 int n, Tri* __restrict__ dst) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i < n) dst[i] = src[primIds[i]];
 }
 
 // Karras 2012 的二叉基数树：内部节点 i 自己二分出自己的叶子区间和切分点。
@@ -522,6 +531,16 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
             throw std::runtime_error("buildBVHGPU: depth bucketing lost nodes");
         }
 
+        // 拓扑不变，这个 (深度, 编号) 顺序也不变：留给 refit 逐层重放，
+        // 省掉每次更新重算 parent/depth + 一次 7 位基数排序。
+        cudaOk(cudaMalloc(&bvh.d_refitOrder, static_cast<size_t>(internalCount) * sizeof(int)),
+               "refit order");
+        cudaOk(cudaMemcpy(bvh.d_refitOrder, dDepthValSorted.p,
+                          static_cast<size_t>(internalCount) * sizeof(int),
+                          cudaMemcpyDeviceToDevice),
+               "D2D refit order");
+        bvh.refitOffsets.assign(offsets, offsets + bins + 1);
+
         // 从最深层往上：第 d 层的节点只读第 d+1 层，天然无竞争。
         for (int d = bins - 1; d >= 0; --d) {
             const int count = offsets[d + 1] - offsets[d];
@@ -554,7 +573,128 @@ void destroyBVHGPU(GpuBVH& bvh) {
     if (bvh.d_nodes) cudaFree(bvh.d_nodes);
     if (bvh.d_tris) cudaFree(bvh.d_tris);
     if (bvh.d_primIds) cudaFree(bvh.d_primIds);
+    if (bvh.d_refitOrder) cudaFree(bvh.d_refitOrder);
+    if (bvh.d_stage) cudaFree(bvh.d_stage);
     bvh = GpuBVH{};
+}
+
+// 只上传改动的三角形：主机侧已经按 dirty 顺序打包好，slot 是它的叶子槽。
+// 写入 + 重算叶子盒在同一个线程里做，省一次 kernel。
+__global__ void scatterLeafKernel(const int* __restrict__ slots, const Tri* __restrict__ src,
+                                  int count, Tri* __restrict__ sortedTris,
+                                  GpuBVHNode* __restrict__ nodes, int n) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= count) return;
+    const int slot = slots[i];
+    const Tri t = src[i];
+    sortedTris[slot] = t;
+    GpuBVHNode& leaf = nodes[n - 1 + slot];
+    setNodeBox(leaf, t.bounds());
+}
+
+double refitImpl(GpuBVH& bvh, const Scene& scene, const std::vector<int>* dirty,
+                 GpuRefitTimings* timings) {    const int n = bvh.triCount;
+    if (n < 2 || bvh.d_nodes == nullptr) throw std::runtime_error("refitBVHGPU: BVH not built");
+    if (bvh.d_refitOrder == nullptr) throw std::runtime_error("refitBVHGPU: missing refit order");
+    if (static_cast<int>(scene.tris.size()) != n) {
+        throw std::runtime_error("refitBVHGPU: triangle count changed, rebuild instead");
+    }
+
+    auto* nodes = static_cast<GpuBVHNode*>(bvh.d_nodes);
+    auto* sortedTris = static_cast<Tri*>(bvh.d_tris);
+    const auto* primIds = static_cast<const int*>(bvh.d_primIds);
+    const auto* order = static_cast<const int*>(bvh.d_refitOrder);
+
+    if (dirty && bvh.primSlot.empty()) {
+        // 反向映射只在第一次增量更新时建：建树路径不替不 refit 的调用方付这次回传。
+        std::vector<int> hostPrimIds(static_cast<size_t>(n));
+        cudaOk(cudaMemcpy(hostPrimIds.data(), primIds, static_cast<size_t>(n) * sizeof(int),
+                          cudaMemcpyDeviceToHost),
+               "D2H primIds");
+        bvh.primSlot.resize(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) bvh.primSlot[static_cast<size_t>(hostPrimIds[i])] = i;
+    }
+
+    StageClock clock;
+    clock.mark();  // 0
+
+    if (dirty) {
+        const int count = static_cast<int>(dirty->size());
+        // 主机侧 gather：改动量通常远小于 n，拿到叶子序的紧凑数组再传一次。
+        std::vector<int> slots(static_cast<size_t>(count));
+        std::vector<Tri> moved(static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            const int id = (*dirty)[static_cast<size_t>(i)];
+            if (id < 0 || id >= n) throw std::runtime_error("refitBVHGPU: dirty index out of range");
+            slots[static_cast<size_t>(i)] = bvh.primSlot[static_cast<size_t>(id)];
+            moved[static_cast<size_t>(i)] = scene.tris[static_cast<size_t>(id)];
+        }
+
+        DevBuf<int> dSlots(std::max(1, count));
+        DevBuf<Tri> dMoved(std::max(1, count));
+        if (count > 0) {
+            cudaOk(cudaMemcpy(dSlots.p, slots.data(), static_cast<size_t>(count) * sizeof(int),
+                              cudaMemcpyHostToDevice),
+                   "refit H2D slots");
+            cudaOk(cudaMemcpy(dMoved.p, moved.data(), static_cast<size_t>(count) * sizeof(Tri),
+                              cudaMemcpyHostToDevice),
+                   "refit H2D tris");
+        }
+        clock.mark();  // 1
+
+        if (count > 0) {
+            scatterLeafKernel<<<blocksFor(count), kBlock>>>(dSlots.p, dMoved.p, count, sortedTris,
+                                                            nodes, n);
+        }
+    } else {
+        // 暂存区首次用到才分配：不 refit 的调用方不付这块显存。
+        if (bvh.d_stage == nullptr || bvh.stageCount < n) {
+            if (bvh.d_stage) cudaFree(bvh.d_stage);
+            cudaOk(cudaMalloc(&bvh.d_stage, static_cast<size_t>(n) * sizeof(Tri)), "refit stage");
+            bvh.stageCount = n;
+        }
+        auto* dSrc = static_cast<Tri*>(bvh.d_stage);
+        cudaOk(cudaMemcpy(dSrc, scene.tris.data(), static_cast<size_t>(n) * sizeof(Tri),
+                          cudaMemcpyHostToDevice),
+               "refit H2D");
+        clock.mark();  // 1
+
+        gatherTrisKernel<<<blocksFor(n), kBlock>>>(dSrc, primIds, n, sortedTris);
+        leafInitKernel<<<blocksFor(n), kBlock>>>(nodes, sortedTris, n);
+    }
+    cudaOk(cudaGetLastError(), "refit scatter");
+    clock.mark();  // 2
+
+    // 叶子盒已经定稿，内部节点按缓存的层序从深到浅合并：第 d 层只读 d+1 层。
+    const int bins = static_cast<int>(bvh.refitOffsets.size()) - 1;
+    for (int d = bins - 1; d >= 0; --d) {
+        const int count = bvh.refitOffsets[d + 1] - bvh.refitOffsets[d];
+        if (count == 0) continue;
+        const int blocks = (count + kBlock * kRefitUnroll - 1) / (kBlock * kRefitUnroll);
+        refitKernel<<<blocks, kBlock>>>(nodes, order + bvh.refitOffsets[d], count);
+    }
+    cudaOk(cudaGetLastError(), "refit tree");
+    clock.mark();  // 3
+    cudaOk(cudaEventSynchronize(clock.ev[clock.marks - 1]), "refit sync");
+
+    const double total = clock.ms(0, 3);
+    if (timings) {
+        timings->uploadMs = clock.ms(0, 1);
+        timings->gatherMs = clock.ms(1, 2);
+        timings->treeMs = clock.ms(2, 3);
+        timings->totalMs = total;
+        timings->updated = dirty ? static_cast<int>(dirty->size()) : n;
+    }
+    return total;
+}
+
+double refitBVHGPU(GpuBVH& bvh, const Scene& scene, GpuRefitTimings* timings) {
+    return refitImpl(bvh, scene, nullptr, timings);
+}
+
+double refitBVHGPU(GpuBVH& bvh, const Scene& scene, const std::vector<int>& dirty,
+                   GpuRefitTimings* timings) {
+    return refitImpl(bvh, scene, &dirty, timings);
 }
 
 std::string validateBVHGPU(const GpuBVH& bvh, const Scene& scene) {

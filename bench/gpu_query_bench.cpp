@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +45,10 @@ struct Options {
     bool stats = false;
     std::string dump;
     int warmupMs = 3000;
+    bool refit = false;
+    double refitShift = 0.005;
+    double refitDirty = 0.01;
+    std::string refitMotion = "random";
 };
 
 void printUsage() {
@@ -63,7 +68,11 @@ void printUsage() {
         "  --stats                        额外跑一轮带节点/三角形计数的查询\n"
         "  --verify / --no-verify         是否逐点对拍（default verify）\n"
         "  --no-cpu                       跳过 CPU 参考查询（大场景省时间）\n"
-        "  --dump FILE                    把场景与查询点写成二进制后退出（给外部引擎对照用）\n");
+        "  --dump FILE                    把场景与查询点写成二进制后退出（给外部引擎对照用）\n"
+        "  --refit                        额外做一轮增量更新实验（少量改动 → 全量 refit → 重建）\n"
+        "  --refit-shift F                每个三角形随机平移的幅度（场景对角线的比例），default 0.005\n"
+        "  --refit-dirty F                第一步改动的三角形比例，default 0.01\n"
+        "  --refit-motion random|coherent 位移方式：逐三角形独立 / 平滑场，default random\n");
 }
 
 bool parseArgs(int argc, char** argv, Options& opt) {
@@ -129,6 +138,26 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             const char* v = needValue("--dump");
             if (!v) return false;
             opt.dump = v;
+        } else if (arg == "--refit") {
+            opt.refit = true;
+        } else if (arg == "--refit-shift") {
+            const char* v = needValue("--refit-shift");
+            if (!v) return false;
+            opt.refitShift = std::atof(v);
+            if (opt.refitShift < 0.0) opt.refitShift = 0.0;
+        } else if (arg == "--refit-dirty") {
+            const char* v = needValue("--refit-dirty");
+            if (!v) return false;
+            opt.refitDirty = std::atof(v);
+            if (opt.refitDirty < 0.0 || opt.refitDirty > 1.0) opt.refitDirty = 0.01;
+        } else if (arg == "--refit-motion") {
+            const char* v = needValue("--refit-motion");
+            if (!v) return false;
+            opt.refitMotion = v;
+            if (opt.refitMotion != "random" && opt.refitMotion != "coherent") {
+                std::fprintf(stderr, "unknown --refit-motion: %s\n", v);
+                return false;
+            }
         } else if (arg == "-h" || arg == "--help") {
             printUsage();
             return false;
@@ -177,6 +206,117 @@ ClosestHit hitFromGpu(const GpuClosestResult& r) {
         h.triangle = r.triangle;
     }
     return h;
+}
+
+// 把三种查询统一成"每点一个结果列表"：closest 是 0/1 条，kNN / radius 是 k 条或不定长。
+// 这样 refit 前后、CPU 与 GPU 之间只需要一套比较逻辑。
+struct QueryOutput {
+    std::vector<std::vector<ClosestHit>> perPoint;
+    GpuQueryStats stats;  // 只有 GPU 路径会填；CPU 侧只用来出结果
+    double ms = 0.0;
+};
+
+QueryOutput queryGpu(GpuBVH& bvh, GpuPointBuffer& buf, int stride, const std::string& query, int k,
+                     float radius, bool collectStats) {
+    QueryOutput out;
+    out.perPoint.resize(static_cast<size_t>(buf.count));
+    if (query == "radius") {
+        GpuRadiusBuffer rb;
+        out.ms = radiusQueryGPU(bvh, buf, radius, rb, collectStats);
+        std::vector<std::vector<ClosestHit>> lists = readRadiusResultsGPU(rb);
+        destroyRadiusBufferGPU(rb);
+        out.perPoint = std::move(lists);
+    } else {
+        out.ms = (query == "knn") ? kNearestGPU(bvh, buf, k, collectStats)
+                                  : closestPointGPU(bvh, buf, collectStats);
+        const std::vector<GpuClosestResult> flat = readQueryResultsGPU(buf);
+        for (size_t i = 0; i < out.perPoint.size(); ++i) {
+            const GpuClosestResult* row = flat.data() + i * stride;
+            for (int j = 0; j < stride; ++j) {
+                const ClosestHit g = hitFromGpu(row[j]);
+                if (!g.found) break;
+                out.perPoint[i].push_back(g);
+            }
+        }
+    }
+    out.stats = lastQueryStatsGPU();
+    return out;
+}
+
+QueryOutput queryCpu(const BVH& bvh, const std::vector<Vec3>& points, const std::string& query,
+                     int k, float radius) {
+    QueryOutput out;
+    out.perPoint.resize(points.size());
+    const double t0 = nowMs();
+    for (size_t i = 0; i < points.size(); ++i) {
+        if (query == "knn") {
+            out.perPoint[i] = kNearestBVH(bvh, points[i], k);
+        } else if (query == "radius") {
+            out.perPoint[i] = radiusBVH(bvh, points[i], radius);
+        } else {
+            const ClosestHit h = closestPointBVH(bvh, points[i]);
+            if (h.found) out.perPoint[i].push_back(h);
+        }
+    }
+    out.ms = nowMs() - t0;
+    return out;
+}
+
+struct Mismatch {
+    uint64_t count = 0;
+    uint64_t tri = 0;
+    uint64_t dist = 0;
+};
+
+Mismatch compareQueryOutput(const QueryOutput& want, const QueryOutput& got) {
+    Mismatch m;
+    for (size_t i = 0; i < want.perPoint.size() && i < got.perPoint.size(); ++i) {
+        const std::vector<ClosestHit>& a = want.perPoint[i];
+        const std::vector<ClosestHit>& b = got.perPoint[i];
+        if (a.size() != b.size()) {
+            ++m.count;
+            continue;
+        }
+        for (size_t j = 0; j < a.size(); ++j) {
+            if (a[j].triangle != b[j].triangle) ++m.tri;
+            if (std::memcmp(&a[j].dist2, &b[j].dist2, sizeof(float)) != 0) ++m.dist;
+        }
+    }
+    return m;
+}
+
+// 每个三角形整体平移：形状不变、顺序不变，refit 的合法输入。random 给每个三角形
+// 独立位移（最坏情况的局部性），coherent 用平滑场（位移前后邻居关系基本保留）。
+// 幅度按场景对角线取比例，跨规模可比。which 为空表示全动。
+void displaceTriangles(Scene& scene, float amplitude, const std::vector<int>* which,
+                       bool coherent) {
+    uint64_t state = 0x9e3779b97f4a7c15ull;
+    auto next = [&state]() {
+        state ^= state >> 33;
+        state *= 0xff51afd7ed558ccdull;
+        state ^= state >> 33;
+        return static_cast<float>((state >> 40) * (1.0 / 16777216.0));
+    };
+    auto bump = [&](Tri& t) {
+        Vec3 d;
+        if (coherent) {
+            const Vec3 c = (t.a + t.b + t.c) * (1.0f / 3.0f);
+            d = {amplitude * std::sin(c.y * 0.5f), amplitude * 0.5f * std::sin(c.x * 0.5f),
+                 amplitude * std::cos(c.z * 0.5f)};
+        } else {
+            d = {(next() * 2.0f - 1.0f) * amplitude, (next() * 2.0f - 1.0f) * amplitude,
+                 (next() * 2.0f - 1.0f) * amplitude};
+        }
+        t.a = t.a + d;
+        t.b = t.b + d;
+        t.c = t.c + d;
+    };
+    if (which) {
+        for (const int id : *which) bump(scene.tris[static_cast<size_t>(id)]);
+    } else {
+        for (Tri& t : scene.tris) bump(t);
+    }
+    scene.updateBounds();
 }
 
 }  // namespace
@@ -433,6 +573,149 @@ int main(int argc, char** argv) {
             st.nodeTests / n, st.triTests / n,
             static_cast<unsigned long long>(st.stackOverflows),
             static_cast<unsigned long long>(st.nodeTests));
+    }
+
+    if (opt.refit) {
+        // ---- 增量更新三步 ----
+        // 1) 只动 1% 的三角形，refit 只上传这些；
+        // 2) 整体位移，refit 全量上传；
+        // 3) 同一份几何整树重建。
+        // 每一步都拿 CPU 参考对拍：refit 不改拓扑，结果必须逐位正确。第 2、3 步
+        // 用的是同一份几何，查询快慢才只反映树的质量（第 1 步的几何不同，不参与比较）。
+        const double nPoints = static_cast<double>(points.size());
+        const QueryOutput base = queryGpu(gpu, buf, stride, opt.query, opt.k, opt.radius, true);
+        std::printf("refit baseline avg_node_tests=%.1f avg_tri_tests=%.1f\n",
+                    base.stats.nodeTests / nPoints, base.stats.triTests / nPoints);
+
+        Scene moved = scene;
+        const Vec3 ext = moved.bounds.mx - moved.bounds.mn;
+        const double diag = std::sqrt(static_cast<double>(dot(ext, ext)));
+        const float amplitude = static_cast<float>(opt.refitShift * diag);
+        std::printf("refit motion=%s shift=%.4f amplitude=%.4f world tris=%zu\n",
+                    opt.refitMotion.c_str(), opt.refitShift, amplitude, moved.tris.size());
+
+        auto cpuFor = [&](const Scene& s) {
+            const BVH cpu = buildBVH(s);
+            return queryCpu(cpu, points, opt.query, opt.k, opt.radius);
+        };
+        auto medianQuery = [&](GpuBVH& b) {
+            std::vector<double> t;
+            for (int i = 0; i < opt.runs; ++i) {
+                t.push_back(queryGpu(b, buf, stride, opt.query, opt.k, opt.radius, false).ms);
+            }
+            std::sort(t.begin(), t.end());
+            return t[t.size() / 2];
+        };
+        auto verify = [&](const char* label, const QueryOutput& want, const QueryOutput& got) {
+            const Mismatch m = compareQueryOutput(want, got);
+            std::printf("%s verify points=%zu count_mismatch=%llu tri_mismatch=%llu "
+                        "dist2_mismatch=%llu\n",
+                        label, points.size(), static_cast<unsigned long long>(m.count),
+                        static_cast<unsigned long long>(m.tri),
+                        static_cast<unsigned long long>(m.dist));
+            if (m.count || m.tri || m.dist) exitCode = 6;
+        };
+
+        // 1) 少量改动：只上传 dirty 里的三角形
+        std::vector<int> dirty;
+        const int step = opt.refitDirty > 0.0
+                             ? std::max(1, static_cast<int>(std::lround(1.0 / opt.refitDirty)))
+                             : 0;
+        for (int i = 0; step > 0 && i < static_cast<int>(moved.tris.size()); i += step) {
+            dirty.push_back(i);
+        }
+        displaceTriangles(moved, amplitude, &dirty, opt.refitMotion == "coherent");
+
+        GpuRefitTimings partial{};
+        double partialMs = 0.0;
+        try {
+            // 同一个几何重复 refit 是幂等的；取中位数，顺手把暂存区的首次分配
+            // 和模块状态排除在稳定态之外。
+            std::vector<double> times;
+            for (int i = 0; i < opt.runs; ++i) {
+                times.push_back(refitBVHGPU(gpu, moved, dirty, &partial));
+            }
+            std::sort(times.begin(), times.end());
+            partialMs = times[times.size() / 2];
+        } catch (const std::exception& e) {
+            std::printf("gpu partial refit failed: %s\n", e.what());
+            return 3;
+        }
+        std::printf("partial updated=%d upload=%.3f scatter=%.3f tree=%.3f total=%.3f ms\n",
+                    partial.updated, partial.uploadMs, partial.gatherMs, partial.treeMs, partialMs);
+        const std::string partialTree = validateBVHGPU(gpu, moved);
+        std::printf("partial tree %s%s\n", partialTree.empty() ? "PASS" : "FAIL: ",
+                    partialTree.c_str());
+        if (!partialTree.empty()) return 4;
+
+        const double partialQuery = medianQuery(gpu);
+        const QueryOutput partialRes = queryGpu(gpu, buf, stride, opt.query, opt.k, opt.radius, true);
+        std::printf("partial query median_ms=%.3f avg_node_tests=%.1f avg_tri_tests=%.1f\n",
+                    partialQuery, partialRes.stats.nodeTests / nPoints,
+                    partialRes.stats.triTests / nPoints);
+        if (opt.cpu) verify("partial", cpuFor(moved), partialRes);
+
+        // 2) 整体位移：全量 refit
+        displaceTriangles(moved, amplitude, nullptr, opt.refitMotion == "coherent");
+        GpuRefitTimings full{};
+        double fullMs = 0.0;
+        try {
+            std::vector<double> times;
+            for (int i = 0; i < opt.runs; ++i) {
+                times.push_back(refitBVHGPU(gpu, moved, &full));
+            }
+            std::sort(times.begin(), times.end());
+            fullMs = times[times.size() / 2];
+        } catch (const std::exception& e) {
+            std::printf("gpu refit failed: %s\n", e.what());
+            return 3;
+        }
+        std::printf("refit updated=%d upload=%.3f scatter=%.3f tree=%.3f total=%.3f ms\n",
+                    full.updated, full.uploadMs, full.gatherMs, full.treeMs, fullMs);
+        const std::string refitTree = validateBVHGPU(gpu, moved);
+        std::printf("refit tree %s%s\n", refitTree.empty() ? "PASS" : "FAIL: ", refitTree.c_str());
+        if (!refitTree.empty()) return 4;
+
+        const QueryOutput refCpu = opt.cpu ? cpuFor(moved) : QueryOutput{};
+        const double refitQuery = medianQuery(gpu);
+        const QueryOutput refitRes = queryGpu(gpu, buf, stride, opt.query, opt.k, opt.radius, true);
+        std::printf("refit query median_ms=%.3f Mqueries_s=%.2f avg_node_tests=%.1f "
+                    "avg_tri_tests=%.1f\n",
+                    refitQuery, refitQuery > 0.0 ? nPoints / (refitQuery * 1e3) : 0.0,
+                    refitRes.stats.nodeTests / nPoints, refitRes.stats.triTests / nPoints);
+        if (opt.cpu) verify("refit", refCpu, refitRes);
+
+        // 3) 同一份几何整树重建（同样取中位数，和 refit 的计时口径对齐）
+        GpuBuildTimings rebuild{};
+        GpuBVH rebuilt;
+        double rebuildMs = 0.0;
+        try {
+            std::vector<double> times;
+            for (int i = 0; i < opt.runs; ++i) {
+                destroyBVHGPU(rebuilt);
+                rebuild = GpuBuildTimings{};
+                rebuilt = buildBVHGPU(moved, &rebuild);
+                times.push_back(rebuild.totalMs);
+            }
+            std::sort(times.begin(), times.end());
+            rebuildMs = times[times.size() / 2];
+        } catch (const std::exception& e) {
+            std::printf("gpu rebuild failed: %s\n", e.what());
+            return 3;
+        }
+        const double rebuildQuery = medianQuery(rebuilt);
+        const QueryOutput rebuiltRes =
+            queryGpu(rebuilt, buf, stride, opt.query, opt.k, opt.radius, true);
+        std::printf("rebuild total=%.3f ms query median_ms=%.3f avg_node_tests=%.1f "
+                    "avg_tri_tests=%.1f\n",
+                    rebuildMs, rebuildQuery, rebuiltRes.stats.nodeTests / nPoints,
+                    rebuiltRes.stats.triTests / nPoints);
+        if (opt.cpu) verify("rebuild", refCpu, rebuiltRes);
+
+        // 第 1 步与第 2/3 步的几何不同，它的查询时间不参与比较，只比成本。
+        std::printf("cost_vs_rebuild partial=%.2fx refit=%.2fx query refit/rebuild=%.2fx\n",
+                    rebuildMs / partialMs, rebuildMs / fullMs, refitQuery / rebuildQuery);
+        destroyBVHGPU(rebuilt);
     }
 
     destroyRadiusBufferGPU(radiusBuf);
