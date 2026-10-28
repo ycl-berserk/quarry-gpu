@@ -44,6 +44,11 @@ bool gpuDescribe(std::string* why);
 
 // 可能抛 std::runtime_error（CUDA 调用失败时）。
 GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings = nullptr);
+
+// 在计时构建之前空跑一个小 kernel：CUDA 默认懒加载模块，第一次启动 kernel 才会
+// 把整个 cubin 载入设备（~2 ms），不算这一次就把它记到构建头上。
+void warmupBuildGPU();
+
 void destroyBVHGPU(GpuBVH& bvh);
 
 GpuRayBuffer uploadRaysGPU(const std::vector<Ray>& rays);

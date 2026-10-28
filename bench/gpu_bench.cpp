@@ -216,6 +216,7 @@ int main(int argc, char** argv) {
     GpuBuildTimings build{};
     GpuBVH gpu;
     try {
+        warmupBuildGPU();  // 模块懒加载的一次性开销不算进构建
         gpu = buildBVHGPU(scene, &build);
     } catch (const std::exception& e) {
         std::printf("gpu build failed: %s\n", e.what());

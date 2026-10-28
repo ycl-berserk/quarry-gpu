@@ -274,40 +274,68 @@ __global__ void depthKernel(const int* __restrict__ parent, int nodeCount,
     atomicMax(maxDepth, d);
 }
 
-__global__ void countDepthsKernel(const int* __restrict__ depth, int nodeCount,
-                                  int* __restrict__ counts) {
-    const int i = blockIdx.x * kBlock + threadIdx.x;
-    if (i >= nodeCount) return;
-    atomicAdd(&counts[depth[i]], 1);
-}
-
-__global__ void scatterDepthsKernel(const int* __restrict__ depth, int* __restrict__ fill,
-                                    int* __restrict__ bucket, int nodeCount) {
-    const int i = blockIdx.x * kBlock + threadIdx.x;
-    if (i >= nodeCount) return;
-    const int d = depth[i];
-    const int pos = atomicAdd(&fill[d], 1);
-    bucket[pos] = i;
+// 按深度排好的桶里，每层的起点 = 该深度在有序键里的 lower_bound。
+// 只有 <=64 个桶，一个 block 一次二分查完，比在主机上按计数做前缀省一次
+// 大数组回传。
+__global__ void depthOffsetsKernel(const uint32_t* __restrict__ sortedKeys, int nodeCount,
+                                   int bins, int* __restrict__ offsets) {
+    const int d = threadIdx.x;
+    if (d > bins) return;
+    int lo = 0;
+    int hi = nodeCount;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (sortedKeys[mid] < static_cast<uint32_t>(d)) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    offsets[d] = lo;
 }
 
 // 同一层里没有父子关系，可以整层并行；孩子的层已经在前一批 kernel 里算完。
 // 叶子盒在 leafInitKernel 里就定稿了，这里只处理内部节点。
+//
+// 每个线程一次处理 kRefitUnroll 个节点：子节点下标是散的，单条链上两个 32B
+// 读要串行等显存；把 kRefitUnroll 份摊开，8 次读能同时挂在飞行队列里。
+constexpr int kRefitUnroll = 4;
+
 __global__ void refitKernel(GpuBVHNode* __restrict__ nodes, const int* __restrict__ bucket,
                             int count) {
-    const int t = blockIdx.x * kBlock + threadIdx.x;
-    if (t >= count) return;
-    const int i = bucket[t];
-    if (nodes[i].left < 0) return;
+    const int base = blockIdx.x * (kBlock * kRefitUnroll) + threadIdx.x;
 
-    const GpuBVHNode& left = nodes[nodes[i].left];
-    const GpuBVHNode& right = nodes[nodes[i].right];
+    int ids[kRefitUnroll];
+    GpuBVHNode l[kRefitUnroll], r[kRefitUnroll];
+    bool ok[kRefitUnroll];
 
-    nodes[i].mnx = left.mnx < right.mnx ? left.mnx : right.mnx;
-    nodes[i].mny = left.mny < right.mny ? left.mny : right.mny;
-    nodes[i].mnz = left.mnz < right.mnz ? left.mnz : right.mnz;
-    nodes[i].mxx = left.mxx > right.mxx ? left.mxx : right.mxx;
-    nodes[i].mxy = left.mxy > right.mxy ? left.mxy : right.mxy;
-    nodes[i].mxz = left.mxz > right.mxz ? left.mxz : right.mxz;
+#pragma unroll
+    for (int u = 0; u < kRefitUnroll; ++u) {
+        const int t = base + u * kBlock;
+        ok[u] = false;
+        if (t < count) {
+            const int i = bucket[t];
+            const GpuBVHNode nd = nodes[i];
+            if (nd.left >= 0) {
+                ok[u] = true;
+                ids[u] = i;
+                l[u] = nodes[nd.left];
+                r[u] = nodes[nd.right];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int u = 0; u < kRefitUnroll; ++u) {
+        if (!ok[u]) continue;
+        GpuBVHNode& nd = nodes[ids[u]];
+        nd.mnx = l[u].mnx < r[u].mnx ? l[u].mnx : r[u].mnx;
+        nd.mny = l[u].mny < r[u].mny ? l[u].mny : r[u].mny;
+        nd.mnz = l[u].mnz < r[u].mnz ? l[u].mnz : r[u].mnz;
+        nd.mxx = l[u].mxx > r[u].mxx ? l[u].mxx : r[u].mxx;
+        nd.mxy = l[u].mxy > r[u].mxy ? l[u].mxy : r[u].mxy;
+        nd.mxz = l[u].mxz > r[u].mxz ? l[u].mxz : r[u].mxz;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +415,12 @@ bool gpuDescribe(std::string* out) {
     return true;
 }
 
+void warmupBuildGPU() {
+    resetCentroidBoundsKernel<<<1, 32>>>();
+    cudaOk(cudaGetLastError(), "warmup");
+    cudaOk(cudaDeviceSynchronize(), "warmup sync");
+}
+
 GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
     const int n = static_cast<int>(scene.tris.size());
     if (n < 2) throw std::runtime_error("buildBVHGPU: at least 2 triangles required");
@@ -415,8 +449,9 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
         DevBuf<int> dOrder(n), dOrderSorted(n);
         DevBuf<int> dParent(nodeCount);
         DevBuf<int> dDepth(nodeCount);
-        DevBuf<int> dCounts(kDepthBins), dFill(kDepthBins);
-        DevBuf<int> dBucket(nodeCount);
+        DevBuf<uint32_t> dDepthKeySorted(nodeCount);
+        DevBuf<int> dDepthVal(nodeCount), dDepthValSorted(nodeCount);
+        DevBuf<int> dOffsets(kDepthBins + 1);
         DevBuf<int> dMaxDepth(1);
 
         StageClock clock;
@@ -455,29 +490,44 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
         clock.mark();  // 4
 
         leafInitKernel<<<blocksFor(n), kBlock>>>(nodes, sortedTris, n);
-        cudaOk(cudaMemset(dCounts.p, 0, kDepthBins * sizeof(int)), "counts");
-        countDepthsKernel<<<blocksFor(nodeCount), kBlock>>>(dDepth.p, nodeCount, dCounts.p);
-        cudaOk(cudaGetLastError(), "count depths");
+        iotaKernel<<<blocksFor(internalCount), kBlock>>>(dDepthVal.p, internalCount);
 
-        int counts[kDepthBins] = {};
-        cudaOk(cudaMemcpy(counts, dCounts.p, sizeof(counts), cudaMemcpyDeviceToHost), "D2H counts");
+        // 内部节点编号恰好是 0..n-2，叶子不会进桶——refit 少处理一半的节点。
+        // 深度取值 <=64，7 位基数排序就够一次排完。稳定排序让同层节点按编号升序
+        // 排在一起，refit 时相邻线程读相邻节点；也避开了 2M 线程抢 128 个计数器的
+        // 全局 atomic（实测分布 + 落桶占了 2M 构建里 8.4 ms）。
+        std::size_t depthSortBytes = 0;
+        cudaOk(cub::DeviceRadixSort::SortPairs(nullptr, depthSortBytes,
+                                               reinterpret_cast<const uint32_t*>(dDepth.p),
+                                               dDepthKeySorted.p, dDepthVal.p, dDepthValSorted.p,
+                                               internalCount, 0, 7),
+               "depth sort(probe)");
+        DevBuf<unsigned char> dDepthTemp(depthSortBytes);
+        cudaOk(cub::DeviceRadixSort::SortPairs(dDepthTemp.p, depthSortBytes,
+                                               reinterpret_cast<const uint32_t*>(dDepth.p),
+                                               dDepthKeySorted.p, dDepthVal.p, dDepthValSorted.p,
+                                               internalCount, 0, 7),
+               "depth sort");
 
-        int offsets[kDepthBins] = {};
-        int total = 0;
-        for (int d = 0; d < kDepthBins; ++d) {
-            offsets[d] = total;
-            total += counts[d];
+        const int bins = bvh.depth + 1;
+        depthOffsetsKernel<<<1, kDepthBins + 1>>>(dDepthKeySorted.p, internalCount, bins,
+                                                  dOffsets.p);
+        cudaOk(cudaGetLastError(), "depth offsets");
+
+        int offsets[kDepthBins + 1] = {};
+        cudaOk(cudaMemcpy(offsets, dOffsets.p, static_cast<size_t>(bins + 1) * sizeof(int),
+                          cudaMemcpyDeviceToHost),
+               "D2H offsets");
+        if (offsets[bins] != internalCount) {
+            throw std::runtime_error("buildBVHGPU: depth bucketing lost nodes");
         }
-        if (total != nodeCount) throw std::runtime_error("buildBVHGPU: depth bucketing lost nodes");
-
-        cudaOk(cudaMemcpy(dFill.p, offsets, sizeof(offsets), cudaMemcpyHostToDevice), "H2D fill");
-        scatterDepthsKernel<<<blocksFor(nodeCount), kBlock>>>(dDepth.p, dFill.p, dBucket.p, nodeCount);
-        cudaOk(cudaGetLastError(), "scatter depths");
 
         // 从最深层往上：第 d 层的节点只读第 d+1 层，天然无竞争。
-        for (int d = bvh.depth - 1; d >= 0; --d) {
-            if (counts[d] == 0) continue;
-            refitKernel<<<blocksFor(counts[d]), kBlock>>>(nodes, dBucket.p + offsets[d], counts[d]);
+        for (int d = bins - 1; d >= 0; --d) {
+            const int count = offsets[d + 1] - offsets[d];
+            if (count == 0) continue;
+            const int blocks = (count + kBlock * kRefitUnroll - 1) / (kBlock * kRefitUnroll);
+            refitKernel<<<blocks, kBlock>>>(nodes, dDepthValSorted.p + offsets[d], count);
         }
         cudaOk(cudaGetLastError(), "refit");
         clock.mark();  // 5
