@@ -11,14 +11,18 @@
 // GPU 后端的主机侧 API。头文件里不出现任何 CUDA 类型，设备指针一律用 void*：
 // 没装 CUDA 的机器（CI、纯 CPU 构建）也能包含它、链接到空实现之外的分支。
 //
-// 树是 LBVH（Morton + 基数排序 + Karras 建树），节点布局与 learn/03 一致：
-//   内部节点 0 .. n-2，叶子 n-1 .. 2n-2。
+// 树是 LBVH（Morton + 基数排序 + Karras 建树）。叶子不是一个三角形，而是一段
+// 连续区间：Morton 序相邻的 kLeafSize 个三角形合成一片叶子。设 g = ceil(n/k)，
+// 则内部节点 0 .. g-2，叶子 g-1 .. 2g-2，叶子节点的 (left, right) 编码为
+// left = -(区间起点 + 1)，right = 区间长度。
 struct GpuBVH {
-    void* d_nodes = nullptr;    // GpuBVHNode[]，共 2n-1 个
+    void* d_nodes = nullptr;    // GpuBVHNode[]，共 2g-1 个
     void* d_tris = nullptr;     // Tri[]，按叶子顺序重排
     void* d_primIds = nullptr;  // int[]，tris[i] 对应的场景索引
     int triCount = 0;
     int nodeCount = 0;
+    int internalCount = 0;      // g - 1；叶子从 internalCount 开始
+    int leafSize = 1;
     int depth = 0;
 };
 
@@ -43,7 +47,9 @@ struct GpuRayBuffer {
 bool gpuDescribe(std::string* why);
 
 // 可能抛 std::runtime_error（CUDA 调用失败时）。
-GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings = nullptr);
+// 每片叶子装 leafSize 个 Morton 序相邻的三角形：节点数从 2n-1 降到 ~2n/leafSize，
+// 深度也跟着降，代价是进入叶子后最多多测 leafSize 个三角形。
+GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings = nullptr, int leafSize = 4);
 
 // 在计时构建之前空跑一个小 kernel：CUDA 默认懒加载模块，第一次启动 kernel 才会
 // 把整个 cubin 载入设备（~2 ms），不算这一次就把它记到构建头上。

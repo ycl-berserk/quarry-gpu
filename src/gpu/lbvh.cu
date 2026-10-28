@@ -197,14 +197,30 @@ __global__ void internalInitKernel(GpuBVHNode* __restrict__ nodes, int internalC
     nodes[i].mxz = -CUDART_INF_F;
 }
 
+// 每 leafSize 个 Morton 序相邻的三角形合成一片叶子，树的键取每组的第一个。
+// 取第一而不是质心：排序后键非降，隔 k 取仍然非降，Karras 只要求这一点。
+__global__ void groupKeysKernel(const uint64_t* __restrict__ sortedKeys, int n, int groups,
+                                int leafSize, uint64_t* __restrict__ groupKeys) {
+    const int g = blockIdx.x * kBlock + threadIdx.x;
+    if (g >= groups) return;
+    const int at = g * leafSize;
+    groupKeys[g] = sortedKeys[at < n ? at : n - 1];
+}
+
 __global__ void leafInitKernel(GpuBVHNode* __restrict__ nodes, const Tri* __restrict__ sortedTris,
-                               int n) {
-    const int k = blockIdx.x * kBlock + threadIdx.x;
-    if (k >= n) return;
-    GpuBVHNode& leaf = nodes[n - 1 + k];
-    setNodeBox(leaf, sortedTris[k].bounds());
-    leaf.left = -(k + 1);
-    leaf.right = 1;
+                               int n, int groups, int leafSize) {
+    const int g = blockIdx.x * kBlock + threadIdx.x;
+    if (g >= groups) return;
+    const int start = g * leafSize;
+    const int end = start + leafSize < n ? start + leafSize : n;
+
+    AABB box = sortedTris[start].bounds();
+    for (int i = start + 1; i < end; ++i) box.extend(sortedTris[i].bounds());
+
+    GpuBVHNode& leaf = nodes[groups - 1 + g];
+    setNodeBox(leaf, box);
+    leaf.left = -(start + 1);
+    leaf.right = end - start;
 }
 
 // Karras 2012 的二叉基数树：内部节点 i 自己二分出自己的叶子区间和切分点。
@@ -339,17 +355,18 @@ __global__ void refitKernel(GpuBVHNode* __restrict__ nodes, const int* __restric
 }
 
 // ---------------------------------------------------------------------------
-// 结构校验：父盒必须逐位等于两个子盒的并，叶子盒必须逐位等于三角形包围盒，
+// 结构校验：父盒必须逐位等于两个子盒的并，叶子盒必须逐位等于区间内三角形的并，
 // 每个非根节点必须被恰好引用一次。
 // ---------------------------------------------------------------------------
 __global__ void checkNodesKernel(const GpuBVHNode* __restrict__ nodes,
                                  const Tri* __restrict__ sortedTris, int n, int nodeCount,
-                                 int* __restrict__ visited, int* __restrict__ errors) {
+                                 int internalCount, int leafSize, int* __restrict__ visited,
+                                 int* __restrict__ errors) {
     const int i = blockIdx.x * kBlock + threadIdx.x;
     if (i >= nodeCount) return;
 
     const GpuBVHNode& nd = nodes[i];
-    if (i < n - 1) {
+    if (i < internalCount) {
         if (nd.left < 0 || nd.left >= nodeCount || nd.right < 0 || nd.right >= nodeCount) {
             atomicAdd(&errors[0], 1);
             return;
@@ -368,15 +385,18 @@ __global__ void checkNodesKernel(const GpuBVHNode* __restrict__ nodes,
             atomicAdd(&errors[0], 1);
         }
     } else {
-        const int slot = -nd.left - 1;
-        if (slot < 0 || slot >= n) {
+        const int start = -nd.left - 1;
+        if (start < 0 || nd.right < 1 || nd.right > leafSize || start + nd.right > n) {
             atomicAdd(&errors[0], 1);
             return;
         }
+        AABB uni = sortedTris[start].bounds();
+        for (int s = start + 1, end = start + nd.right; s < end; ++s) {
+            uni.extend(sortedTris[s].bounds());
+        }
         const AABB mine = nodeBox(nd);
-        const AABB tri = sortedTris[slot].bounds();
-        if (mine.mn.x != tri.mn.x || mine.mn.y != tri.mn.y || mine.mn.z != tri.mn.z ||
-            mine.mx.x != tri.mx.x || mine.mx.y != tri.mx.y || mine.mx.z != tri.mx.z) {
+        if (mine.mn.x != uni.mn.x || mine.mn.y != uni.mn.y || mine.mn.z != uni.mn.z ||
+            mine.mx.x != uni.mx.x || mine.mx.y != uni.mx.y || mine.mx.z != uni.mx.z) {
             atomicAdd(&errors[1], 1);
         }
     }
@@ -421,16 +441,22 @@ void warmupBuildGPU() {
     cudaOk(cudaDeviceSynchronize(), "warmup sync");
 }
 
-GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
+GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings, int leafSize) {
     const int n = static_cast<int>(scene.tris.size());
     if (n < 2) throw std::runtime_error("buildBVHGPU: at least 2 triangles required");
+    if (leafSize < 1) leafSize = 1;
 
-    const int nodeCount = 2 * n - 1;
-    const int internalCount = n - 1;
+    // 每片叶子装 leafSize 个 Morton 序相邻的三角形。groups 既是叶子数，也是
+    // Karras 建树时"图元"的个数——叶子盒在建树前就知道，不用事后裁剪。
+    const int groups = (n + leafSize - 1) / leafSize;
+    const int nodeCount = 2 * groups - 1;
+    const int internalCount = groups - 1;
 
     GpuBVH bvh;
     bvh.triCount = n;
     bvh.nodeCount = nodeCount;
+    bvh.internalCount = internalCount;
+    bvh.leafSize = leafSize;
     cudaOk(cudaMalloc(&bvh.d_nodes, static_cast<size_t>(nodeCount) * sizeof(GpuBVHNode)), "nodes");
     cudaOk(cudaMalloc(&bvh.d_tris, static_cast<size_t>(n) * sizeof(Tri)), "tris");
     cudaOk(cudaMalloc(&bvh.d_primIds, static_cast<size_t>(n) * sizeof(int)), "primIds");
@@ -446,6 +472,7 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
                "H2D tris");
 
         DevBuf<uint64_t> dKeys(n), dKeysSorted(n);
+        DevBuf<uint64_t> dGroupKeys(groups);
         DevBuf<int> dOrder(n), dOrderSorted(n);
         DevBuf<int> dParent(nodeCount);
         DevBuf<int> dDepth(nodeCount);
@@ -480,7 +507,9 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
 
         cudaOk(cudaMemset(dParent.p, 0xff, static_cast<size_t>(nodeCount) * sizeof(int)), "parent");
         internalInitKernel<<<blocksFor(internalCount), kBlock>>>(nodes, internalCount);
-        buildInternalKernel<<<blocksFor(internalCount), kBlock>>>(dKeysSorted.p, n, nodes,
+        groupKeysKernel<<<blocksFor(groups), kBlock>>>(dKeysSorted.p, n, groups, leafSize,
+                                                       dGroupKeys.p);
+        buildInternalKernel<<<blocksFor(internalCount), kBlock>>>(dGroupKeys.p, groups, nodes,
                                                                   dParent.p);
         cudaOk(cudaGetLastError(), "build internal");
         cudaOk(cudaMemset(dMaxDepth.p, 0, sizeof(int)), "maxDepth");
@@ -489,7 +518,7 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
         if (bvh.depth >= kDepthBins) throw std::runtime_error("buildBVHGPU: depth exceeds bin table");
         clock.mark();  // 4
 
-        leafInitKernel<<<blocksFor(n), kBlock>>>(nodes, sortedTris, n);
+        leafInitKernel<<<blocksFor(groups), kBlock>>>(nodes, sortedTris, n, groups, leafSize);
         iotaKernel<<<blocksFor(internalCount), kBlock>>>(dDepthVal.p, internalCount);
 
         // 内部节点编号恰好是 0..n-2，叶子不会进桶——refit 少处理一半的节点。
@@ -560,7 +589,8 @@ void destroyBVHGPU(GpuBVH& bvh) {
 std::string validateBVHGPU(const GpuBVH& bvh, const Scene& scene) {
     const int n = bvh.triCount;
     const int nodeCount = bvh.nodeCount;
-    if (nodeCount != 2 * n - 1) return "nodeCount != 2n-1";
+    if (nodeCount != 2 * bvh.internalCount + 1) return "nodeCount != 2g-1";
+    if ((n + bvh.leafSize - 1) / bvh.leafSize != bvh.internalCount + 1) return "leaf group count";
 
     const auto* nodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
     const auto* sortedTris = static_cast<const Tri*>(bvh.d_tris);
@@ -570,8 +600,9 @@ std::string validateBVHGPU(const GpuBVH& bvh, const Scene& scene) {
     cudaOk(cudaMemset(dVisited.p, 0, static_cast<size_t>(nodeCount) * sizeof(int)), "visited");
     cudaOk(cudaMemset(dErrors.p, 0, 4 * sizeof(int)), "errors");
 
-    checkNodesKernel<<<blocksFor(nodeCount), kBlock>>>(nodes, sortedTris, n, nodeCount, dVisited.p,
-                                                       dErrors.p);
+    checkNodesKernel<<<blocksFor(nodeCount), kBlock>>>(nodes, sortedTris, n, nodeCount,
+                                                       bvh.internalCount, bvh.leafSize,
+                                                       dVisited.p, dErrors.p);
     checkRefsKernel<<<blocksFor(nodeCount), kBlock>>>(dVisited.p, nodeCount, dErrors.p);
 
     int errors[4] = {};

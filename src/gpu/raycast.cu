@@ -116,12 +116,14 @@ __global__ __launch_bounds__(kBlock) void raycastKernel(
                 const GpuBVHNode nd = nodes[id];
 
                 if (nd.left < 0) {
-                    const Tri& tri = tris[-nd.left - 1];
-                    ++triTests;
-                    float t;
-                    if (intersectTriangle(ray, tri, t) && t < best) {
-                        best = t;
-                        any = true;
+                    const int start = -nd.left - 1;
+                    triTests += nd.right;
+                    for (int s = start, send = start + nd.right; s < send; ++s) {
+                        float t;
+                        if (intersectTriangle(ray, tris[s], t) && t < best) {
+                            best = t;
+                            any = true;
+                        }
                     }
                     continue;
                 }

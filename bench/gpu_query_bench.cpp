@@ -44,6 +44,7 @@ struct Options {
     bool stats = false;
     std::string dump;
     int warmupMs = 3000;
+    int leaf = 4;
 };
 
 void printUsage() {
@@ -59,6 +60,7 @@ void printUsage() {
         "  --points N                     查询点数，default 20000\n"
         "  --runs N                       计时轮数，取中位数，default 5\n"
         "  --warmup-ms N                  计时前持续负载毫秒数，default 3000\n"
+        "  --leaf N                       每叶三角形数，default 4\n"
         "  --seed N                       default 1\n"
         "  --stats                        额外跑一轮带节点/三角形计数的查询\n"
         "  --verify / --no-verify         是否逐点对拍（default verify）\n"
@@ -113,6 +115,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             const char* v = needValue("--warmup-ms");
             if (!v) return false;
             opt.warmupMs = std::max(0, std::atoi(v));
+        } else if (arg == "--leaf") {
+            const char* v = needValue("--leaf");
+            if (!v) return false;
+            opt.leaf = std::max(1, std::atoi(v));
         } else if (arg == "--seed") {
             const char* v = needValue("--seed");
             if (!v) return false;
@@ -279,16 +285,16 @@ int main(int argc, char** argv) {
     GpuBVH gpu;
     try {
         warmupBuildGPU();
-        gpu = buildBVHGPU(scene, &build);
+        gpu = buildBVHGPU(scene, &build, opt.leaf);
     } catch (const std::exception& e) {
         std::printf("gpu build failed: %s\n", e.what());
         return 3;
     }
     std::printf(
         "gpu build morton=%.2f sort=%.2f scatter=%.2f tree=%.2f refit=%.2f total=%.2f ms "
-        "nodes=%d depth=%d\n",
+        "nodes=%d internal=%d leaf=%d depth=%d\n",
         build.mortonMs, build.sortMs, build.scatterMs, build.treeMs, build.refitMs, build.totalMs,
-        gpu.nodeCount, gpu.depth);
+        gpu.nodeCount, gpu.internalCount, gpu.leafSize, gpu.depth);
     const std::string treeError = validateBVHGPU(gpu, scene);
     std::printf("gpu tree %s%s\n", treeError.empty() ? "PASS" : "FAIL: ", treeError.c_str());
     if (!treeError.empty()) return 4;

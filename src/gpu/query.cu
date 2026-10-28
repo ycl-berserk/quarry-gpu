@@ -73,14 +73,17 @@ __global__ __launch_bounds__(kBlock) void closestPointKernel(
             ++nodeTests;
 
             if (nd.left < 0) {
-                const int slot = -nd.left - 1;
-                ++triTests;
-                const ClosestHit h = closestPointOnTriangle(p, tris[slot]);
-                const int tri = primIds[slot];
-                // 与 closerHit 等价：(距离, 场景索引) 字典序严格更小才替换。
-                if (bestTri < 0 || h.dist2 < best2 || (h.dist2 == best2 && tri < bestTri)) {
-                    best2 = h.dist2;
-                    bestTri = tri;
+                // 叶子是一个连续区间 [start, start+count)，count <= leafSize。
+                const int start = -nd.left - 1;
+                triTests += nd.right;
+                for (int s = start, e = start + nd.right; s < e; ++s) {
+                    const ClosestHit h = closestPointOnTriangle(p, tris[s]);
+                    const int tri = primIds[s];
+                    // 与 closerHit 等价：(距离, 场景索引) 字典序严格更小才替换。
+                    if (bestTri < 0 || h.dist2 < best2 || (h.dist2 == best2 && tri < bestTri)) {
+                        best2 = h.dist2;
+                        bestTri = tri;
+                    }
                 }
                 continue;
             }
@@ -180,12 +183,14 @@ __global__ __launch_bounds__(kBlock) void kNearestKernel(
             ++nodeTests;
 
             if (nd.left < 0) {
-                const int slot = -nd.left - 1;
-                ++triTests;
-                const ClosestHit h = closestPointOnTriangle(p, tris[slot]);
-                const KnnEntry e{h.dist2, primIds[slot]};
-                if (n == k && !knnBetter(e, best[k - 1])) continue;
-                knnInsert(best, n, k, e);
+                const int start = -nd.left - 1;
+                triTests += nd.right;
+                for (int s = start, send = start + nd.right; s < send; ++s) {
+                    const ClosestHit h = closestPointOnTriangle(p, tris[s]);
+                    const KnnEntry e{h.dist2, primIds[s]};
+                    if (n == k && !knnBetter(e, best[k - 1])) continue;
+                    knnInsert(best, n, k, e);
+                }
                 continue;
             }
 
@@ -270,9 +275,11 @@ __global__ __launch_bounds__(kBlock) void radiusCountKernel(
             ++nodeTests;
 
             if (nd.left < 0) {
-                const int slot = -nd.left - 1;
-                ++triTests;
-                if (closestPointOnTriangle(p, tris[slot]).dist2 <= r2) ++found;
+                const int start = -nd.left - 1;
+                triTests += nd.right;
+                for (int s = start, send = start + nd.right; s < send; ++s) {
+                    if (closestPointOnTriangle(p, tris[s]).dist2 <= r2) ++found;
+                }
                 continue;
             }
 
@@ -318,16 +325,18 @@ __global__ __launch_bounds__(kBlock) void radiusFillKernel(
         if (!radiusVisit(p, nd, r2)) continue;
 
         if (nd.left < 0) {
-            const int slot = -nd.left - 1;
-            const ClosestHit h = closestPointOnTriangle(p, tris[slot]);
-            if (h.dist2 > r2) continue;
-            const int tri = primIds[slot];
-            // 非负浮点的位模式就是升序整数，拼上场景索引后按 64 位键升序排
-            // 就等价于 closerHit 的 (dist2, 索引) 字典序。三角形索引随键一起排，
-            // 不用再维护第二个数组。
-            keys[write] = (static_cast<unsigned long long>(__float_as_uint(h.dist2)) << 32) |
-                          static_cast<unsigned int>(tri);
-            ++write;
+            const int start = -nd.left - 1;
+            for (int s = start, send = start + nd.right; s < send; ++s) {
+                const ClosestHit h = closestPointOnTriangle(p, tris[s]);
+                if (h.dist2 > r2) continue;
+                const int tri = primIds[s];
+                // 非负浮点的位模式就是升序整数，拼上场景索引后按 64 位键升序排
+                // 就等价于 closerHit 的 (dist2, 索引) 字典序。三角形索引随键一起排，
+                // 不用再维护第二个数组。
+                keys[write] = (static_cast<unsigned long long>(__float_as_uint(h.dist2)) << 32) |
+                              static_cast<unsigned int>(tri);
+                ++write;
+            }
         } else {
             // 和计数那一遍一样在溢出处停下，否则写指针会越出本查询点的段。
             if (sp + 2 > kStack) break;

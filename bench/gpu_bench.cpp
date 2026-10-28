@@ -41,6 +41,7 @@ struct Options {
     RaySort raySort = RaySort::None;
     int diagRay = -1;
     int warmupMs = 3000;
+    int leaf = 4;
 };
 
 void printUsage() {
@@ -54,6 +55,7 @@ void printUsage() {
         "  --mode down|random             default down\n"
         "  --runs N                       计时轮数，取中位数，default 5\n"
         "  --warmup-ms N                  计时前持续负载毫秒数，default 3000\n"
+        "  --leaf N                       每叶三角形数，default 4\n"
         "  --seed N                       default 1\n"
         "  --stats                        额外跑一轮带计数的遍历\n"
         "  --ray-sort                     GPU 内按原点 Morton 序重排射线（端到端计时）\n"
@@ -99,6 +101,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             const char* v = needValue("--warmup-ms");
             if (!v) return false;
             opt.warmupMs = std::max(0, std::atoi(v));
+        } else if (arg == "--leaf") {
+            const char* v = needValue("--leaf");
+            if (!v) return false;
+            opt.leaf = std::max(1, std::atoi(v));
         } else if (arg == "--seed") {
             const char* v = needValue("--seed");
             if (!v) return false;
@@ -223,7 +229,7 @@ int main(int argc, char** argv) {
     GpuBVH gpu;
     try {
         warmupBuildGPU();  // 模块懒加载的一次性开销不算进构建
-        gpu = buildBVHGPU(scene, &build);
+        gpu = buildBVHGPU(scene, &build, opt.leaf);
     } catch (const std::exception& e) {
         std::printf("gpu build failed: %s\n", e.what());
         return 3;
@@ -231,11 +237,11 @@ int main(int argc, char** argv) {
 
     std::printf(
         "gpu build morton=%.2f sort=%.2f scatter=%.2f tree=%.2f refit=%.2f total=%.2f ms "
-        "nodes=%d depth=%d\n",
+        "nodes=%d internal=%d leaf=%d depth=%d\n",
         build.mortonMs, build.sortMs, build.scatterMs, build.treeMs, build.refitMs, build.totalMs,
-        gpu.nodeCount, gpu.depth);
-    if (gpu.nodeCount != static_cast<int>(2 * scene.tris.size() - 1)) {
-        std::printf("gpu tree FAIL: node count %d\n", gpu.nodeCount);
+        gpu.nodeCount, gpu.internalCount, gpu.leafSize, gpu.depth);
+    if (gpu.nodeCount != 2 * gpu.internalCount + 1) {
+        std::printf("gpu tree FAIL: node count %d != 2*%d+1\n", gpu.nodeCount, gpu.internalCount);
         return 4;
     }
 
