@@ -70,6 +70,43 @@ if(QUARRY_GPU)
 
         add_executable(gpu_query_bench bench/gpu_query_bench.cpp)
         target_link_libraries(gpu_query_bench PRIVATE quarry_gpu)
+
+        # Python 绑定：pybind11 由 pip 安装时不是系统包，向解释器要 cmakedir。
+        # 没装就跳过，CI（无 CUDA）和纯 C++ 构建都不受影响。
+        option(QUARRY_PYTHON "Build the Python bindings when pybind11 is available" ON)
+        if(QUARRY_PYTHON)
+            find_package(Python COMPONENTS Interpreter Development.Module QUIET)
+            if(Python_FOUND)
+                execute_process(
+                    COMMAND ${Python_EXECUTABLE} -m pybind11 --cmakedir
+                    OUTPUT_VARIABLE QUARRY_PYBIND11_DIR
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET RESULT_VARIABLE QUARRY_PYBIND11_RC)
+            endif()
+            if(Python_FOUND AND QUARRY_PYBIND11_RC EQUAL 0)
+                find_package(pybind11 CONFIG QUIET PATHS ${QUARRY_PYBIND11_DIR} NO_DEFAULT_PATH)
+            endif()
+            if(pybind11_FOUND)
+                pybind11_add_module(quarry_py MODULE bindings/python/quarry_py.cpp)
+                target_link_libraries(quarry_py PRIVATE quarry_gpu)
+                set_target_properties(quarry_py PROPERTIES
+                    OUTPUT_NAME quarry
+                    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python
+                    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python)
+                # Python 3.8+ 不再用 PATH 找扩展模块的依赖，把 cudart 放到 .pyd 旁边，
+                # 免去在每个脚本里 os.add_dll_directory。
+                file(GLOB QUARRY_CUDART_DLLS "${CUDAToolkit_BIN_DIR}/cudart64_*.dll")
+                if(QUARRY_CUDART_DLLS)
+                    add_custom_command(TARGET quarry_py POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                                ${QUARRY_CUDART_DLLS} $<TARGET_FILE_DIR:quarry_py>)
+                endif()
+                message(STATUS "Python ${Python_VERSION}: building quarry bindings")
+            else()
+                message(STATUS "pybind11 not found: skipping Python bindings")
+            endif()
+        endif()
+
         message(STATUS "CUDA ${CUDAToolkit_VERSION} found: building quarry_gpu (sm_${QUARRY_CUDA_ARCH})")
     else()
         message(STATUS "CUDA not found: building CPU-only")

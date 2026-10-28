@@ -120,6 +120,45 @@ Embree `rtcPointQuery`、Warp 1.6.2（`wp.mesh_query_point_no_sign`）对照；k
 - **注意精度口径**：quarry 的结果与 CPU 参考逐位相同；Warp 用 float32 重建最近点，
   选中的三角形一致但距离末几位不同（200 个采样点上 `suboptimal=0`）。
 
+## Python 绑定
+
+有 Python 3.8+ 和 `pip install pybind11 numpy` 时，`build.bat` 会顺带把扩展模块建到
+`build\python\`，并把 `cudart64_12.dll` 拷到 `.pyd` 旁边（Python 3.8+ 不再用 PATH 找
+扩展模块的依赖）：
+
+```python
+import numpy as np, quarry
+
+v, f = quarry.demo_mesh(grid=256, seed=1)   # 或别的 (N,3) / (M,3) 网格
+scene = quarry.Scene(v, f)                  # 也可 Scene(triangles (M,3,3))
+d2, tri = scene.closest(points)             # (N,) float32, (N,) int32
+```
+
+```bat
+py -3.13 python/demo.py          :: 建场景 + 四种查询 + 开销拆分
+py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（21 项检查）
+```
+
+| 入口 | 返回 |
+|---|---|
+| `quarry.describe()` | 显卡字符串；无 CUDA 时为空串 |
+| `quarry.demo_mesh(kind, grid, random_tris, seed)` | `(vertices (N,3) f32, indices (M,3) i32)` |
+| `Scene(vertices, indices)` / `Scene(triangles)` | 构建 GPU BVH；`triangle_count` / `node_count` / `depth` / `bounds` / `build_stats` |
+| `scene.validate()` | 树结构自检，空串表示通过 |
+| `scene.raycast(origins, dirs, tmax=inf)` | `(hit bool[N], t f32[N])`，未命中 `t=inf` |
+| `scene.closest(points)` | `(dist2 f32[N], triangle i32[N])` |
+| `scene.knn(points, k)` | `(dist2 f32[N,k], triangle i32[N,k])`，按 `(dist2, 索引)` 升序，缺位 -1 |
+| `scene.radius(points, r)` | CSR：`(offsets i64[N+1], dist2 f32[total], triangle i32[total])`，段内有序 |
+
+- 入参统一按 `float32` / C 连续处理（`forcecast`），传 float64 或非连续数组会先拷贝。
+  返回数组在重新拿到 GIL 之后才分配，构建与查询期间 GIL 是释放的。
+- `last_query_ms` 是 CUDA event 计的内核时间，`build_ms` 是构建路径的墙钟；
+  端到端还包含上传、回读和建 Python 数组。131k 场景、20k 查询点的 closest：
+  墙钟中位数 1.44 ms，内核 1.29 ms，**Python 侧固定开销约 0.14 ms**。
+- 进程里**第一个** `Scene` 还要付一次 CUDA 模块懒加载，约 0.5 s 墙钟，而它报告
+  的 `build_ms` 只有 2 ms——计时数字对得上内核，对不上你的 `time.perf_counter()`。
+- 每个查询调用内部同步一次，返回即可读；还没有异步 API。
+
 ## 我们做什么 / 不做什么
 
 做：
@@ -143,7 +182,9 @@ src/core/     几何、场景生成、射线的可复现输入（host/device 共
 src/cpu/      暴力法真值 + 朴素 BVH 参照
 src/gpu/      CUDA：并行 LBVH 构建（lbvh.cu）、光线遍历（raycast.cu）、点查询（query.cu）
 src/cli/      quarry 命令行
+bindings/     pybind11 绑定（quarry_py.cpp）
 bench/        Embree 对照、Warp 对照与 gpu_*_bench（同一份输入，二进制转储互通）
+python/       Python 侧的用法示例与 numpy 对拍
 tests/        自测入口
 learn/        教程配套的单文件练习
 ```
@@ -158,6 +199,8 @@ learn/        教程配套的单文件练习
 - 场景类型只有地形网格和随机三角形，缺非均匀模型（Dragon/Lucy）与多层遮挡
 - closest 已和 Embree 32 线程（3.0–16.3×）与 Warp 1.6.2（0.72–1.15×）对拍；
   kNN / 半径在两家外部库里都没有原生入口，只有自家 CPU 参考
+- Python 绑定是同步的：每次调用都上传、同步、回读，没有异步 / 零拷贝接口；
+  场景不可增量更新，换场景只能重建 `Scene`
 - BVH 每叶 1 个三角形，2M 场景 419 万节点；Morton 叶子批量（4–8 个/叶）实测
   遍历更慢（射线 2.2×、kNN 1.8×），已回退。Warp 的叶子 4 个配的是 SAH 建树，
   要追这 1.2–1.4× 需要 GPU 自顶向下 SAH 或 BVH4 宽节点
