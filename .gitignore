@@ -11,3 +11,4 @@ compile_commands.json
 *.dll
 *.lib
 *.exp
+__pycache__/

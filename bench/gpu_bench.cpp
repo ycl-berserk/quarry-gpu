@@ -40,6 +40,7 @@ struct Options {
     enum class RaySort { None, Host, Gpu, GpuDir };
     RaySort raySort = RaySort::None;
     int diagRay = -1;
+    int warmupMs = 3000;
 };
 
 void printUsage() {
@@ -52,6 +53,7 @@ void printUsage() {
         "  --rays N                       default 1000000\n"
         "  --mode down|random             default down\n"
         "  --runs N                       计时轮数，取中位数，default 5\n"
+        "  --warmup-ms N                  计时前持续负载毫秒数，default 3000\n"
         "  --seed N                       default 1\n"
         "  --stats                        额外跑一轮带计数的遍历\n"
         "  --ray-sort                     GPU 内按原点 Morton 序重排射线（端到端计时）\n"
@@ -93,6 +95,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             const char* v = needValue("--runs");
             if (!v) return false;
             opt.runs = std::max(1, std::atoi(v));
+        } else if (arg == "--warmup-ms") {
+            const char* v = needValue("--warmup-ms");
+            if (!v) return false;
+            opt.warmupMs = std::max(0, std::atoi(v));
         } else if (arg == "--seed") {
             const char* v = needValue("--seed");
             if (!v) return false;
@@ -258,8 +264,17 @@ int main(int argc, char** argv) {
     const double uploadMs = nowMs() - uploadStart;
     std::printf("upload_ms=%.2f\n", uploadMs);
 
-    // 预热：第一次 kernel 会带上上下文初始化
+    // 第一次 kernel 会带上上下文初始化；之后持续跑 warmup_ms，让 DVFS 把 SM 时钟
+    // 拉到稳定档。笔记本上 32 ms 级的遍历 kernel 单独跑多少次都升不了频，实测
+    // 冷态 780 MHz、热态 2025 MHz，同一二进制的吞吐差 2.5× 以上。
     raycastGPU(gpu, rayBuf, false, gpuOrder);
+    const double warmStart = nowMs();
+    int warmRuns = 0;
+    while (nowMs() - warmStart < opt.warmupMs) {
+        raycastGPU(gpu, rayBuf, false, gpuOrder);
+        ++warmRuns;
+    }
+    std::printf("gpu warmup_ms=%.0f runs=%d\n", nowMs() - warmStart, warmRuns);
 
     std::vector<double> gpuTimes;
     for (int run = 0; run < opt.runs; ++run)

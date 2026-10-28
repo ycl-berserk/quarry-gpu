@@ -42,6 +42,8 @@ struct Options {
     bool verify = true;
     bool cpu = true;
     bool stats = false;
+    std::string dump;
+    int warmupMs = 3000;
 };
 
 void printUsage() {
@@ -56,10 +58,12 @@ void printUsage() {
         "  --random-tris N                random/mixed 的随机三角形数\n"
         "  --points N                     查询点数，default 20000\n"
         "  --runs N                       计时轮数，取中位数，default 5\n"
+        "  --warmup-ms N                  计时前持续负载毫秒数，default 3000\n"
         "  --seed N                       default 1\n"
         "  --stats                        额外跑一轮带节点/三角形计数的查询\n"
         "  --verify / --no-verify         是否逐点对拍（default verify）\n"
-        "  --no-cpu                       跳过 CPU 参考查询（大场景省时间）\n");
+        "  --no-cpu                       跳过 CPU 参考查询（大场景省时间）\n"
+        "  --dump FILE                    把场景与查询点写成二进制后退出（给外部引擎对照用）\n");
 }
 
 bool parseArgs(int argc, char** argv, Options& opt) {
@@ -105,6 +109,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             const char* v = needValue("--runs");
             if (!v) return false;
             opt.runs = std::max(1, std::atoi(v));
+        } else if (arg == "--warmup-ms") {
+            const char* v = needValue("--warmup-ms");
+            if (!v) return false;
+            opt.warmupMs = std::max(0, std::atoi(v));
         } else if (arg == "--seed") {
             const char* v = needValue("--seed");
             if (!v) return false;
@@ -117,6 +125,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             opt.verify = false;
         } else if (arg == "--no-cpu") {
             opt.cpu = false;
+        } else if (arg == "--dump") {
+            const char* v = needValue("--dump");
+            if (!v) return false;
+            opt.dump = v;
         } else if (arg == "-h" || arg == "--help") {
             printUsage();
             return false;
@@ -126,6 +138,35 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         }
     }
     return true;
+}
+
+// 二进制格式（小端）：magic "QRYD" + version=1 + nTris + nPoints + 三角形顶点 +
+// 查询点。外部引擎（Warp 等）读同一份输入，跨语言对照才不是"各自生成一个近似场景"。
+bool dumpQueryInput(const std::string& path, const Scene& scene, const std::vector<Vec3>& points) {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        std::fprintf(stderr, "cannot open %s\n", path.c_str());
+        return false;
+    }
+    const uint32_t magic = 0x44595251u;  // "QRYD"
+    const uint32_t version = 1;
+    const uint64_t nTris = scene.tris.size();
+    const uint64_t nPoints = points.size();
+    std::fwrite(&magic, sizeof(magic), 1, f);
+    std::fwrite(&version, sizeof(version), 1, f);
+    std::fwrite(&nTris, sizeof(nTris), 1, f);
+    std::fwrite(&nPoints, sizeof(nPoints), 1, f);
+    for (const Tri& t : scene.tris) {
+        const float v[9] = {t.a.x, t.a.y, t.a.z, t.b.x, t.b.y, t.b.z, t.c.x, t.c.y, t.c.z};
+        std::fwrite(v, sizeof(float), 9, f);
+    }
+    for (const Vec3& p : points) {
+        const float v[3] = {p.x, p.y, p.z};
+        std::fwrite(v, sizeof(float), 3, f);
+    }
+    const bool ok = std::fflush(f) == 0 && std::ferror(f) == 0;
+    std::fclose(f);
+    return ok;
 }
 
 ClosestHit hitFromGpu(const GpuClosestResult& r) {
@@ -182,6 +223,13 @@ int main(int argc, char** argv) {
     if (knnMode) std::printf(" k=%d", opt.k);
     if (radiusMode) std::printf(" radius=%g", static_cast<double>(opt.radius));
     std::printf(" seed=%llu\n", static_cast<unsigned long long>(opt.seed));
+
+    if (!opt.dump.empty()) {
+        if (!dumpQueryInput(opt.dump, scene, points)) return 1;
+        std::printf("dumped %s (%zu tris, %zu points)\n", opt.dump.c_str(), scene.tris.size(),
+                    points.size());
+        return 0;
+    }
 
     // ---- CPU 参考 ----
     BVH cpuBVH;
@@ -258,6 +306,24 @@ int main(int argc, char** argv) {
     std::vector<double> gpuTimes;
     GpuRadiusBuffer radiusBuf;
     try {
+        // 笔记本的 DVFS 不会因为几十毫秒的 kernel 就升到稳定时钟：计时前先持续
+        // 跑 warmup_ms（默认 3 s，实测时钟约在 4 s 到顶），否则同一二进制在"冷"
+        // 和"热"两种时钟状态下的差可以到 2.5×。
+        const double warmStart = nowMs();
+        int warmRuns = 0;
+        while (nowMs() - warmStart < opt.warmupMs) {
+            if (radiusMode) {
+                destroyRadiusBufferGPU(radiusBuf);
+                radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, false);
+            } else if (knnMode) {
+                kNearestGPU(gpu, buf, opt.k, false);
+            } else {
+                closestPointGPU(gpu, buf, false);
+            }
+            ++warmRuns;
+        }
+        std::printf("gpu warmup_ms=%.0f runs=%d\n", nowMs() - warmStart, warmRuns);
+
         for (int run = 0; run < opt.runs; ++run) {
             if (radiusMode) {
                 destroyRadiusBufferGPU(radiusBuf);  // 每轮重新分配，分配时间不计入 event
