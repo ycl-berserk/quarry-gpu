@@ -69,6 +69,24 @@ std::vector<Tri> trianglesFromMesh(const F32Array& vertices, const I32Array& ind
     return tris;
 }
 
+std::vector<Tri> trianglesFromIndices(const std::vector<Vec3>& verts,
+                                      const std::vector<int32_t>& indices) {
+    const int n = static_cast<int>(verts.size());
+    const size_t m = indices.size() / 3;
+    std::vector<Tri> tris(m);
+    for (size_t i = 0; i < m; ++i) {
+        const int a = indices[i * 3];
+        const int b = indices[i * 3 + 1];
+        const int c = indices[i * 3 + 2];
+        if (a < 0 || b < 0 || c < 0 || a >= n || b >= n || c >= n) {
+            throw std::invalid_argument("indices out of range");
+        }
+        tris[i] = {verts[static_cast<size_t>(a)], verts[static_cast<size_t>(b)],
+                   verts[static_cast<size_t>(c)]};
+    }
+    return tris;
+}
+
 std::vector<Vec3> pointsFromArray(const F32Array& arr, const char* what) {
     if (arr.ndim() != 2 || arr.shape(1) != 3) {
         throw std::invalid_argument(std::string(what) + " must have shape (N, 3)");
@@ -98,6 +116,7 @@ public:
 
     PyScene(const F32Array& vertices, const I32Array& indices)
         : tris_(trianglesFromMesh(vertices, indices)) {
+        indices_.assign(indices.data(), indices.data() + indices.size());
         build();
     }
 
@@ -111,6 +130,17 @@ public:
     int depth() const { return bvh_.depth; }
     double buildMs() const { return buildMs_; }
     double lastQueryMs() const { return lastQueryMs_; }
+    double refitMs() const { return refitMs_; }
+
+    py::dict refitStats() const {
+        py::dict out;
+        out["upload_ms"] = refitTimings_.uploadMs;
+        out["scatter_ms"] = refitTimings_.gatherMs;
+        out["tree_ms"] = refitTimings_.treeMs;
+        out["total_ms"] = refitTimings_.totalMs;
+        out["updated"] = refitTimings_.updated;
+        return out;
+    }
 
     py::dict bounds() const {
         py::dict out;
@@ -297,13 +327,55 @@ private:
         buildMs_ = timings_.totalMs;
     }
 
+    // dirty 非 None 时只上传这些场景三角形（未列出的三角形在树里保持旧值），
+    // 调用方必须保证"没列出来的都没动"——这是增量接口的合同，不会被逐位校验兜住。
+    void update(std::vector<Tri> tris, const py::object& dirty) {
+        if (static_cast<int>(tris.size()) != bvh_.triCount) {
+            throw std::invalid_argument("update must keep the triangle count; rebuild instead");
+        }
+        std::vector<int> ids;
+        const bool partial = !dirty.is_none();
+        if (partial) {
+            const I32Array arr = dirty.cast<I32Array>();
+            ids.assign(arr.data(), arr.data() + arr.size());
+        }
+
+        tris_ = std::move(tris);
+        sceneView_.tris = tris_;
+        sceneView_.updateBounds();
+        bounds_ = sceneView_.bounds;
+
+        {
+            py::gil_scoped_release release;
+            refitMs_ = partial ? refitBVHGPU(bvh_, sceneView_, ids, &refitTimings_)
+                               : refitBVHGPU(bvh_, sceneView_, &refitTimings_);
+        }
+    }
+
+public:
+    void updateTriangles(const F32Array& triangles, const py::object& dirty) {
+        update(trianglesFromArray(triangles), dirty);
+    }
+
+    void updateVertices(const F32Array& vertices, const py::object& dirty) {
+        if (indices_.empty()) {
+            throw std::invalid_argument("Scene was built from triangles; use update_triangles");
+        }
+        const std::vector<Vec3> verts = pointsFromArray(vertices, "vertices");
+        update(trianglesFromIndices(verts, indices_), dirty);
+    }
+
+private:
     std::vector<Tri> tris_;
+    std::vector<int32_t> indices_;  // 只有 (vertices, indices) 构造时才有
     ::Scene sceneView_;
     AABB bounds_;
     GpuBVH bvh_;
     GpuBuildTimings timings_{};
+    GpuRefitTimings refitTimings_{};
     double buildMs_ = 0.0;
     double lastQueryMs_ = 0.0;
+    double refitMs_ = 0.0;
 };
 
 py::tuple demoMesh(const std::string& kind, int grid, int randomTris, uint64_t seed) {
@@ -362,9 +434,22 @@ PYBIND11_MODULE(quarry, m) {
                                "pays CUDA module load")
         .def_property_readonly("last_query_ms", &PyScene::lastQueryMs,
                                "Kernel time of the most recent query (CUDA events, no copies)")
+        .def_property_readonly("refit_ms", &PyScene::refitMs,
+                               "Time of the most recent update, including the H2D upload")
+        .def_property_readonly("refit_stats", &PyScene::refitStats,
+                               "Breakdown of the most recent update: upload_ms, scatter_ms, "
+                               "tree_ms, total_ms, updated")
         .def_property_readonly("bounds", &PyScene::bounds)
         .def_property_readonly("build_stats", &PyScene::buildStats)
         .def("validate", &PyScene::validate, "Check tree invariants; empty string means pass")
+        .def("update_triangles", &PyScene::updateTriangles, py::arg("triangles"),
+             py::arg("dirty") = py::none(),
+             "Refit in place: triangle i must still describe the same surface element. "
+             "dirty is an int32 array of scene indices to upload; omit it to upload everything")
+        .def("update_vertices", &PyScene::updateVertices, py::arg("vertices"),
+             py::arg("dirty") = py::none(),
+             "Same as update_triangles, but rebuilding the triangles from the mesh that was "
+             "used to construct this Scene")
         .def("raycast", &PyScene::raycast, py::arg("origins"), py::arg("dirs"),
              py::arg("tmax") = std::numeric_limits<float>::infinity(),
              "Return (hit bool[N], t float32[N]); t is inf on a miss. dirs need not be normalized")

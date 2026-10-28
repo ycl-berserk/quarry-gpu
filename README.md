@@ -5,8 +5,9 @@
 GPU 原生空间查询引擎：构建加速结构（BVH / 八叉树 / 哈希网格），支持射线求交、kNN、半径查询、AABB 查询，图元覆盖三角形、点云、高斯，并支持增量更新。
 
 许可证 Apache-2.0（见 `LICENSE`）。CPU 参考实现已完整；GPU 侧（CUDA 12.4，sm_89）已有
-并行 LBVH 构建、光线遍历，以及 closest / kNN / radius 三条点查询路径。没有 CUDA 工具链时
-自动降级为纯 CPU 构建，CI 与本文档的 CPU 数字不受影响。
+并行 LBVH 构建、光线遍历、closest / kNN / radius 三条点查询路径，以及拓扑冻结的
+增量更新（refit）。没有 CUDA 工具链时自动降级为纯 CPU 构建，CI 与本文档的 CPU
+数字不受影响。
 
 ## 现在能跑什么
 
@@ -22,6 +23,7 @@ build\gpu_bench.exe --grid 256 --rays 1000000 --runs 5 --stats   :: GPU 建树 +
 build\gpu_query_bench.exe --grid 256 --points 20000 --runs 5 --stats          :: GPU 最近点，逐点对拍 CPU
 build\gpu_query_bench.exe --grid 256 --points 20000 --query knn --k 16        :: GPU kNN
 build\gpu_query_bench.exe --grid 256 --points 20000 --query radius --radius 2.0  :: GPU 半径查询
+build\gpu_query_bench.exe --grid 256 --points 20000 --refit --refit-dirty 0.01  :: 局部 / 全量 refit + 重建对照
 ```
 
 输出包含一个**正确性指纹**（每条射线的命中标志 + t 值，按 FNV-1a 折叠）：
@@ -149,6 +151,8 @@ py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（21 项检查）
 | `scene.closest(points)` | `(dist2 f32[N], triangle i32[N])` |
 | `scene.knn(points, k)` | `(dist2 f32[N,k], triangle i32[N,k])`，按 `(dist2, 索引)` 升序，缺位 -1 |
 | `scene.radius(points, r)` | CSR：`(offsets i64[N+1], dist2 f32[total], triangle i32[total])`，段内有序 |
+| `scene.update_vertices(vertices, dirty=None)` | 拓扑冻结的 refit：顶点换位、三角形数不变；`dirty` 是改动三角形索引 |
+| `scene.update_triangles(triangles, dirty=None)` | 同上，直接给 `(M,3,3)`；`refit_ms` / `refit_stats` 读上一次的耗时 |
 
 - 入参统一按 `float32` / C 连续处理（`forcecast`），传 float64 或非连续数组会先拷贝。
   返回数组在重新拿到 GIL 之后才分配，构建与查询期间 GIL 是释放的。
@@ -158,6 +162,49 @@ py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（21 项检查）
 - 进程里**第一个** `Scene` 还要付一次 CUDA 模块懒加载，约 0.5 s 墙钟，而它报告
   的 `build_ms` 只有 2 ms——计时数字对得上内核，对不上你的 `time.perf_counter()`。
 - 每个查询调用内部同步一次，返回即可读；还没有异步 API。
+
+## 增量更新（refit）
+
+拓扑冻结：三角形数量与顺序不变，只改顶点位置。叶子盒按新三角形重写，内部盒自底向上
+合并成**精确并集**，所以 refit 之后的结果仍与 CPU 参考逐位相同；代价只是盒子变松、
+遍历要多测节点。
+
+```bat
+build\gpu_query_bench.exe --grid 256 --points 20000 --refit --refit-dirty 0.01 --refit-motion coherent
+```
+
+```python
+scene.update_vertices(v2)              # 全量 refit
+scene.update_triangles(tris2, dirty=[0, 5, 7])   # 只上传改动的三角形
+scene.refit_ms, scene.refit_stats       # {upload_ms, scatter_ms, tree_ms, total_ms, updated}
+```
+
+`--refit-dirty 0.01` 表示每 100 个三角形改 1 个。同一次会话内配对测得的
+refit / 重建耗时，以及 refit 后的查询相对重建树查询的倍数：
+
+| 三角形 | 运动 | 局部 refit 1% | 全量 refit | 整树重建 | 局部 / 重建 | 查询 refit / 重建 |
+|---|---|---|---|---|---|---|
+| 8,192 | 随机 | 0.242 ms | 0.221 ms | 0.884 ms | **3.7×** | 1.13× |
+| 131,072 | 随机 | 0.553 ms | 0.863 ms | 1.223 ms | **2.2×** | 1.60× |
+| 131,072 | 相干 | 0.284 ms | 1.004 ms | 2.222 ms | **7.8×** | 0.98× |
+| 2,097,152 | 随机 | 2.605 ms | 13.816 ms | 7.545 ms | **2.9×** | 3.61× |
+| 2,097,152 | 相干 | 2.294 ms | 14.681 ms | 7.528 ms | **3.3×** | 1.19× |
+
+- **全量 refit 是上传受限的**：从 CPU 侧场景出发每次要重传整棵三角形数组（2M 是 72 MB，
+  实测 H2D 10.8–11.7 ms），所以 2M 上 14.1 ms 比整树重建的 7.5 ms 更贵。它只在
+  小场景划算（8k 4.0×、131k 1.2–2.2×）。真正有用的增量路径是 `dirty` 子集：
+  只传改动三角形 + 叶子槽号，2M 1% 改动 2.3–2.6 ms。
+- **local refit 的时间几乎全在树合并**（131k：上传 0.031、scatter 0.021、树 0.208 ms）：
+  现在底向上仍会合并所有内部节点。下一步是只合并脏叶子的祖先，那才是"改动量决定
+  耗时"的终态。
+- **refit 后查询会变慢，程度取决于运动是否相干**：随机抖动让盒子迅速变松（平均节点
+  测试 131k 139 vs 85、2M 323 vs 99），整体平移几乎无损（131k 0.98×、2M 1.19×）。
+  这是 refit 的固有代价，和构建质量一起读才有意义。
+- 正确性门禁：每个规模、两种运动下，refit 树的内部盒逐位等于孩子并集、根盒等于
+  场景包围盒；closest / kNN(k=8) / radius(r=2.0) 的结果与 CPU 参考逐位一致
+  （`count/tri/dist2_mismatch` 全 0）。
+- 语义限制：**不增删三角形、不重排**。改了面数请重建；`update_vertices` 只对
+  `Scene(vertices, indices)` 构造的场景有效。
 
 ## 我们做什么 / 不做什么
 
@@ -199,8 +246,9 @@ learn/        教程配套的单文件练习
 - 场景类型只有地形网格和随机三角形，缺非均匀模型（Dragon/Lucy）与多层遮挡
 - closest 已和 Embree 32 线程（3.0–16.3×）与 Warp 1.6.2（0.72–1.15×）对拍；
   kNN / 半径在两家外部库里都没有原生入口，只有自家 CPU 参考
-- Python 绑定是同步的：每次调用都上传、同步、回读，没有异步 / 零拷贝接口；
-  场景不可增量更新，换场景只能重建 `Scene`
+- Python 绑定是同步的：每次调用都上传、同步、回读，没有异步 / 零拷贝接口
+- refit 拓扑冻结：不增删、不重排三角形；`dirty` 路径省掉的是上传与叶子重写，
+  树合并仍是全树一遍（下一步只合并脏叶子的祖先）
 - BVH 每叶 1 个三角形，2M 场景 419 万节点；Morton 叶子批量（4–8 个/叶）实测
   遍历更慢（射线 2.2×、kNN 1.8×），已回退。Warp 的叶子 4 个配的是 SAH 建树，
   要追这 1.2–1.4× 需要 GPU 自顶向下 SAH 或 BVH4 宽节点

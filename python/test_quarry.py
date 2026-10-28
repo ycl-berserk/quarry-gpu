@@ -99,6 +99,29 @@ def check(name, cond, detail=""):
     print(f"[PASS] {name}")
 
 
+def closest_brute(points, tris):
+    """每个点到全部三角形的 (平方距离矩阵, 最小距离, argmin)。"""
+    a64, b64, c64 = (tris[:, j].astype(np.float64) for j in range(3))
+    D = np.empty((len(points), len(tris)))
+    for i, p in enumerate(points):
+        q = closest_point_on_triangles(p.astype(np.float64), a64, b64, c64)
+        D[i] = np.einsum("ij,ij->i", q - p, q - p)
+    return D, D.min(axis=1), D.argmin(axis=1).astype(np.int32)
+
+
+def check_closest(scene, points, tris, label):
+    """距离按容差、ID 按"并列允许"判定：地形上相邻三角形的距离经常只差 1 ulp。"""
+    D, ref_d2, ref_tri = closest_brute(points, tris)
+    dist2, tri = scene.closest(points)
+    check(f"{label} distance", np.allclose(dist2, ref_d2, rtol=2e-4, atol=1e-6),
+          f"max abs diff {np.max(np.abs(dist2 - ref_d2)):.3e}")
+    tie_ok = D[np.arange(len(points)), tri] <= ref_d2 * (1 + 2e-4) + 1e-6
+    check(f"{label} ids (ties allowed)", np.all(tie_ok),
+          f"{np.sum(~tie_ok)} points pick a strictly farther triangle; "
+          f"{np.sum(tri != ref_tri)} ids differ at ties")
+    return dist2, tri, D
+
+
 def main():
     np.set_printoptions(precision=6, suppress=True)
     device = quarry.describe()
@@ -124,21 +147,8 @@ def main():
 
     # 暴力参考：每个点到全部三角形的平方距离（double）。地形上点到相邻三角形的
     # 距离经常只差 1 ulp，ID 按"距离在容差内并列"判定，而不是要求整数完全相同。
-    a64, b64, c64 = (tris[:, j].astype(np.float64) for j in range(3))
-    D = np.empty((len(points), len(tris)))
-    for i, p in enumerate(points):
-        q = closest_point_on_triangles(p.astype(np.float64), a64, b64, c64)
-        D[i] = np.einsum("ij,ij->i", q - p, q - p)
+    dist2, tri, D = check_closest(scene, points, tris, "closest")
     ref_d2 = D.min(axis=1)
-    ref_tri = D.argmin(axis=1).astype(np.int32)
-
-    dist2, tri = scene.closest(points)
-    check("closest distance", np.allclose(dist2, ref_d2, rtol=2e-4, atol=1e-6),
-          f"max abs diff {np.max(np.abs(dist2 - ref_d2)):.3e}")
-    tie_ok = D[np.arange(len(points)), tri] <= ref_d2 * (1 + 2e-4) + 1e-6
-    check("closest ids (ties allowed)", np.all(tie_ok),
-          f"{np.sum(~tie_ok)} points pick a strictly farther triangle; "
-          f"{np.sum(tri != ref_tri)} ids differ at ties")
     check("last_query_ms", scene.last_query_ms > 0.0, scene.last_query_ms)
 
     k = 4
@@ -182,10 +192,36 @@ def main():
     face_scene = quarry.Scene(tris)
     check("triangles constructor", face_scene.triangle_count == 2048)
 
+    # ---- 增量更新 ----
+    lifted = vertices.copy()
+    lifted[:, 1] += 0.1
+    scene.update_vertices(lifted)
+    check("update keeps triangle count", scene.triangle_count == 2048)
+    check("update validate", scene.validate() == "", scene.validate())
+    check("update refit_ms", scene.refit_ms > 0.0, scene.refit_ms)
+    check("update uploaded everything", scene.refit_stats["updated"] == 2048,
+          scene.refit_stats["updated"])
+    new_lo, new_hi = np.array(scene.bounds["min"]), np.array(scene.bounds["max"])
+    check("update bounds", np.allclose(new_hi, lifted.max(axis=0), atol=1e-5),
+          (new_hi, lifted.max(axis=0)))
+    check_closest(scene, points, lifted[indices].astype(np.float32), "update closest")
+
+    # 只声明改动的三角形：未列出的在树里保持旧值，结果仍须与整份新数组一致
+    partial = lifted[indices].astype(np.float32)
+    dirty = np.array([0, 5, 7, 2047], dtype=np.int32)
+    partial[dirty] += np.array([0.0, 3.0, 0.0], dtype=np.float32)
+    scene.update_triangles(partial, dirty=dirty)
+    check("partial update validate", scene.validate() == "", scene.validate())
+    check("partial updated count", scene.refit_stats["updated"] == len(dirty),
+          scene.refit_stats["updated"])
+    check_closest(scene, points, partial, "partial update closest")
+
     for bad_call in (lambda: quarry.Scene(np.zeros((5, 3), dtype=np.float32)),
                      lambda: scene.knn(points, 0),
                      lambda: scene.knn(points, 33),
-                     lambda: scene.raycast(points, dirs[:-1])):
+                     lambda: scene.raycast(points, dirs[:-1]),
+                     lambda: scene.update_triangles(partial[:10]),
+                     lambda: face_scene.update_vertices(lifted)):
         try:
             bad_call()
         except ValueError:
