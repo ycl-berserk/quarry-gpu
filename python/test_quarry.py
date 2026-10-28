@@ -216,6 +216,14 @@ def main():
           scene.refit_stats["updated"])
     check_closest(scene, points, partial, "partial update closest")
 
+    # 第二次增量：与上一轮共享叶子和祖先，epoch 去重不能吃掉新一轮的标记
+    again = partial.copy()
+    dirty2 = np.array([0, 5, 7, 2047, 100], dtype=np.int32)
+    again[dirty2] += np.array([0.0, 3.0, 0.0], dtype=np.float32)
+    scene.update_triangles(again, dirty=dirty2)
+    check("second partial update validate", scene.validate() == "", scene.validate())
+    check_closest(scene, points, again, "second partial update closest")
+
     for bad_call in (lambda: quarry.Scene(np.zeros((5, 3), dtype=np.float32)),
                      lambda: scene.knn(points, 0),
                      lambda: scene.knn(points, 33),

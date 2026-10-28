@@ -28,6 +28,19 @@ struct GpuBVH {
     std::vector<int> primSlot;      // 场景索引 -> 叶子槽，只上传改动三角形时用
     void* d_stage = nullptr;        // 全量 refit 的上传暂存区，首次用到才分配
     int stageCount = 0;
+    void* d_dirtySlots = nullptr;   // 局部 refit 的暂存区，按需增长，不每次 cudaMalloc
+    void* d_dirtyTris = nullptr;
+    int dirtyCapacity = 0;
+
+    // 只合并脏叶子的祖先：沿 parent 链向上标记，按层收集，然后逐层发射。
+    // d_dirtyOrder 与 d_refitOrder 用同一套层区间，所以每层不会越界。
+    void* d_parent = nullptr;       // int[]，nodeCount，根为 -1
+    void* d_depth = nullptr;        // int[]，nodeCount
+    void* d_mark = nullptr;         // int[]，nodeCount，记录最后一次标记的 epoch
+    void* d_dirtyOrder = nullptr;   // int[]，internalCount
+    void* d_levelCounts = nullptr;  // int[]，每层本次要合并的节点数
+    void* d_refitOffsets = nullptr; // int[]，refitOffsets 的设备副本（标记 kernel 用）
+    int refitEpoch = 0;
 };
 
 struct GpuBuildTimings {
@@ -65,7 +78,9 @@ void warmupBuildGPU();
 struct GpuRefitTimings {
     double uploadMs = 0.0;  // H2D（全量或只上传改动的三角形）
     double gatherMs = 0.0;  // 按 primIds 重排进叶子顺序 + 重写叶子盒
-    double treeMs = 0.0;    // 逐层合并内部节点
+    double treeMs = 0.0;    // 逐层合并内部节点（增量路径还含祖先标记）
+    double markMs = 0.0;    // 增量路径：沿 parent 链标记脏叶子的祖先
+    double mergeMs = 0.0;   // 合并；全量路径即 treeMs
     double totalMs = 0.0;
     int updated = 0;        // 本次上传的三角形数
 };
@@ -73,8 +88,8 @@ struct GpuRefitTimings {
 // 全量重传：场景整体动过（或调用方手里只有一份新数组）。
 double refitBVHGPU(GpuBVH& bvh, const Scene& scene, GpuRefitTimings* timings = nullptr);
 
-// 只上传 dirty 里的场景三角形索引（scene 仍传完整的数组）。盒子照旧逐层合并——
-// 合并本身与改动量无关，省下来的是传输。
+// 只上传 dirty 里的场景三角形索引（scene 仍传完整的数组）。除了省掉传输，树合并
+// 也只处理这些叶子的祖先——耗时随改动量 × 树高走，不再与场景大小成正比。
 double refitBVHGPU(GpuBVH& bvh, const Scene& scene, const std::vector<int>& dirty,
                    GpuRefitTimings* timings = nullptr);
 

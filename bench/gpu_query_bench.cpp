@@ -641,8 +641,10 @@ int main(int argc, char** argv) {
             std::printf("gpu partial refit failed: %s\n", e.what());
             return 3;
         }
-        std::printf("partial updated=%d upload=%.3f scatter=%.3f tree=%.3f total=%.3f ms\n",
-                    partial.updated, partial.uploadMs, partial.gatherMs, partial.treeMs, partialMs);
+        std::printf("partial updated=%d upload=%.3f scatter=%.3f mark=%.3f merge=%.3f "
+                    "total=%.3f ms\n",
+                    partial.updated, partial.uploadMs, partial.gatherMs, partial.markMs,
+                    partial.mergeMs, partialMs);
         const std::string partialTree = validateBVHGPU(gpu, moved);
         std::printf("partial tree %s%s\n", partialTree.empty() ? "PASS" : "FAIL: ",
                     partialTree.c_str());

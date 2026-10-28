@@ -137,6 +137,8 @@ public:
         out["upload_ms"] = refitTimings_.uploadMs;
         out["scatter_ms"] = refitTimings_.gatherMs;
         out["tree_ms"] = refitTimings_.treeMs;
+        out["mark_ms"] = refitTimings_.markMs;
+        out["merge_ms"] = refitTimings_.mergeMs;
         out["total_ms"] = refitTimings_.totalMs;
         out["updated"] = refitTimings_.updated;
         return out;

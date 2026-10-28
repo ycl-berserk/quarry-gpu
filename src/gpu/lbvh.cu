@@ -347,6 +347,26 @@ __global__ void refitKernel(GpuBVHNode* __restrict__ nodes, const int* __restric
     }
 }
 
+// 增量路径：每层只合并脏叶子的祖先。发射容量取 min(脏叶子数, 该层原节点数)，
+// 实际条数从显存读——省掉每层一次 30–60 µs 的 D2H 同步。
+__global__ void refitAncestorKernel(GpuBVHNode* __restrict__ nodes,
+                                    const int* __restrict__ bucket,
+                                    const int* __restrict__ count, int capacity) {
+    const int t = blockIdx.x * kBlock + threadIdx.x;
+    if (t >= capacity || t >= *count) return;
+    const int i = bucket[t];
+    const GpuBVHNode node = nodes[i];
+    const GpuBVHNode l = nodes[node.left];
+    const GpuBVHNode r = nodes[node.right];
+    GpuBVHNode& out = nodes[i];
+    out.mnx = l.mnx < r.mnx ? l.mnx : r.mnx;
+    out.mny = l.mny < r.mny ? l.mny : r.mny;
+    out.mnz = l.mnz < r.mnz ? l.mnz : r.mnz;
+    out.mxx = l.mxx > r.mxx ? l.mxx : r.mxx;
+    out.mxy = l.mxy > r.mxy ? l.mxy : r.mxy;
+    out.mxz = l.mxz > r.mxz ? l.mxz : r.mxz;
+}
+
 // ---------------------------------------------------------------------------
 // 结构校验：父盒必须逐位等于两个子盒的并，叶子盒必须逐位等于三角形包围盒，
 // 每个非根节点必须被恰好引用一次。
@@ -541,6 +561,25 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
                "D2D refit order");
         bvh.refitOffsets.assign(offsets, offsets + bins + 1);
 
+        // 只合并脏叶子的祖先要用：parent / depth 建树时已经算过，留一份免得重算。
+        const size_t ints = static_cast<size_t>(nodeCount) * sizeof(int);
+        cudaOk(cudaMalloc(&bvh.d_parent, ints), "parent keep");
+        cudaOk(cudaMemcpy(bvh.d_parent, dParent.p, ints, cudaMemcpyDeviceToDevice), "parent D2D");
+        cudaOk(cudaMalloc(&bvh.d_depth, ints), "depth keep");
+        cudaOk(cudaMemcpy(bvh.d_depth, dDepth.p, ints, cudaMemcpyDeviceToDevice), "depth D2D");
+        cudaOk(cudaMalloc(&bvh.d_mark, ints), "mark");
+        cudaOk(cudaMemset(bvh.d_mark, 0, ints), "mark clear");
+        cudaOk(cudaMalloc(&bvh.d_dirtyOrder,
+                          static_cast<size_t>(internalCount) * sizeof(int)),
+               "dirty order");
+        cudaOk(cudaMalloc(&bvh.d_refitOffsets, static_cast<size_t>(bins + 1) * sizeof(int)),
+               "refit offsets");
+        cudaOk(cudaMemcpy(bvh.d_refitOffsets, offsets, static_cast<size_t>(bins + 1) * sizeof(int),
+                          cudaMemcpyHostToDevice),
+               "refit offsets H2D");
+        cudaOk(cudaMalloc(&bvh.d_levelCounts, static_cast<size_t>(bins) * sizeof(int)),
+               "level counts");
+
         // 从最深层往上：第 d 层的节点只读第 d+1 层，天然无竞争。
         for (int d = bins - 1; d >= 0; --d) {
             const int count = offsets[d + 1] - offsets[d];
@@ -575,6 +614,14 @@ void destroyBVHGPU(GpuBVH& bvh) {
     if (bvh.d_primIds) cudaFree(bvh.d_primIds);
     if (bvh.d_refitOrder) cudaFree(bvh.d_refitOrder);
     if (bvh.d_stage) cudaFree(bvh.d_stage);
+    if (bvh.d_dirtySlots) cudaFree(bvh.d_dirtySlots);
+    if (bvh.d_dirtyTris) cudaFree(bvh.d_dirtyTris);
+    if (bvh.d_parent) cudaFree(bvh.d_parent);
+    if (bvh.d_depth) cudaFree(bvh.d_depth);
+    if (bvh.d_mark) cudaFree(bvh.d_mark);
+    if (bvh.d_dirtyOrder) cudaFree(bvh.d_dirtyOrder);
+    if (bvh.d_refitOffsets) cudaFree(bvh.d_refitOffsets);
+    if (bvh.d_levelCounts) cudaFree(bvh.d_levelCounts);
     bvh = GpuBVH{};
 }
 
@@ -592,10 +639,35 @@ __global__ void scatterLeafKernel(const int* __restrict__ slots, const Tri* __re
     setNodeBox(leaf, t.bounds());
 }
 
+// 脏叶子 → 祖先链：从父节点一路走到根。epoch 标记顺带做去重——同一棵子树被多个
+// 脏叶子共享时只合并一次；写入位置复用缓存层序的同一段区间，每个节点最多写一次，
+// 所以每层不会越界到下一层。
+__global__ void markAncestorsKernel(const int* __restrict__ slots, int count,
+                                    const int* __restrict__ parent,
+                                    const int* __restrict__ depth,
+                                    int* __restrict__ mark, int epoch,
+                                    int* __restrict__ levelCounts,
+                                    const int* __restrict__ levelOffsets,
+                                    int* __restrict__ dirtyOrder, int n) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= count) return;
+    int node = parent[n - 1 + slots[i]];
+    while (node >= 0) {
+        if (atomicExch(&mark[node], epoch) == epoch) break;
+        const int d = depth[node];
+        dirtyOrder[levelOffsets[d] + atomicAdd(&levelCounts[d], 1)] = node;
+        node = parent[node];
+    }
+}
+
 double refitImpl(GpuBVH& bvh, const Scene& scene, const std::vector<int>* dirty,
-                 GpuRefitTimings* timings) {    const int n = bvh.triCount;
+                 GpuRefitTimings* timings) {
+    const int n = bvh.triCount;
     if (n < 2 || bvh.d_nodes == nullptr) throw std::runtime_error("refitBVHGPU: BVH not built");
     if (bvh.d_refitOrder == nullptr) throw std::runtime_error("refitBVHGPU: missing refit order");
+    if (dirty && bvh.d_parent == nullptr) {
+        throw std::runtime_error("refitBVHGPU: missing parent links");
+    }
     if (static_cast<int>(scene.tris.size()) != n) {
         throw std::runtime_error("refitBVHGPU: triangle count changed, rebuild instead");
     }
@@ -618,34 +690,65 @@ double refitImpl(GpuBVH& bvh, const Scene& scene, const std::vector<int>* dirty,
     StageClock clock;
     clock.mark();  // 0
 
+    const int bins = static_cast<int>(bvh.refitOffsets.size()) - 1;
+    int dirtyCount = 0;
+
     if (dirty) {
-        const int count = static_cast<int>(dirty->size());
+        dirtyCount = static_cast<int>(dirty->size());
         // 主机侧 gather：改动量通常远小于 n，拿到叶子序的紧凑数组再传一次。
-        std::vector<int> slots(static_cast<size_t>(count));
-        std::vector<Tri> moved(static_cast<size_t>(count));
-        for (int i = 0; i < count; ++i) {
+        std::vector<int> slots(static_cast<size_t>(dirtyCount));
+        std::vector<Tri> moved(static_cast<size_t>(dirtyCount));
+        for (int i = 0; i < dirtyCount; ++i) {
             const int id = (*dirty)[static_cast<size_t>(i)];
             if (id < 0 || id >= n) throw std::runtime_error("refitBVHGPU: dirty index out of range");
             slots[static_cast<size_t>(i)] = bvh.primSlot[static_cast<size_t>(id)];
             moved[static_cast<size_t>(i)] = scene.tris[static_cast<size_t>(id)];
         }
 
-        DevBuf<int> dSlots(std::max(1, count));
-        DevBuf<Tri> dMoved(std::max(1, count));
-        if (count > 0) {
-            cudaOk(cudaMemcpy(dSlots.p, slots.data(), static_cast<size_t>(count) * sizeof(int),
+        // 暂存区按需增长：每次 cudaMalloc 的固定开销比内容本身还贵。
+        if (bvh.dirtyCapacity < dirtyCount) {
+            if (bvh.d_dirtySlots) cudaFree(bvh.d_dirtySlots);
+            if (bvh.d_dirtyTris) cudaFree(bvh.d_dirtyTris);
+            cudaOk(cudaMalloc(&bvh.d_dirtySlots, static_cast<size_t>(dirtyCount) * sizeof(int)),
+                   "dirty slots");
+            cudaOk(cudaMalloc(&bvh.d_dirtyTris, static_cast<size_t>(dirtyCount) * sizeof(Tri)),
+                   "dirty tris");
+            bvh.dirtyCapacity = dirtyCount;
+        }
+        auto* dSlots = static_cast<int*>(bvh.d_dirtySlots);
+        auto* dMoved = static_cast<Tri*>(bvh.d_dirtyTris);
+        if (dirtyCount > 0) {
+            cudaOk(cudaMemcpy(dSlots, slots.data(), static_cast<size_t>(dirtyCount) * sizeof(int),
                               cudaMemcpyHostToDevice),
                    "refit H2D slots");
-            cudaOk(cudaMemcpy(dMoved.p, moved.data(), static_cast<size_t>(count) * sizeof(Tri),
+            cudaOk(cudaMemcpy(dMoved, moved.data(), static_cast<size_t>(dirtyCount) * sizeof(Tri),
                               cudaMemcpyHostToDevice),
                    "refit H2D tris");
         }
         clock.mark();  // 1
 
-        if (count > 0) {
-            scatterLeafKernel<<<blocksFor(count), kBlock>>>(dSlots.p, dMoved.p, count, sortedTris,
-                                                            nodes, n);
+        if (dirtyCount > 0) {
+            scatterLeafKernel<<<blocksFor(dirtyCount), kBlock>>>(dSlots, dMoved, dirtyCount,
+                                                                 sortedTris, nodes, n);
         }
+        cudaOk(cudaGetLastError(), "refit scatter");
+        clock.mark();  // 2
+
+        // 沿 parent 链标出要合并的祖先，按层计数留在显存：合并 kernel 自己读，
+        // 每层省掉一次会阻塞主机的 D2H。
+        if (dirtyCount > 0) {
+            cudaOk(cudaMemset(bvh.d_levelCounts, 0, static_cast<size_t>(bins) * sizeof(int)),
+                   "level counts");
+            ++bvh.refitEpoch;
+            markAncestorsKernel<<<blocksFor(dirtyCount), kBlock>>>(
+                dSlots, dirtyCount, static_cast<const int*>(bvh.d_parent),
+                static_cast<const int*>(bvh.d_depth), static_cast<int*>(bvh.d_mark),
+                bvh.refitEpoch, static_cast<int*>(bvh.d_levelCounts),
+                static_cast<const int*>(bvh.d_refitOffsets), static_cast<int*>(bvh.d_dirtyOrder),
+                n);
+            cudaOk(cudaGetLastError(), "refit mark");
+        }
+        clock.mark();  // 3
     } else {
         // 暂存区首次用到才分配：不 refit 的调用方不付这块显存。
         if (bvh.d_stage == nullptr || bvh.stageCount < n) {
@@ -661,29 +764,57 @@ double refitImpl(GpuBVH& bvh, const Scene& scene, const std::vector<int>* dirty,
 
         gatherTrisKernel<<<blocksFor(n), kBlock>>>(dSrc, primIds, n, sortedTris);
         leafInitKernel<<<blocksFor(n), kBlock>>>(nodes, sortedTris, n);
+        cudaOk(cudaGetLastError(), "refit scatter");
+        clock.mark();  // 2
     }
-    cudaOk(cudaGetLastError(), "refit scatter");
-    clock.mark();  // 2
 
     // 叶子盒已经定稿，内部节点按缓存的层序从深到浅合并：第 d 层只读 d+1 层。
-    const int bins = static_cast<int>(bvh.refitOffsets.size()) - 1;
-    for (int d = bins - 1; d >= 0; --d) {
-        const int count = bvh.refitOffsets[d + 1] - bvh.refitOffsets[d];
-        if (count == 0) continue;
-        const int blocks = (count + kBlock * kRefitUnroll - 1) / (kBlock * kRefitUnroll);
-        refitKernel<<<blocks, kBlock>>>(nodes, order + bvh.refitOffsets[d], count);
+    // 增量路径只合并脏叶子的祖先；区间与全量层序共用，所以不会串层。
+    double total = 0.0;
+    if (dirty) {
+        auto* dirtyOrder = static_cast<int*>(bvh.d_dirtyOrder);
+        auto* levelCounts = static_cast<int*>(bvh.d_levelCounts);
+        for (int d = bins - 1; d >= 0; --d) {
+            const int levelSize = bvh.refitOffsets[d + 1] - bvh.refitOffsets[d];
+            // 每个脏叶子在每层最多贡献一个祖先，所以脏叶子数就是每层的容量上界。
+            const int capacity = std::min(levelSize, dirtyCount);
+            if (capacity == 0) continue;
+            const int blocks = (capacity + kBlock - 1) / kBlock;
+            refitAncestorKernel<<<blocks, kBlock>>>(nodes, dirtyOrder + bvh.refitOffsets[d],
+                                                    levelCounts + d, capacity);
+        }
+        cudaOk(cudaGetLastError(), "refit tree");
+        clock.mark();  // 4
+        cudaOk(cudaEventSynchronize(clock.ev[clock.marks - 1]), "refit sync");
+        total = clock.ms(0, 4);
+        if (timings) {
+            timings->markMs = clock.ms(2, 3);
+            timings->mergeMs = clock.ms(3, 4);
+            timings->treeMs = clock.ms(2, 4);
+            timings->updated = dirtyCount;
+        }
+    } else {
+        for (int d = bins - 1; d >= 0; --d) {
+            const int count = bvh.refitOffsets[d + 1] - bvh.refitOffsets[d];
+            if (count == 0) continue;
+            const int blocks = (count + kBlock * kRefitUnroll - 1) / (kBlock * kRefitUnroll);
+            refitKernel<<<blocks, kBlock>>>(nodes, order + bvh.refitOffsets[d], count);
+        }
+        cudaOk(cudaGetLastError(), "refit tree");
+        clock.mark();  // 3
+        cudaOk(cudaEventSynchronize(clock.ev[clock.marks - 1]), "refit sync");
+        total = clock.ms(0, 3);
+        if (timings) {
+            timings->mergeMs = clock.ms(2, 3);
+            timings->treeMs = timings->mergeMs;
+            timings->updated = n;
+        }
     }
-    cudaOk(cudaGetLastError(), "refit tree");
-    clock.mark();  // 3
-    cudaOk(cudaEventSynchronize(clock.ev[clock.marks - 1]), "refit sync");
 
-    const double total = clock.ms(0, 3);
     if (timings) {
         timings->uploadMs = clock.ms(0, 1);
         timings->gatherMs = clock.ms(1, 2);
-        timings->treeMs = clock.ms(2, 3);
         timings->totalMs = total;
-        timings->updated = dirty ? static_cast<int>(dirty->size()) : n;
     }
     return total;
 }
