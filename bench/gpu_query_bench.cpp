@@ -377,10 +377,6 @@ int main(int argc, char** argv) {
         std::printf("--query-sort does not support --refit yet\n");
         return 1;
     }
-    if (opt.wide && opt.refit) {
-        std::printf("--wide does not support --refit yet (collapsed boxes go stale)\n");
-        return 1;
-    }
 
     if (!opt.dump.empty()) {
         if (!dumpQueryInput(opt.dump, scene, points)) return 1;
@@ -614,7 +610,7 @@ int main(int argc, char** argv) {
         const double nPoints = static_cast<double>(points.size());
         auto runQuery = [&](GpuBVH& b, GpuPointBuffer& pb, bool st) {
             return queryGpu(b, pb, stride, opt.query, opt.k, opt.radius, st,
-                            QueryOrder::Input);
+                            QueryOrder::Input, opt.wide);
         };
         const QueryOutput base = runQuery(gpu, buf, true);
         std::printf("refit baseline avg_node_tests=%.1f avg_tri_tests=%.1f\n",
@@ -675,9 +671,9 @@ int main(int argc, char** argv) {
             return 3;
         }
         std::printf("partial updated=%d upload=%.3f scatter=%.3f mark=%.3f merge=%.3f "
-                    "total=%.3f ms\n",
+                    "wide=%.3f total=%.3f ms\n",
                     partial.updated, partial.uploadMs, partial.gatherMs, partial.markMs,
-                    partial.mergeMs, partialMs);
+                    partial.mergeMs, partial.wideMs, partialMs);
         const std::string partialTree = validateBVHGPU(gpu, moved);
         std::printf("partial tree %s%s\n", partialTree.empty() ? "PASS" : "FAIL: ",
                     partialTree.c_str());
@@ -705,8 +701,9 @@ int main(int argc, char** argv) {
             std::printf("gpu refit failed: %s\n", e.what());
             return 3;
         }
-        std::printf("refit updated=%d upload=%.3f scatter=%.3f tree=%.3f total=%.3f ms\n",
-                    full.updated, full.uploadMs, full.gatherMs, full.treeMs, fullMs);
+        std::printf("refit updated=%d upload=%.3f scatter=%.3f tree=%.3f wide=%.3f "
+                    "total=%.3f ms\n",
+                    full.updated, full.uploadMs, full.gatherMs, full.treeMs, full.wideMs, fullMs);
         const std::string refitTree = validateBVHGPU(gpu, moved);
         std::printf("refit tree %s%s\n", refitTree.empty() ? "PASS" : "FAIL: ", refitTree.c_str());
         if (!refitTree.empty()) return 4;
@@ -738,6 +735,8 @@ int main(int argc, char** argv) {
             std::printf("gpu rebuild failed: %s\n", e.what());
             return 3;
         }
+        // 对照查询要和 refit 用同一种遍历；重折叠不计入重建时间。
+        if (opt.wide) buildWideNodesGPU(rebuilt);
         const double rebuildQuery = medianQuery(rebuilt);
         const QueryOutput rebuiltRes =
             runQuery(rebuilt, buf, true);

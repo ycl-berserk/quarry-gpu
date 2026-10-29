@@ -468,14 +468,9 @@ __device__ __forceinline__ void fillWideEntry(GpuBVH4Entry& e, const GpuBVHNode&
     e.pad = 0;
 }
 
-__global__ void wideEmitKernel(const GpuBVHNode* __restrict__ nodes, int n,
-                               const int* __restrict__ depth, const int* __restrict__ wideId,
-                               GpuBVH4Node* __restrict__ wide) {
-    const int i = blockIdx.x * kBlock + threadIdx.x;
-    if (i >= n - 1) return;
-    if ((depth[i] & 1) != 0) return;
-
-    GpuBVH4Node out;
+__device__ __forceinline__ void fillWideNode(const GpuBVHNode* __restrict__ nodes, int n,
+                                             const int* __restrict__ wideId, int i,
+                                             GpuBVH4Node& out) {
 #pragma unroll
     for (int s = 0; s < 4; ++s) clearWideEntry(out.c[s]);
 
@@ -499,7 +494,36 @@ __global__ void wideEmitKernel(const GpuBVHNode* __restrict__ nodes, int n,
             }
         }
     }
+}
+
+__global__ void wideEmitKernel(const GpuBVHNode* __restrict__ nodes, int n,
+                               const int* __restrict__ depth, const int* __restrict__ wideId,
+                               GpuBVH4Node* __restrict__ wide) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= n - 1) return;
+    if ((depth[i] & 1) != 0) return;
+
+    GpuBVH4Node out;
+    fillWideNode(nodes, n, wideId, i, out);
     wide[wideId[i]] = out;
+}
+
+// refit 之后：一次只重发本层被合并过的祖先（dirtyOrder 里只可能是内部节点），
+// 按层交错执行时更深层的盒子已经定稿，所以宽节点读到的是最终值。
+// 计数留在显存里，kernel 自己读，省掉每层一次阻塞主机的 D2H。
+__global__ void wideEmitDirtyKernel(const GpuBVHNode* __restrict__ nodes, int n,
+                                    const int* __restrict__ depth,
+                                    const int* __restrict__ wideId,
+                                    const int* __restrict__ dirtyOrder,
+                                    const int* __restrict__ count, GpuBVH4Node* __restrict__ wide) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= *count) return;
+    const int id = dirtyOrder[i];
+    if ((depth[id] & 1) != 0) return;
+
+    GpuBVH4Node out;
+    fillWideNode(nodes, n, wideId, id, out);
+    wide[wideId[id]] = out;
 }
 
 }  // namespace
@@ -931,7 +955,13 @@ double refitImpl(GpuBVH& bvh, const std::vector<typename Ops::Item>& items,
 
     // 叶子盒已经定稿，内部节点按缓存的层序从深到浅合并：第 d 层只读 d+1 层。
     // 增量路径只合并脏叶子的祖先；区间与全量层序共用，所以不会串层。
+    // 有宽节点层时，合并完还要把受影响的宽节点重发一遍（拓扑与 wideId 都没变，
+    // 只是盒子拷贝变旧了）：全量路径整体重发，增量路径只重发脏祖先里偶数深度的。
     double total = 0.0;
+    const bool wideLayer = bvh.d_wideNodes != nullptr && bvh.d_wideId != nullptr;
+    auto* wideNodes = static_cast<GpuBVH4Node*>(bvh.d_wideNodes);
+    const auto* wideId = static_cast<const int*>(bvh.d_wideId);
+    const auto* depths = static_cast<const int*>(bvh.d_depth);
     if (dirty) {
         auto* dirtyOrder = static_cast<int*>(bvh.d_dirtyOrder);
         auto* levelCounts = static_cast<int*>(bvh.d_levelCounts);
@@ -946,11 +976,38 @@ double refitImpl(GpuBVH& bvh, const std::vector<typename Ops::Item>& items,
         }
         cudaOk(cudaGetLastError(), "refit tree");
         clock.mark();  // 4
-        cudaOk(cudaEventSynchronize(clock.ev[clock.marks - 1]), "refit sync");
-        total = clock.ms(0, 4);
+
+        if (wideLayer && dirtyCount > 0) {
+            // 按层重发要 launch 十几次小 kernel，小树上启动开销反而更高：
+            // 实测 131k 按层 0.23–0.37 ms、整层 0.17 ms；2M 按层 0.38、整层 1.5 ms。
+            // 所以小树或大部分叶子都脏时整层重发，其余按层。阈值取实测中点
+            // （262144 个宽节点 ≈ 52 万图元）。
+            const bool fullEmit = bvh.wideCount <= 262144 ||
+                                  static_cast<long long>(dirtyCount) * 8 >= n;
+            if (fullEmit) {
+                wideEmitKernel<<<blocksFor(n - 1), kBlock>>>(nodes, n, depths, wideId, wideNodes);
+            } else {
+                for (int d = bins - 1; d >= 0; --d) {
+                    if ((d & 1) != 0) continue;
+                    const int levelSize = bvh.refitOffsets[d + 1] - bvh.refitOffsets[d];
+                    const int capacity = std::min(levelSize, dirtyCount);
+                    if (capacity == 0) continue;
+                    wideEmitDirtyKernel<<<blocksFor(capacity), kBlock>>>(
+                        nodes, n, depths, wideId, dirtyOrder + bvh.refitOffsets[d],
+                        levelCounts + d, wideNodes);
+                }
+            }
+            cudaOk(cudaGetLastError(), "wide refit");
+            clock.mark();  // 5
+        }
+
+        const int last = clock.marks - 1;
+        cudaOk(cudaEventSynchronize(clock.ev[last]), "refit sync");
+        total = clock.ms(0, last);
         if (timings) {
             timings->markMs = clock.ms(2, 3);
             timings->mergeMs = clock.ms(3, 4);
+            timings->wideMs = (last > 4) ? clock.ms(4, last) : 0.0;
             timings->treeMs = clock.ms(2, 4);
             timings->updated = dirtyCount;
         }
@@ -963,10 +1020,19 @@ double refitImpl(GpuBVH& bvh, const std::vector<typename Ops::Item>& items,
         }
         cudaOk(cudaGetLastError(), "refit tree");
         clock.mark();  // 3
-        cudaOk(cudaEventSynchronize(clock.ev[clock.marks - 1]), "refit sync");
-        total = clock.ms(0, 3);
+
+        if (wideLayer) {
+            wideEmitKernel<<<blocksFor(n - 1), kBlock>>>(nodes, n, depths, wideId, wideNodes);
+            cudaOk(cudaGetLastError(), "wide refit");
+            clock.mark();  // 4
+        }
+
+        const int last = clock.marks - 1;
+        cudaOk(cudaEventSynchronize(clock.ev[last]), "refit sync");
+        total = clock.ms(0, last);
         if (timings) {
             timings->mergeMs = clock.ms(2, 3);
+            timings->wideMs = (last > 3) ? clock.ms(3, last) : 0.0;
             timings->treeMs = timings->mergeMs;
             timings->updated = n;
         }

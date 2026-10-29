@@ -338,10 +338,6 @@ int main(int argc, char** argv) {
         std::printf("k must be in [1, 32]\n");
         return 1;
     }
-    if (opt.wide && opt.refit) {
-        std::printf("--wide does not support --refit yet (collapsed boxes go stale)\n");
-        return 1;
-    }
 
     GaussianCloudSpec spec;
     spec.kind = opt.kind;
@@ -473,8 +469,9 @@ int main(int argc, char** argv) {
             refitGaussianBVHGPU(gpu, moved, &rt);
             const std::string fullErr = validateGaussianBVHGPU(gpu, moved);
             std::printf(
-                "gpu refit full upload=%.2f gather=%.2f tree=%.2f total=%.2f ms tree=%s\n",
-                rt.uploadMs, rt.gatherMs, rt.treeMs, rt.totalMs,
+                "gpu refit full upload=%.2f gather=%.2f tree=%.2f wide=%.2f total=%.2f ms "
+                "tree=%s\n",
+                rt.uploadMs, rt.gatherMs, rt.treeMs, rt.wideMs, rt.totalMs,
                 fullErr.empty() ? "PASS" : "FAIL");
             if (!fullErr.empty()) return 5;
 
@@ -490,9 +487,9 @@ int main(int argc, char** argv) {
             const std::string dirtyErr = validateGaussianBVHGPU(gpu, moved);
             std::printf(
                 "gpu refit dirty updated=%d upload=%.2f gather=%.2f mark=%.2f merge=%.2f "
-                "total=%.2f ms tree=%s\n",
-                rt.updated, rt.uploadMs, rt.gatherMs, rt.markMs, rt.mergeMs, rt.totalMs,
-                dirtyErr.empty() ? "PASS" : "FAIL");
+                "wide=%.2f total=%.2f ms tree=%s\n",
+                rt.updated, rt.uploadMs, rt.gatherMs, rt.markMs, rt.mergeMs, rt.wideMs,
+                rt.totalMs, dirtyErr.empty() ? "PASS" : "FAIL");
             if (!dirtyErr.empty()) return 6;
 
             if (opt.cpu && opt.verify) {

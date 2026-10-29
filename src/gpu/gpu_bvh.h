@@ -97,6 +97,7 @@ struct GpuRefitTimings {
     double treeMs = 0.0;    // 逐层合并内部节点（增量路径还含祖先标记）
     double markMs = 0.0;    // 增量路径：沿 parent 链标记脏叶子的祖先
     double mergeMs = 0.0;   // 合并；全量路径即 treeMs
+    double wideMs = 0.0;    // 有宽节点层时：重发受影响的宽节点
     double totalMs = 0.0;
     int updated = 0;        // 本次上传的三角形数
 };
