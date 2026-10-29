@@ -470,6 +470,145 @@ pybind11 调用本身约 0.02 ms（按墙钟减内核反推，只有内核是 in
    明显离群），131k 相干重建出现 1.36 / 2.12 / 3.57 ms。表里的中位数掩盖不了这个量级的
    抖动，引用时必须带"同 run 配对 + 3 次中位数"的口径。
 
+### 点云：GPU LBVH vs kd-tree（2026-10-29）
+
+`gpu_cloud_bench.exe`。点云与三角形共用同一棵 LBVH、同一套 refit 和同一份 DFS，
+只有叶子里的 `bounds` / `centroid` / `dist2` 三个函数不同（`src/gpu/prim_ops.h` 的
+`TriOps` / `PointOps`）。下面这些数字与上面的三角形查询来自**同一个内核**。
+
+**基线口径：Embree 没有点云图元。** Embree 4.4 的 `rtcPointQuery` 只对三角形网格
+求最近点，Warp 也只有 `wp.mesh_query_point`，点云查询没有 Embree 数字可引用。
+对照用两把 kd-tree：
+
+- **本工程单线程 kd-tree**（`src/cpu/point_kd.cpp`：最长轴中位数切分、叶 8 个点、
+  紧凑 AABB、`(dist2, 索引)` 字典序与 GPU 完全一致）——"记录在案"的分母；
+- **scipy `cKDTree`**（leafsize 16）——第二个外部实现，读 `--dump` 写出的 QRCD
+  二进制，看到的是与 GPU **逐字节相同**的 float32 输入。
+
+引用倍数必须写明"对哪个 kd-tree"。Embree / Warp 在这里没有任何可比数字。
+
+场景：sheet（x/z ∈ [−50, 50]，y = 地形高度 + U(−0.02, 0.02)），20,000 个随机查询点
+（与三角形查询同一套 `makeQueryPoints`）。3 个规模 × 3 种查询 × 3 次重复，每格取
+**3 次的中位数**；计时前空跑 3 s 拉 DVFS 时钟。原始输出在 `out/cloud_matrix.txt`。
+
+构建：
+
+| 点数 | LBVH 节点 | 深度 | GPU 构建 | kd-tree 建树 | GPU / kd |
+|---|---|---|---|---|---|
+| 131,072 | 262,143 | 28 | 1.58 ms | 21–22 ms | 14× |
+| 1,048,576 | 2,097,151 | 32 | 5.19 ms | 200–210 ms | 39× |
+| 10,000,000 | 19,999,999 | 36 | 49.96 ms | 2.4–2.5 s | 49× |
+
+10M 的 GPU 分阶段：morton 1.9 / 排序 11.4 / 散射 5.2 / 建树 7.1 / refit 24.2 ms。
+refit 仍占一半——点的叶子盒就是一个点，但内部节点合并的次数与三角形场景相同，
+没有可以摊掉的部分。kd 建树是单线程中位数切分 + 一次 `nth_element` 重排，
+规模越大差距越大。
+
+查询（GPU 时间为 CUDA event，结果常驻显存，不含 H2D/D2H；括号内是对同进程单线程
+kd 的倍数；默认半径 = 包围盒对角线 1% = 1.41656）：
+
+| 点数 | closest | kNN k=8 | radius | 结果数/查询（radius） |
+|---|---|---|---|---|
+| 131,072 | 0.64 ms (32.7×) | 1.90 ms (17.8×) | 1.10 ms (14.5×) | 11.2 |
+| 1,048,576 | 1.81 ms (27.8×) | 3.78 ms (20.3×) | 13.22 ms (8.9×) | 89.8 |
+| 10,000,000 | 5.81 ms (52.1×) | 8.07 ms (49.3×) | 65.54 ms (27.9×) | 855.5 |
+
+每查询的平均节点 / 点测试（`--stats`，每格一轮）：
+
+| 点数 | closest | kNN k=8 | radius |
+|---|---|---|---|
+| 131,072 | 110.0 / 10.7 | 186.7 / 44.4 | 45.3 / 11.2 |
+| 1,048,576 | 198.4 / 15.5 | 315.7 / 65.0 | 222.6 / 89.8 |
+| 10,000,000 | 392.7 / 21.3 | 616.2 / 100.2 | 1,827.9 / 855.5 |
+
+读法：
+
+1. **closest 是最纯粹的"延迟受限"负载。** 每查询只碰 110–393 个节点、11–21 个点，
+   单线程一次 1.0–15.1 µs，几乎全是冷缓存行。树越深，kd 单次下潜越贵；GPU 同时挂
+   2 万条查询把延迟藏掉，倍数从 33× 涨到 52×。
+2. **kNN k=8 的节点测试是 closest 的 1.6–1.7 倍，GPU 时间只多 1.6–3.0 倍**：第 k 近
+   阈值在 GPU 上同样是并行的，剪枝多出来的访问不额外收钱。
+3. **radius 的成本由输出条数主导。** 默认半径下 10M 每查询吐 855 条，GPU 只有
+   0.31 Mq/s；27.9× 是表面上的最好数字，实际比的是"写 1700 万条结果"。
+
+半径不能跨规模直接比：查询点均匀撒在 3D 包围盒里、点却在 2D 地形面上，输出条数
+≈ C·n·r³，所以"同样的结果数"要按 r ∝ n^(−1/3) 缩半径。把输出拉回约 11 条/查询后：
+
+| 点数 | 半径 | 结果/查询 | GPU | kd 1T | 倍数 |
+|---|---|---|---|---|---|
+| 1,048,576 | 0.708 | 11.4 | 1.36 ms | 18.13 ms | 13.7× |
+| 10,000,000 | 0.334 | 11.3 | 5.25 ms | 20.38 ms | 3.9× |
+
+同输出量下 10M 从 27.9× 掉到 3.9×：GPU 时间主要是两遍遍历 + 前缀和 + 段内排序的
+固定成本，与输出量几乎无关；kd 的时间随点密度增长。**报 radius 倍数必须带
+results/query**。原始输出 `out/cloud_radius_scaled.txt`。
+
+scipy `cKDTree`（同一批浮点数；只计 `tree.query` / `query_ball_point` 本身，float32
+距离重算与排序都在计时窗口外）：
+
+| 点数 | 数据 | 查询 | scipy | 本工程 kd | GPU | GPU / scipy | scipy / kd |
+|---|---|---|---|---|---|---|---|
+| 131,072 | sheet | closest | 53.41 ms | 20.93 ms | 0.64 ms | 84× | 2.6× |
+| 131,072 | sheet | kNN k=8 | 62.69 ms | 33.83 ms | 1.90 ms | 33× | 1.9× |
+| 1,048,576 | sheet | closest | 747.99 ms | 50.39 ms | 1.81 ms | 413× | 14.8× |
+| 1,048,576 | sheet | kNN k=8 | 679.56 ms | 76.61 ms | 3.78 ms | 180× | 8.9× |
+| 10,000,000 | sheet | closest | 22,750.12 ms | 302.68 ms | 5.81 ms | 3,916× | 75.2× |
+| 10,000,000 | sheet | kNN k=8 | 22,765.99 ms | 397.98 ms | 8.07 ms | 2,821× | 57.2× |
+| 1,048,576 | sheet | radius 1.4166 | 334.89 ms | 117.62 ms | 13.22 ms | 25× | 2.8× |
+| 1,048,576 | volume | closest | 32.11 ms | 19.35 ms | 0.32 ms | 100× | 1.7× |
+| 10,000,000 | volume | closest | 87.72 ms | 35.48 ms | 0.62 ms | 142× | 2.5× |
+
+（sheet 的 kd/GPU 取自 `out/cloud_matrix.txt`；volume 的 kd/GPU 是 3 次配对重复的
+中位数，`out/cloud_volume_reps.txt`，该会话 1M/10M 对 kd 是 60.4×/55.5×——跨会话
+热状态会把它拉到 62.6×/75.2×，绝对值按同一会话内配对读。scipy 建树 10M 需要
+9.1–9.7 s，本工程 kd 是 2.4–2.5 s，两次都比 GPU 的 50 ms 慢两个数量级。）
+
+- **sheet 数据上 scipy 会退化，而且退化随密度加深**：131k 只慢 2.6×，1M 慢 15×，
+  10M 慢 75×（单次查询 1.14 ms）。用 numpy 暴力法抽查过随机查询，它选中的点与我们
+  **完全相同**——是结果正确、路径变慢（查询点落在 2D 流形附近时，它的剪枝收益
+  随树深衰减）。
+- **换成体积点云（`--kind volume`）后差距恢复正常**：scipy 只比自家 kd 慢 1.7–2.5×。
+  也就是说 headline 用自家 kd 当分母是保守的，scipy 只是第二个旁证；**不要拿
+  3–4 个数量级去对外宣传**，那是 scipy 在这份数据上的病态。
+- 指纹：closest 在五个格子上 scipy 的 `sum_dist2` 与 hash 与 kd/GPU **逐位相同**
+  （sheet `0x31bca88d…` / `0x94d204dd…` / `0x2a8fce89…`；volume `0xb948e15d…` /
+  `0xf9f23e87…`）；kNN 的 `sum_dist2` 相对差 6e−13（scipy 用 float64 距离选点，
+  近并列的取法不同）；radius 在**精确 float32 半径**下集合、段内顺序、`sum_dist2`
+  与 hash 全部相同（`0x27bda28ba8bb7682`）。
+- **radius 曾报"hash 不同"，是两个 bug 叠出来的假象**：一是命令行传了四舍五入的
+  1.41656（真值 1.4165570735931396），球面正好跨过 9 个点的距离；二是旧版
+  `gpu_cloud_bench` 的指纹对列表查询漏了"先混入长度"，与 `fingerprint.h` 的约定
+  不一致。两个都修掉后才逐位一致——**并列取法本身没有问题**。
+- 原始输出 `out/scipy_cloud.txt`。
+
+增量更新（1% 相干位移，`--refit-dirty 0.01 --refit-motion coherent`，3 次中位数）：
+
+| 点数 | 局部 refit | 全量 refit | 重建 | 局部 / 重建 | 全量 / 重建 |
+|---|---|---|---|---|---|
+| 1,048,576 | 0.86 ms | 3.27 ms | 5.54 ms | **6.4×** | 1.7× |
+| 10,000,000 | 8.88 ms | 38.02 ms | 50.14 ms | **5.6×** | 1.3× |
+
+10M 局部路径的分阶段（已扣除 1% = 10 万个脏点）：上传 5.3–6.7 / 标记祖先 1.2 /
+合并 1.6–1.8 ms。**全量 refit 在点云上反而比重建快**，与三角形 2M 上的 0.69–0.73×
+相反：点云重建必须重跑 Morton + 基数排序 + 建树（10M 合计约 50 ms），而上传
+120 MB 点 + 重写叶子 + 合并只要 38 ms。结论不是"全量 refit 好用"，而是**点云重建的
+主成本是排序而不是上传**；数据本来就在显存上时，局部 refit 仍是唯一划算的路径。
+原始输出 `out/cloud_refit.txt`。
+
+正确性：9 格 × 3 次重复全部 `id_mismatch=0 dist_mismatch=0 count_mismatch=0`，
+CPU kd 与 GPU 的 closest / kNN / radius 指纹逐位相同；refit 后结构校验 PASS
+（内部盒逐位等于子节点并集、叶子盒等于点、根盒等于点云盒），且与重建树的 kd
+结果逐点对拍一致。
+
+两个只在 10M 暴露的问题（详见 `Quarry-学习路径/08-点云.md`）：
+
+1. **kd 建树在递归中持有 `nodes` 引用会悬空。** `push_back` 扩容后，外层若还用
+   引用写回就是 use-after-free——10M 必崩，131k/1M 偶尔不崩。改成递归返回后按
+   下标写回。
+2. **closest 只比距离时，等距并列由访问顺序决定。** 与暴力法/GPU 的
+   `(dist2, 索引)` 字典序不一致，10M 上出现 1 个 id 不一致。改成 `closerHit` 后
+   三方逐位一致。
+
 ## 结论
 
 1. **CPU 吞吐随场景大小塌陷一个数量级。** 13 万三角形受缓存保护，32 线程能到 96 Mrays/s；200 万三角形掉到 19.7，属于结构性访存受限，增加线程无用。
@@ -503,6 +642,19 @@ pybind11 调用本身约 0.02 ms（按墙钟减内核反推，只有内核是 in
     （射线 2.2× 慢、kNN 1.8× 慢），差距来自构建器的树质量，不是叶子粒度本身；
     要继续追，应该上 GPU 自顶向下 SAH（或 BVH4 宽节点），而不是改叶子大小。
     Warp 的结果是 float32 精度（同位但末位不同），我们是与 CPU 参考逐位相同。
+12. **点云把"延迟受限"推到极端。** closest 每查询只做 110–393 次节点测试，GPU 对
+    同进程单线程 kd 是 32× / 27× / 55×——倍数随规模**上升**，因为 kd 每次下潜更贵
+    而 GPU 的并发不变。kNN k=8 是 17.8–49.3×，radius（默认半径、输出 11–855 条）
+    是 8.9–27.9×。
+13. **radius 的倍数由输出量支配，报数必须带 results/query。** 同输出量（约 11 条/
+    查询）下 1M 13.7×、10M 3.9×：GPU 时间几乎只随查询数走，kd 随点密度增长。
+    点云查询**没有 Embree 基线**（Embree / Warp 都没有点云图元），分母是自写 kd 与
+    scipy `cKDTree`；scipy 在 2D 流形点云上退化，自家 kd 在所有格子上更快，因此
+    headline 倍数偏保守。
+14. **点云全量 refit 比重建快（1.7× / 1.3×），与三角形 2M 的 0.69–0.73× 相反。**
+    点云重建的主成本是 Morton + 基数排序而不是上传；局部 refit 仍是首选
+    （5.6–6.4×）。两个 M2 bug（kd 递归中的悬空引用、等距并列的取法）都只在 10M
+    暴露——规模本身就是一项测试。
 
 
 ## 正确性交叉核对
@@ -569,6 +721,20 @@ build\gpu_query_bench.exe --grid 256  --points 20000 --query knn --k 16 --runs 3
 build\gpu_query_bench.exe --grid 1024 --points 20000 --query knn --k 16 --runs 3 --stats
 build\gpu_query_bench.exe --grid 256  --points 20000 --query radius --radius 2.0 --runs 3 --stats
 build\gpu_query_bench.exe --grid 1024 --points 20000 --query radius --radius 0.5 --runs 3 --stats
+
+build\gpu_cloud_bench.exe --points 131072   --queries 20000
+build\gpu_cloud_bench.exe --points 1048576  --queries 20000 --query knn --k 8
+build\gpu_cloud_bench.exe --points 10000000 --queries 20000 --query radius
+build\gpu_cloud_bench.exe --kind volume --points 1048576 --query radius --radius 1.0
+build\gpu_cloud_bench.exe --points 1048576 --refit --refit-dirty 0.01 --refit-motion coherent
+
+build\gpu_cloud_bench.exe --points 1048576 --queries 20000 --dump out\cloud_1048576.bin
+build\gpu_cloud_bench.exe --points 10000000 --queries 20000 --dump out\cloud_10000000.bin
+build\gpu_cloud_bench.exe --kind volume --points 1048576  --queries 20000 --dump out\vol_1048576.bin
+build\gpu_cloud_bench.exe --kind volume --points 10000000 --queries 20000 --dump out\vol_10000000.bin
+py -3.13 bench\scipy_kd_bench.py out\cloud_1048576.bin --query closest
+py -3.13 bench\scipy_kd_bench.py out\cloud_10000000.bin --query knn --k 8
+py -3.13 bench\scipy_kd_bench.py out\cloud_1048576.bin --query radius --radius 1.4165570735931396
 ```
 
 ## 已知缺口
@@ -584,6 +750,10 @@ build\gpu_query_bench.exe --grid 1024 --points 20000 --query radius --radius 0.5
 - 外部 GPU 对照：射线侧只有 CPU 的 Embree，Warp `bvh.ray_trace` 对照待 M1
 - 点查询外部对照只有 closest（Embree `rtcPointQuery` 与 Warp `mesh_query_point`）；
   kNN / radius 在 Embree 和 Warp 里都没有原生入口
+- 点云查询**没有 Embree / Warp 基线**（两者都没有点云图元）。分母是自写中位数切分
+  kd-tree 与 scipy `cKDTree`；后者在 2D 流形点云（sheet）上退化，只有体积点云上是
+  正常对照
+- 点云场景只有 sheet / volume 两种解析分布，缺真实扫描数据（LiDAR、重建网格采样）
 - Morton 叶子批量（4–8 图元/叶）实测负结果，已回退到每叶 1 个；追 Warp 需要
   GPU 自顶向下 SAH 或宽节点，不在 M1 范围
 - 第一轮结果（不同场景、20 万条射线）已作废，勿引用

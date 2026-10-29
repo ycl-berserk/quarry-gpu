@@ -5,15 +5,15 @@
 GPU 原生空间查询引擎：构建加速结构（BVH / 八叉树 / 哈希网格），支持射线求交、kNN、半径查询、AABB 查询，图元覆盖三角形、点云、高斯，并支持增量更新。
 
 许可证 Apache-2.0（见 `LICENSE`）。CPU 参考实现已完整；GPU 侧（CUDA 12.4，sm_89）已有
-并行 LBVH 构建、光线遍历、closest / kNN / radius 三条点查询路径，以及拓扑冻结的
-增量更新（refit）。没有 CUDA 工具链时自动降级为纯 CPU 构建，CI 与本文档的 CPU
-数字不受影响。
+并行 LBVH 构建、光线遍历、closest / kNN / radius 三条点查询路径，拓扑冻结的增量更新
+（refit），以及**点云图元**（同一套 LBVH + 三条查询 + refit，只在叶子里换"测什么"）。
+没有 CUDA 工具链时自动降级为纯 CPU 构建，CI 与本文档的 CPU 数字不受影响。
 
 ## 现在能跑什么
 
 ```bat
 build.bat                                  :: CMake + Ninja（用 VS 2022 自带的，无需另装）
-build\quarry.exe selftest                  :: 正确性自测（29 项）
+build\quarry.exe selftest                  :: 正确性自测（34 项）
 build\quarry.exe run --scene terrain --grid 256 --rays 1000000 --engine bvh
 build\quarry.exe query --type closest --grid 256 --points 20000 --stats
 build\quarry.exe query --type knn --k 16 --grid 256 --points 20000
@@ -24,6 +24,11 @@ build\gpu_query_bench.exe --grid 256 --points 20000 --runs 5 --stats          ::
 build\gpu_query_bench.exe --grid 256 --points 20000 --query knn --k 16        :: GPU kNN
 build\gpu_query_bench.exe --grid 256 --points 20000 --query radius --radius 2.0  :: GPU 半径查询
 build\gpu_query_bench.exe --grid 256 --points 20000 --refit --refit-dirty 0.01  :: 局部 / 全量 refit + 重建对照
+
+build\gpu_cloud_bench.exe --points 131072 --queries 20000                   :: 点云 closest，GPU 对 kd-tree
+build\gpu_cloud_bench.exe --points 1048576 --queries 20000 --query knn --k 8
+build\gpu_cloud_bench.exe --kind volume --points 1048576 --query radius --radius 1.0
+build\gpu_cloud_bench.exe --points 1048576 --refit --refit-dirty 0.01 --refit-motion coherent
 ```
 
 输出包含一个**正确性指纹**（每条射线的命中标志 + t 值，按 FNV-1a 折叠）：
@@ -122,6 +127,51 @@ Embree `rtcPointQuery`、Warp 1.6.2（`wp.mesh_query_point_no_sign`）对照；k
 - **注意精度口径**：quarry 的结果与 CPU 参考逐位相同；Warp 用 float32 重建最近点，
   选中的三角形一致但距离末几位不同（200 个采样点上 `suboptimal=0`）。
 
+## 点云（M2 前半，2026-10-29）
+
+三角形和点共用同一棵 LBVH、同一套 refit 与同一份 DFS，只有叶子里的三个函数不同
+（`src/gpu/prim_ops.h` 的 `TriOps` / `PointOps`）。所以下面这张表里的数字和上面的
+三角形查询是**同一个内核**，不是另一份实现。
+
+**基线口径**：Embree 4.4 的 `rtcPointQuery` 只对三角形网格求最近点，没有点云图元；
+Warp 也只有 `mesh_query_point`。所以点云查询没有 Embree 数字可引用，对照是
+**自写的中位数切分 kd-tree**（`src/cpu/point_kd.cpp`，单线程），第二把尺子是
+scipy 1.17 的 `cKDTree`。引用倍数时必须写明"对哪个 kd-tree"。
+
+sheet 点云（x/z ∈ [-50, 50]，y 贴地形面 + 2 cm 抖动），20,000 个随机查询点，
+3×3×3 矩阵连跑 3 次、每格取中位数：
+
+| 点数 | GPU 构建 | closest | kNN k=8 | radius | 结果数/查询（radius） |
+|---|---|---|---|---|---|
+| 131,072 | 1.58 ms | 0.64 ms (32.7×) | 1.90 ms (17.8×) | 1.10 ms (14.5×) | 11.2 |
+| 1,048,576 | 5.19 ms | 1.81 ms (27.8×) | 3.78 ms (20.3×) | 13.22 ms (8.9×) | 89.8 |
+| 10,000,000 | 49.96 ms | 5.81 ms (52.1×) | 8.07 ms (49.3×) | 65.54 ms (27.9×) | 855.5 |
+
+- 括号内是**对同一进程内的单线程 kd-tree 的倍数**。10M 的 GPU 构建在 50.0 ms
+  （morton 1.9 / 排 11.4 / 散射 5.2 / 建树 7.1 / refit 24.2），kd 建树是 2.5 s。
+- **closest 只碰 110–393 个节点、11–21 个点/查询**，单线程一次 1.0–15.1 µs，几乎
+  全是冷缓存行——这是"延迟受限"最纯粹的形态，也是 GPU 倍数随规模上升的原因
+  （33× → 52×）。
+- **radius 的成本由输出条数主导**：默认半径（对角线 1%）下 10M 每查询吐 855 条，
+  GPU 只剩 0.31 Mq/s。按 `r ∝ n^(-1/3)` 把输出拉回约 11 条/查询后，
+  1M 是 1.36 ms（13.7×）、10M 是 5.25 ms（3.9×）——10M 的 radius 优势明显收窄，
+  报数必须带这个口径。
+- **scipy `cKDTree` 的对照要小心**：在 sheet 数据上它会退化，而且随密度加深——
+  与自家 kd 比，131k 慢 2.6×、1M 慢 15×、10M 慢 75×（单次查询 1.14 ms）。
+  换成体积点云（`--kind volume`）后差距正常：1M 是 32.1 vs 19.4 ms、10M 是 87.7 vs
+  35.5 ms（scipy 慢 1.7–2.5×），同会话 GPU 对 kd 的配对倍数是 60.4× / 55.5×
+  （热状态不同时会漂到 62.6× / 75.2×）。也就是说自家 kd 比成熟库还快，
+  headline 倍数是保守的。`bench/scipy_kd_bench.py` 读 `gpu_cloud_bench --dump`
+  写出的同一批浮点数。
+- 增量更新：1% 相干位移下，1M 局部 refit 0.86 ms（重建 5.54 ms，6.4×）、
+  10M 8.88 ms（重建 50.14 ms，5.6×）。**全量 refit 在这里反而比重建快**
+  （10M 38.0 vs 50.1 ms），因为点云重建的 Morton 排序 + 建树比上传 120 MB 更贵；
+  这与三角形在 2M 上的结论相反，别混着引用。
+- 正确性：9 格 × 3 次重复全部 `id_mismatch=0 dist_mismatch=0 count_mismatch=0`，
+  CPU/GPU 指纹逐位相同；refit 后结构校验 PASS；closest 与 radius 还和 scipy 的
+  `sum_dist2` + 指纹逐位一致（独立实现的第三个见证），kNN 的 `sum_dist2` 相对差
+  在 1e-13 量级（scipy 用 float64 距离选点）。
+
 ## Python 绑定
 
 有 Python 3.8+ 和 `pip install pybind11 numpy` 时，`build.bat` 会顺带把扩展模块建到
@@ -138,7 +188,7 @@ d2, tri = scene.closest(points)             # (N,) float32, (N,) int32
 
 ```bat
 py -3.13 python/demo.py          :: 建场景 + 四种查询 + 开销拆分
-py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（21 项检查）
+py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（55 项检查）
 ```
 
 | 入口 | 返回 |
@@ -146,16 +196,20 @@ py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（21 项检查）
 | `quarry.describe()` | 显卡字符串；无 CUDA 时为空串 |
 | `quarry.demo_mesh(kind, grid, random_tris, seed)` | `(vertices (N,3) f32, indices (M,3) i32)` |
 | `Scene(vertices, indices)` / `Scene(triangles)` | 构建 GPU BVH；`triangle_count` / `node_count` / `depth` / `bounds` / `build_stats` |
-| `scene.validate()` | 树结构自检，空串表示通过 |
+| `PointCloud(points)` | 构建点云 LBVH；`point_count` / `node_count` / `depth` / `bounds` / `build_stats` |
+| `scene.validate()` / `cloud.validate()` | 树结构自检，空串表示通过 |
 | `scene.raycast(origins, dirs, tmax=inf)` | `(hit bool[N], t f32[N])`，未命中 `t=inf` |
-| `scene.closest(points)` | `(dist2 f32[N], triangle i32[N])` |
-| `scene.knn(points, k)` | `(dist2 f32[N,k], triangle i32[N,k])`，按 `(dist2, 索引)` 升序，缺位 -1 |
-| `scene.radius(points, r)` | CSR：`(offsets i64[N+1], dist2 f32[total], triangle i32[total])`，段内有序 |
+| `scene.closest(points)` / `cloud.closest(points)` | `(dist2 f32[N], triangle/point i32[N])` |
+| `scene.knn(points, k)` / `cloud.knn(points, k)` | `(dist2 f32[N,k], index i32[N,k])`，按 `(dist2, 索引)` 升序，缺位 -1 |
+| `scene.radius(points, r)` / `cloud.radius(points, r)` | CSR：`(offsets i64[N+1], dist2 f32[total], index i32[total])`，段内有序 |
 | `scene.update_vertices(vertices, dirty=None)` | 拓扑冻结的 refit：顶点换位、三角形数不变；`dirty` 是改动三角形索引 |
 | `scene.update_triangles(triangles, dirty=None)` | 同上，直接给 `(M,3,3)`；`refit_ms` / `refit_stats` 读上一次的耗时 |
+| `cloud.update_points(points, dirty=None)` | 点云 refit：点数不变；`dirty` 是改动的点索引 |
 
 - 入参统一按 `float32` / C 连续处理（`forcecast`），传 float64 或非连续数组会先拷贝。
   返回数组在重新拿到 GIL 之后才分配，构建与查询期间 GIL 是释放的。
+- `PointCloud` 与 `Scene` 的查询形状完全一致，`closest/knn/radius` 可以互换；
+  区别是前者的 `triangle` 字段装的是点索引，且没有 `raycast`。
 - `last_query_ms` 是 CUDA event 计的内核时间，`build_ms` 是构建路径的墙钟；
   端到端还包含上传、回读和建 Python 数组。131k 场景、20k 查询点的 closest：
   墙钟中位数 1.44 ms，内核 1.29 ms，**Python 侧固定开销约 0.14 ms**。
@@ -216,7 +270,7 @@ scene.refit_ms, scene.refit_stats       # {upload_ms, scatter_ms, mark_ms, merge
 做：
 
 - 加速结构的**构建**与**查询**都在 GPU 上
-- 三角形、点云、高斯三种图元用同一套查询接口
+- 三角形、点云、高斯三种图元用同一套查询接口（已覆盖前两种，高斯在 M2 后半）
 - 每瓦吞吐与端到端延迟作为一等指标
 - 可复现基准：同 seed 同输入，逐条对拍
 
@@ -230,12 +284,12 @@ scene.refit_ms, scene.refit_stats       # {upload_ms, scatter_ms, mark_ms, merge
 ## 目录
 
 ```text
-src/core/     几何、场景生成、射线的可复现输入（host/device 共用）
-src/cpu/      暴力法真值 + 朴素 BVH 参照
-src/gpu/      CUDA：并行 LBVH 构建（lbvh.cu）、光线遍历（raycast.cu）、点查询（query.cu）
+src/core/     几何、场景与点云生成、可复现输入（host/device 共用）
+src/cpu/      暴力法真值 + 朴素 BVH 参照 + 点云 kd-tree 基线
+src/gpu/      CUDA：并行 LBVH（lbvh.cu，按 Ops 同时服务三角形与点）、光线遍历、点查询
 src/cli/      quarry 命令行
 bindings/     pybind11 绑定（quarry_py.cpp）
-bench/        Embree 对照、Warp 对照与 gpu_*_bench（同一份输入，二进制转储互通）
+bench/        Embree 对照、Warp / scipy 对照与 gpu_*_bench（同一份输入，二进制转储互通）
 python/       Python 侧的用法示例与 numpy 对拍
 tests/        自测入口
 learn/        教程配套的单文件练习
@@ -251,6 +305,11 @@ learn/        教程配套的单文件练习
 - 场景类型只有地形网格和随机三角形，缺非均匀模型（Dragon/Lucy）与多层遮挡
 - closest 已和 Embree 32 线程（3.0–16.3×）与 Warp 1.6.2（0.72–1.15×）对拍；
   kNN / 半径在两家外部库里都没有原生入口，只有自家 CPU 参考
+- 点云查询没有 Embree 对照物（`rtcPointQuery` 只吃三角形）；基线是自写的单线程
+  kd-tree，另有 scipy `cKDTree` 作第二把尺子。scipy 在 2D 流形数据上会退化
+  （10M 慢 72×），所以 headline 倍数只用自家 kd
+- 点云仍是每叶 1 个图元：10M 点 → 2000 万节点、约 640 MB 节点内存，这是 8 GB 卡上
+  的实际上限；叶子批量在三角形上是负结果（射线 2.2× 慢），点云没有重试
 - Python 绑定是同步的：每次调用都上传、同步、回读，没有异步 / 零拷贝接口
 - refit 拓扑冻结：不增删、不重排三角形；局部路径只合并脏叶子的祖先，但逐层 launch
   的数量不变，小场景里启动开销开始主导
