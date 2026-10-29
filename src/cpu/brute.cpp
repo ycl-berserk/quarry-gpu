@@ -117,3 +117,49 @@ std::vector<ClosestHit> radiusVertexBrute(const PointCloud& cloud, const Vec3& p
     std::sort(out.begin(), out.end(), closerHit);
     return out;
 }
+
+ClosestHit closestGaussianBrute(const GaussianCloud& cloud, const Vec3& p) {
+    ClosestHit best;
+    for (int i = 0; i < static_cast<int>(cloud.gaussians.size()); ++i) {
+        ClosestHit h;
+        h.found = true;
+        h.dist2 = gaussianDist2(p, cloud.gaussians[i]);
+        h.triangle = i;
+        if (!best.found || h.dist2 < best.dist2) best = h;
+    }
+    return best;
+}
+
+std::vector<ClosestHit> kNearestGaussianBrute(const GaussianCloud& cloud, const Vec3& p, int k) {
+    std::vector<ClosestHit> all;
+    all.reserve(cloud.gaussians.size());
+    for (int i = 0; i < static_cast<int>(cloud.gaussians.size()); ++i) {
+        ClosestHit h;
+        h.found = true;
+        h.dist2 = gaussianDist2(p, cloud.gaussians[i]);
+        h.triangle = i;
+        all.push_back(h);
+    }
+
+    const size_t n = std::min(all.size(), static_cast<size_t>(std::max(k, 0)));
+    std::partial_sort(all.begin(), all.begin() + n, all.end(), closerHit);
+    all.resize(n);
+    return all;
+}
+
+std::vector<ClosestHit> radiusGaussianBrute(const GaussianCloud& cloud, const Vec3& p,
+                                            float radius) {
+    std::vector<ClosestHit> out;
+    const float r2 = radius * radius;
+    for (int i = 0; i < static_cast<int>(cloud.gaussians.size()); ++i) {
+        const float d2 = gaussianDist2(p, cloud.gaussians[i]);
+        if (d2 > r2) continue;
+        ClosestHit h;
+        h.found = true;
+        h.dist2 = d2;
+        h.triangle = i;
+        out.push_back(h);
+    }
+    std::sort(out.begin(), out.end(), closerHit);
+    return out;
+}

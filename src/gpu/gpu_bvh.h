@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "core/fingerprint.h"
+#include "core/gaussian.h"
 #include "core/geometry.h"
 #include "core/point_cloud.h"
 #include "core/scene.h"
@@ -71,6 +72,10 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings = nullptr);
 // （Tri vs Vec3）和求距函数不同，见 gpu/prim_ops.h。
 GpuBVH buildPointBVHGPU(const PointCloud& cloud, GpuBuildTimings* timings = nullptr);
 
+// 高斯走同一条骨架：叶子盒是椭球外接盒、重心是均值，只有叶子测试换成
+// "到椭球实体的距离"（见 core/gaussian.h）。构建/refit/校验/三种查询全部复用。
+GpuBVH buildGaussianBVHGPU(const GaussianCloud& cloud, GpuBuildTimings* timings = nullptr);
+
 // 在计时构建之前空跑一个小 kernel：CUDA 默认懒加载模块，第一次启动 kernel 才会
 // 把整个 cubin 载入设备（~2 ms），不算这一次就把它记到构建头上。
 void warmupBuildGPU();
@@ -101,6 +106,11 @@ double refitBVHGPU(GpuBVH& bvh, const Scene& scene, const std::vector<int>& dirt
 double refitPointBVHGPU(GpuBVH& bvh, const PointCloud& cloud, GpuRefitTimings* timings = nullptr);
 double refitPointBVHGPU(GpuBVH& bvh, const PointCloud& cloud, const std::vector<int>& dirty,
                         GpuRefitTimings* timings = nullptr);
+
+double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
+                           GpuRefitTimings* timings = nullptr);
+double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
+                           const std::vector<int>& dirty, GpuRefitTimings* timings = nullptr);
 
 void destroyBVHGPU(GpuBVH& bvh);
 
@@ -192,6 +202,15 @@ double kNearestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k,
 double radiusQueryVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
                             GpuRadiusBuffer& out, bool collectStats = false);
 
+// ---- 高斯查询（M2 后半）----
+// 距离是到椭球实体的平方距离（落在椭球内为 0）。GpuClosestResult.triangle 里装
+// 的是高斯索引；输出格式与读写接口和点云完全相同。
+double closestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats = false);
+double kNearestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k,
+                           bool collectStats = false);
+double radiusQueryGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
+                              GpuRadiusBuffer& out, bool collectStats = false);
+
 // 把显存结果拷回主机（按查询点顺序）。
 std::vector<GpuClosestResult> readQueryResultsGPU(const GpuPointBuffer& buf);
 
@@ -203,3 +222,4 @@ void warmupQueryGPU();
 // 每个非根节点被恰好引用一次、根盒等于场景包围盒。返回空串表示通过。
 std::string validateBVHGPU(const GpuBVH& bvh, const Scene& scene);
 std::string validatePointBVHGPU(const GpuBVH& bvh, const PointCloud& cloud);
+std::string validateGaussianBVHGPU(const GpuBVH& bvh, const GaussianCloud& cloud);

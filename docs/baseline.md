@@ -609,6 +609,105 @@ CPU kd 与 GPU 的 closest / kNN / radius 指纹逐位相同；refit 后结构�
    `(dist2, 索引)` 字典序不一致，10M 上出现 1 个 id 不一致。改成 `closerHit` 后
    三方逐位一致。
 
+### 高斯：GPU LBVH vs 椭球 BVH（2026-10-29）
+
+`gpu_gauss_bench.exe`。语义是**椭球实体**：查询点在椭球内距离为 0，在外为到表面的
+欧氏距离；`radius` 是"椭球与查询球相交"。建树、refit、三条查询与三角形/点云共用
+同一份模板代码（`GaussianOps`，`src/gpu/prim_ops.h`）。
+
+**基线口径：没有外部实现。** Embree 4.4 的 `rtcPointQuery` 只对三角网格找最近点，
+Warp 只有 `mesh_query_point`；3DGS 渲染器没有"静态索引 + 任意点查询"接口，3DGRT
+（NVIDIA 2024）查的是**射线**与高斯的求交，不是点到椭球的最近/半径查询。所以分母是
+**本工程单线程椭球 BVH**（`src/cpu/gauss_bvh.cpp`：中位数切分、叶 8 个、紧 AABB、
+`(dist2, 索引)` 字典序），不是 Embree/Warp。numpy float64 二分只做正确性见证，不计时。
+
+场景：sheet（x/z ∈ [−50, 50]，y = 地形高度，模拟表面高斯）与 volume（立方体内均匀），
+20,000 个随机查询点，每格 5 轮中位数（10M 的 CPU 单轮 3 s，跑 3 轮）。原始输出
+`out/gauss_final.txt` / `out/gauss_final_big.txt`。**绝对值跨会话漂 1.3–2.5×，只读
+同一次运行内的配对倍数**；上一轮会话的 1M/10M 用了 50,000 个查询点，不可混引。
+
+构建：
+
+| 高斯数 | 节点 | 深度 | GPU 构建 | CPU BVH 建树 | GPU / CPU |
+|---|---|---|---|---|---|
+| 131,072 | 262,143 | 28 | 1.41 ms | 53 ms | 38× |
+| 1,048,576 | 2,097,151 | 33 | 5.81 ms | 656 ms | 113× |
+| 10,485,760 | 20,971,519 | 38 | 70.2 ms | 26.0 s | 370× |
+
+10M 分阶段：morton 5.00 / 排序 10.56 / 散射 10.24 / 建树 7.56 / refit 36.88 ms。
+节点数与同规模点云相同（点云 50.0 ms）；差异在 refit（36.9 vs 24.2）和 400 MB
+叶子载荷。上一会话同配置 56.4 ms（refit 23.5），这一格对时钟很敏感。
+
+查询（GPU 时间为 CUDA event，结果常驻显存）：
+
+| 分布 | 高斯数 | 查询 | GPU | GPU Mq/s | CPU BVH | CPU Mq/s | GPU / CPU |
+|---|---|---|---|---|---|---|---|
+| sheet | 131,072 | closest | 2.40 ms | 8.32 | 132.71 ms | 0.15 | 55.2× |
+| sheet | 131,072 | kNN k=8 | 5.42 ms | 3.69 | 240.46 ms | 0.08 | 44.4× |
+| sheet | 131,072 | radius 1.42981 | 6.62 ms | 3.02 | 116.63 ms | 0.17 | 17.6× |
+| sheet | 1,048,576 | closest | 8.01 ms | 2.50 | 398.70 ms | 0.05 | 49.8× |
+| sheet | 10,485,760 | closest | 46.12 ms | 0.43 | 3025.47 ms | 0.007 | 65.6× |
+| volume | 131,072 | closest | 0.27 ms | 73.49 | 59.66 ms | 0.34 | 219× |
+| volume | 131,072 | kNN k=8 | 0.91 ms | 22.03 | 153.49 ms | 0.13 | 169× |
+| volume | 131,072 | radius 1.74786 | 1.15 ms | 17.35 | 51.81 ms | 0.39 | 44.9× |
+| volume | 1,048,576 | closest | 0.47 ms | 42.17 | 79.55 ms | 0.25 | 168× |
+
+每查询访问计数（`--stats`）：
+
+| 分布 / 规模 | 节点测试 | 叶子测试 |
+|---|---|---|
+| sheet 131k | 138.3 | 19.0 |
+| sheet 1M | 365.5 | 61.9 |
+| sheet 10M | 1774.9 | 347.8 |
+| volume 131k | 46.4 | 3.5 |
+| volume 1M | 57.2 | 4.0 |
+
+读法：
+
+1. **sheet 是剪枝坏情况，而且随规模恶化**：10M 每查询 1775 个节点、348 次椭球距离，
+   吞吐掉到 0.43 Mq/s；volume 10M 只需 57 个节点、4 次测试。倍数反而 volume 更高
+   （168× vs 50×），因为 CPU 在 sheet 上同样被拖慢；**低吞吐不等于高倍数**。
+2. **椭球距离的边际成本被延迟隐藏**：同会话点云对照（`out/cloud_vs_gauss.txt`）
+   sheet 131k closest 0.68 → 2.35 ms（3.5×）、kNN 1.90 → 3.98（2.1×），
+   volume closest 0.25 → 0.33（1.3×）。一次点测试 3 次乘加，一次椭球测试 14 轮 ×
+   （3 除法 + 12 乘加），总时间只差 1.3–3.5×。
+3. **radius 由输出量主导**：sheet 131k 每查询 16.4 条结果，17.6×；计数 / 前缀和 /
+   填充 / 段内排序四步与点云相同。
+4. **kNN 只比 closest 贵 2.3×**（5.42 vs 2.40 ms）：第 8 近距离收敛快，叶子测试
+   19 → 63。
+
+求根器（float32，对 float64 二分参考）：
+
+| 方案 | 最差距离误差 | 迭代 |
+|---|---|---|
+| 从 t=0 纯牛顿 | 13%（8 轮）/ 12%（12 轮） | 8–12 |
+| Eberly 球近似初值 + 牛顿 | 30%（扁椭球初值在根上方，首步为负被拦） | 8 |
+| 纯二分 | 0.1% | 16–20 |
+| **括号 + 牛顿/二分兜底（采用）** | **1.7e-7** | 14 |
+
+括号 `[0, 2·a_max·|y|]` 两端符号有保证（F(0) > 0 由内部判定；F(hi) < 0 因为每项
+≤ 1/4）。固定 14 轮、无 `break`，CPU 与 GPU 才能逐位一致。每轮用倒数把 6 次除法
+压到 3 次，依赖两边 IEEE 正确舍入（MSVC `/fp:precise`、nvcc 默认 `-prec-div=true`）；
+`--use_fast_math` 会破坏这个前提，CMake 禁止。所有乘加走 `QUARRY_FMA`，nvcc 加
+`--fmad=false`。
+
+增量更新（1M sheet、1% 相干位移）：
+
+| 路径 | 上传 | 重排+叶子盒 | 合并 | 总计 |
+|---|---|---|---|---|
+| 全量 refit | 5.16 ms | 1.19 | 1.07 | 7.42 ms |
+| 局部 refit（1%） | 0.86 | 0.09（+ 标记 0.12） | 0.54 | 1.61 ms |
+
+全量 refit 比重建（5.73 ms）慢 1.30×：40 MB 上传是硬成本，与点云结论一致。局部
+refit 是重建的 1/3.6。上一会话同配置局部路径 0.93 ms（上传 0.42 / 合并 0.27），
+H2D 延迟随电源状态变化明显，**配对倍数报 3.6–6.8×**，绝对值带会话引用。
+
+正确性：全部格子 `id_mismatch=0 dist_mismatch=0 count_mismatch=0`，CPU/GPU 指纹
+逐位相同（sheet 131k closest `0x2ccb47efc9f4d3c7`；1M closest `0xad723636be7f5022`），
+这同时证明椭球求根在两侧逐位一致。refit 后结构校验 PASS，两条路径各自对拍零失配。
+`selftest` 9 项高斯检查（含 float64 参考 1.7e-7、AABB 下界 200 组、BVH vs 暴力 4096
+高斯）；`python/test_quarry.py` 17 项高斯检查（numpy float64 二分见证）。
+
 ## 结论
 
 1. **CPU 吞吐随场景大小塌陷一个数量级。** 13 万三角形受缓存保护，32 线程能到 96 Mrays/s；200 万三角形掉到 19.7，属于结构性访存受限，增加线程无用。
@@ -655,6 +754,13 @@ CPU kd 与 GPU 的 closest / kNN / radius 指纹逐位相同；refit 后结构�
     点云重建的主成本是 Morton + 基数排序而不是上传；局部 refit 仍是首选
     （5.6–6.4×）。两个 M2 bug（kd 递归中的悬空引用、等距并列的取法）都只在 10M
     暴露——规模本身就是一项测试。
+15. **高斯查询没有外部基线，照实写。** Embree/Warp 没有椭球图元，3DGRT 查的是射线，
+    所以分母是自写的单线程椭球 BVH。sheet 上剪枝随规模恶化（10M 每查询 1775 节点、
+    348 次椭球测试、0.43 Mq/s），volume 上 GPU 0.47 ms（168×）。椭球距离的算术量
+    是点距离的 10 倍以上，但同规模总时间只差 1.3–3.5×——除法延迟被并发查询藏掉。
+    求根器必须用"有符号保证的括号 + 牛顿/二分兜底"：纯牛顿 12 轮仍差 12%，球近似
+    初值在扁椭球上会给出 30% 误差；最终 14 轮、无提前退出，float64 参考误差 1.7e-7，
+    CPU/GPU 指纹逐位一致。
 
 
 ## 正确性交叉核对
@@ -735,6 +841,17 @@ build\gpu_cloud_bench.exe --kind volume --points 10000000 --queries 20000 --dump
 py -3.13 bench\scipy_kd_bench.py out\cloud_1048576.bin --query closest
 py -3.13 bench\scipy_kd_bench.py out\cloud_10000000.bin --query knn --k 8
 py -3.13 bench\scipy_kd_bench.py out\cloud_1048576.bin --query radius --radius 1.4165570735931396
+
+build\gpu_gauss_bench.exe --gaussians 131072 --queries 20000 --stats
+build\gpu_gauss_bench.exe --gaussians 131072 --queries 20000 --query knn --k 8 --stats
+build\gpu_gauss_bench.exe --gaussians 131072 --queries 20000 --query radius --stats
+build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --stats
+build\gpu_gauss_bench.exe --gaussians 10485760 --queries 20000 --runs 3 --stats
+build\gpu_gauss_bench.exe --kind volume --gaussians 131072 --queries 20000 --stats
+build\gpu_gauss_bench.exe --kind volume --gaussians 131072 --queries 20000 --query knn --k 8 --stats
+build\gpu_gauss_bench.exe --kind volume --gaussians 131072 --queries 20000 --query radius --stats
+build\gpu_gauss_bench.exe --kind volume --gaussians 1048576 --queries 20000 --stats
+build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --runs 3 --refit --refit-dirty 0.01 --refit-motion coherent
 ```
 
 ## 已知缺口
@@ -754,6 +871,10 @@ py -3.13 bench\scipy_kd_bench.py out\cloud_1048576.bin --query radius --radius 1
   kd-tree 与 scipy `cKDTree`；后者在 2D 流形点云（sheet）上退化，只有体积点云上是
   正常对照
 - 点云场景只有 sheet / volume 两种解析分布，缺真实扫描数据（LiDAR、重建网格采样）
+- 高斯查询**没有 Embree / Warp 基线**（两者都没有椭球图元，3DGRT 查的是射线）。
+  分母是自写单线程椭球 BVH；语义仅"椭球实体"，Mahalanobis 密度与屏幕空间投影未做
+- 高斯每个 40 字节，10M 是 400 MB 载荷 + 640 MB 节点内存；无叶子批量
+- 椭球距离固定 14 轮、无提前退出（CPU/GPU 逐位一致的代价），最差距离误差 1.7e-7
 - Morton 叶子批量（4–8 图元/叶）实测负结果，已回退到每叶 1 个；追 Warp 需要
   GPU 自顶向下 SAH 或宽节点，不在 M1 范围
 - 第一轮结果（不同场景、20 万条射线）已作废，勿引用

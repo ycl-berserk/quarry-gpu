@@ -13,6 +13,15 @@
 #define QUARRY_HD
 #endif
 
+// 融合乘加必须两端走同一条指令：nvcc 默认会把 a*b+c 收紧成 FMA，MSVC 在
+// /fp:precise 下不会。显式写出来，CPU 参考与 GPU 内核的位模式才谈得上一致。
+// fmaf 在 CUDA 的 host/device 两侧都可用，且都是正确舍入的单次运算。
+#if defined(__CUDACC__)
+#define QUARRY_FMA(a, b, c) fmaf((a), (b), (c))
+#else
+#define QUARRY_FMA(a, b, c) std::fma((a), (b), (c))
+#endif
+
 // 本项目所有几何都用 float：GPU 上 float 是默认精度，CPU 参考实现保持一致，
 // 否则跨端比较时会混入精度差异。
 struct Vec3 {

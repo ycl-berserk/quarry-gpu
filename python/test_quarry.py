@@ -99,6 +99,51 @@ def check(name, cond, detail=""):
     print(f"[PASS] {name}")
 
 
+def quat_axes(rot):
+    """把 (N,4) xyzw 四元数展开成旋转矩阵的三列（世界系 → 局部系），double。"""
+    q = rot.astype(np.float64)
+    q = q / np.linalg.norm(q, axis=1, keepdims=True)
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    u = np.stack([1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w)], axis=1)
+    v = np.stack([2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w)], axis=1)
+    t = np.stack([2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)], axis=1)
+    return u, v, t
+
+
+def ellipsoid_dist2(queries, means, rot, scale, iters=80):
+    """numpy 暴力椭球距离（double）：内部为 0，外部二分求 Eberly 方程的根。
+
+    返回 (nq, n) 的平方距离矩阵。
+    """
+    u, v, w = quat_axes(rot)
+    a, b, c = (scale[:, j].astype(np.float64) for j in range(3))
+    d = queries[:, None, :].astype(np.float64) - means[None, :, :].astype(np.float64)
+    y0, y1, y2 = (np.einsum("qki,ki->qk", d, col) for col in (u, v, w))
+
+    norm = (y0 / a) ** 2 + (y1 / b) ** 2 + (y2 / c) ** 2
+    out = np.zeros_like(norm)
+
+    def F(t):
+        return ((a * y0) / (t + a * a)) ** 2 + ((b * y1) / (t + b * b)) ** 2 + \
+               ((c * y2) / (t + c * c)) ** 2 - 1.0
+
+    lo = np.zeros_like(norm)
+    hi = 2.0 * np.maximum(np.maximum(a, b), c) * np.sqrt(y0 * y0 + y1 * y1 + y2 * y2)
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        pos = F(mid) > 0
+        lo = np.where(pos, mid, lo)
+        hi = np.where(pos, hi, mid)
+    t = 0.5 * (lo + hi)
+    x0 = a * a * y0 / (t + a * a)
+    x1 = b * b * y1 / (t + b * b)
+    x2 = c * c * y2 / (t + c * c)
+    outside = norm > 1.0
+    return np.where(outside,
+                    (y0 - x0) ** 2 + (y1 - x1) ** 2 + (y2 - x2) ** 2,
+                    0.0)
+
+
 def closest_brute(points, tris):
     """每个点到全部三角形的 (平方距离矩阵, 最小距离, argmin)。"""
     a64, b64, c64 = (tris[:, j].astype(np.float64) for j in range(3))
@@ -310,6 +355,82 @@ def main():
           and np.array_equal(pdist2.view(np.uint32),
                              d2_partial[rows, best_partial].view(np.uint32)))
 
+    # ---- 高斯：椭球实体距离，与 numpy 暴力法对拍 ----
+    ngs, ngq = 2000, 200
+    gmeans, grot, gscale = quarry.demo_gaussians("sheet", ngs, seed=3)
+    gcloud = quarry.GaussianCloud(gmeans, grot, gscale)
+    check("gaussian_count", gcloud.gaussian_count == ngs, gcloud.gaussian_count)
+    check("gaussian node_count", gcloud.node_count == 2 * ngs - 1, gcloud.node_count)
+    check("gaussian validate", gcloud.validate() == "", gcloud.validate())
+    check("gaussian build_ms", gcloud.build_ms > 0.0, gcloud.build_ms)
+
+    gq = np.array(gcloud.bounds["min"]) + (np.array(gcloud.bounds["max"]) -
+                                           np.array(gcloud.bounds["min"])) * rng.random((ngq, 3))
+    gq = gq.astype(np.float32)
+    gd2 = ellipsoid_dist2(gq, gmeans, grot, gscale)
+    grows = np.arange(ngq)
+    gref_best = gd2.argmin(axis=1)
+    gref_d2 = gd2[grows, gref_best]
+
+    gdist2, gidx = gcloud.closest(gq)
+    check("gaussian closest dist2", np.allclose(gdist2, gref_d2, rtol=1e-4, atol=1e-6),
+          f"max abs diff {np.max(np.abs(gdist2 - gref_d2)):.3e}")
+    tie_ok = gd2[grows, gidx] <= gref_d2 * (1 + 1e-4) + 1e-6
+    check("gaussian closest ids (ties allowed)", np.all(tie_ok),
+          f"{np.sum(tie_ok == False)} points pick a strictly farther gaussian")
+    check("gaussian last_query_ms", gcloud.last_query_ms > 0.0, gcloud.last_query_ms)
+
+    gk = 4
+    gkd, gkid = gcloud.knn(gq, gk)
+    check("gaussian knn shapes", gkd.shape == (ngq, gk) and gkid.shape == (ngq, gk))
+    bench_gd2 = np.sort(gd2, axis=1)[:, :gk]
+    check("gaussian knn dist2", np.allclose(gkd, bench_gd2, rtol=1e-4, atol=1e-6),
+          f"max abs diff {np.max(np.abs(gkd - bench_gd2)):.3e}")
+
+    gradius = 0.03 * float(np.linalg.norm(np.array(gcloud.bounds["max"]) -
+                                          np.array(gcloud.bounds["min"])))
+    goff, grd2, grid_ = gcloud.radius(gq, gradius)
+    check("gaussian radius offsets", goff.shape == (ngq + 1,) and goff[0] == 0
+          and goff[-1] == len(grid_))
+    gr2 = gradius * gradius
+    band = 1e-3 * gr2
+    gr_ok = True
+    for i in range(ngq):
+        got = set(grid_[goff[i]:goff[i + 1]].tolist())
+        inside = set(np.nonzero(gd2[i] <= gr2 - band)[0].tolist())
+        outside = set(np.nonzero(gd2[i] > gr2 + band)[0].tolist())
+        gr_ok &= inside <= got and not (got & outside)
+        gr_ok &= np.all(np.diff(grd2[goff[i]:goff[i + 1]]) >= 0)
+    check("gaussian radius sets", gr_ok)
+
+    # 增量更新：整体平移后再只改一个子集
+    gmoved = gmeans.copy()
+    gmoved[:, 1] += np.float32(0.1)
+    gcloud.update(gmoved, grot, gscale)
+    check("gaussian update validate", gcloud.validate() == "", gcloud.validate())
+    check("gaussian update uploaded everything", gcloud.refit_stats["updated"] == ngs,
+          gcloud.refit_stats["updated"])
+    gd2_moved = ellipsoid_dist2(gq, gmoved, grot, gscale)
+    best_moved = gd2_moved.argmin(axis=1)
+    mdist2, midx = gcloud.closest(gq)
+    check("gaussian update closest",
+          np.allclose(mdist2, gd2_moved[grows, best_moved], rtol=1e-4, atol=1e-6)
+          and np.all(gd2_moved[grows, midx] <= gd2_moved[grows, best_moved] * (1 + 1e-4) + 1e-6))
+
+    gpartial = gmoved.copy()
+    gdirty = np.array([0, 7, ngs - 1], dtype=np.int32)
+    gpartial[gdirty] += np.array([0.0, 0.5, 0.0], dtype=np.float32)
+    gcloud.update(gpartial, grot, gscale, dirty=gdirty)
+    check("gaussian partial validate", gcloud.validate() == "", gcloud.validate())
+    check("gaussian partial updated count", gcloud.refit_stats["updated"] == len(gdirty),
+          gcloud.refit_stats["updated"])
+    gd2_part = ellipsoid_dist2(gq, gpartial, grot, gscale)
+    best_part = gd2_part.argmin(axis=1)
+    pdist2, pidx = gcloud.closest(gq)
+    check("gaussian partial closest",
+          np.allclose(pdist2, gd2_part[grows, best_part], rtol=1e-4, atol=1e-6)
+          and np.all(gd2_part[grows, pidx] <= gd2_part[grows, best_part] * (1 + 1e-4) + 1e-6))
+
     for bad_call in (lambda: quarry.Scene(np.zeros((5, 3), dtype=np.float32)),
                      lambda: quarry.PointCloud(np.zeros((1, 3), dtype=np.float32)),
                      lambda: scene.knn(points, 0),
@@ -318,6 +439,9 @@ def main():
                      lambda: scene.raycast(points, dirs[:-1]),
                      lambda: scene.update_triangles(partial[:10]),
                      lambda: cloud.update_points(pts[:10]),
+                     lambda: gcloud.update(gmoved[:10], grot, gscale),
+                     lambda: quarry.GaussianCloud(gmeans, grot, gscale[:10]),
+                     lambda: quarry.GaussianCloud(gmeans, grot, -gscale),
                      lambda: face_scene.update_vertices(lifted)):
         try:
             bad_call()

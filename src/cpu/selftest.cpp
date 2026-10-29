@@ -6,10 +6,12 @@
 #include <vector>
 
 #include "core/fingerprint.h"
+#include "core/gaussian.h"
 #include "core/point_cloud.h"
 #include "core/scene.h"
 #include "cpu/brute.h"
 #include "cpu/bvh.h"
+#include "cpu/gauss_bvh.h"
 #include "cpu/point_kd.h"
 
 namespace {
@@ -295,6 +297,158 @@ void testPointKdEqualsBrute() {
     check(distOk, "point kd: distances agree");
 }
 
+// 高斯：先用手算答案钉住"到椭球实体的距离"，再让 BVH 与暴力法逐位对拍。
+void testGaussians() {
+    // 轴向椭球 a=1, b=2, c=3，位于原点、单位旋转。沿各轴外推，距离就是 |y| - 半轴。
+    Gaussian g;
+    g.mean = {0.0f, 0.0f, 0.0f};
+    g.scale = {1.0f, 2.0f, 3.0f};
+    g.rot = {0.0f, 0.0f, 0.0f, 1.0f};
+
+    bool axisOk = true;
+    axisOk &= std::fabs(gaussianDist2({5.0f, 0.0f, 0.0f}, g) - 16.0f) < 1e-4f;
+    axisOk &= std::fabs(gaussianDist2({0.0f, 4.0f, 0.0f}, g) - 4.0f) < 1e-4f;
+    axisOk &= std::fabs(gaussianDist2({0.0f, 0.0f, 7.0f}, g) - 16.0f) < 1e-4f;
+    axisOk &= gaussianDist2({0.5f, 0.5f, 0.5f}, g) == 0.0f;
+
+    // 绕 z 轴转 90°：x 半轴变成 2、y 半轴变成 1，长轴跟着转向。
+    Quat rotZ90;
+    rotZ90.z = std::sqrt(0.5f);
+    rotZ90.w = std::sqrt(0.5f);
+    Gaussian r = g;
+    r.rot = rotZ90;
+    axisOk &= std::fabs(gaussianDist2({4.0f, 0.0f, 0.0f}, r) - 4.0f) < 1e-3f;
+    axisOk &= std::fabs(gaussianDist2({0.0f, 5.0f, 0.0f}, r) - 16.0f) < 1e-3f;
+    check(axisOk, "gaussian: analytic distances along the axes");
+
+    // 球退化成点距：a=b=c 时 d^2 = max(0, |y| - r)^2。
+    Gaussian sphere;
+    sphere.scale = {2.0f, 2.0f, 2.0f};
+    bool sphereOk = true;
+    for (const Vec3& p : std::vector<Vec3>{{5.0f, 0.0f, 0.0f}, {0.0f, -3.0f, 0.0f},
+                                           {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}}) {
+        const float len = length(p);
+        const float want = len > 2.0f ? (len - 2.0f) * (len - 2.0f) : 0.0f;
+        sphereOk &= std::fabs(gaussianDist2(p, sphere) - want) < 1e-4f;
+    }
+    check(sphereOk, "gaussian: sphere case matches point distance");
+
+    // 外接盒必须是下界：盒距离永远不超过椭球距离。
+    bool boundsOk = true;
+    for (int i = 0; i < 200; ++i) {
+        Gaussian q;
+        q.mean = {0.5f * i - 50.0f, 0.25f * i, 0.1f * i};
+        q.rot = {0.1f * i, 0.2f, -0.1f, 1.0f};
+        q.scale = {0.1f + 0.01f * i, 0.05f, 0.4f};
+        const Vec3 p{std::sin(0.3f * i) * 60.0f, std::cos(0.7f * i) * 10.0f, 0.5f * i};
+        boundsOk &= distanceSquaredToAABB(p, gaussianBounds(q)) <= gaussianDist2(p, q) + 1e-5f;
+    }
+    check(boundsOk, "gaussian: AABB distance is a lower bound");
+
+    // 独立见证：float64 二分求同一方程的根。float32 牛顿若欠收敛，这里会露馅。
+    bool refOk = true;
+    float worstRel = 0.0f;
+    for (int i = 0; i < 300; ++i) {
+        const double angle = 0.37 * i;
+        Gaussian q;
+        q.mean = {static_cast<float>(std::cos(angle) * 20.0), 1.0f,
+                  static_cast<float>(std::sin(angle) * 20.0)};
+        q.rot = {static_cast<float>(std::sin(0.11 * i)), 0.3f, static_cast<float>(std::cos(0.7 * i)),
+                 1.0f};
+        q.scale = {0.2f + 0.02f * i, 0.05f + 0.01f * i, 0.3f};
+        const Vec3 p{static_cast<float>(std::cos(0.9 * i) * 45.0),
+                     static_cast<float>(std::sin(0.3 * i) * 5.0),
+                     static_cast<float>(std::sin(0.5 * i) * 45.0)};
+
+        Vec3 u, v, w;
+        gaussianAxes(q.rot, u, v, w);
+        const double y0 = (p.x - q.mean.x) * u.x + (p.y - q.mean.y) * u.y + (p.z - q.mean.z) * u.z;
+        const double y1 = (p.x - q.mean.x) * v.x + (p.y - q.mean.y) * v.y + (p.z - q.mean.z) * v.z;
+        const double y2 = (p.x - q.mean.x) * w.x + (p.y - q.mean.y) * w.y + (p.z - q.mean.z) * w.z;
+        const double a = q.scale.x, b = q.scale.y, c = q.scale.z;
+        double want = 0.0;
+        if ((y0 / a) * (y0 / a) + (y1 / b) * (y1 / b) + (y2 / c) * (y2 / c) > 1.0) {
+            auto F = [&](double t) {
+                return (a * y0 / (t + a * a)) * (a * y0 / (t + a * a)) +
+                       (b * y1 / (t + b * b)) * (b * y1 / (t + b * b)) +
+                       (c * y2 / (t + c * c)) * (c * y2 / (t + c * c)) - 1.0;
+            };
+            double lo = 0.0, hi = 2.0 * std::max({a, b, c}) * std::sqrt(y0 * y0 + y1 * y1 + y2 * y2);
+            for (int it = 0; it < 200; ++it) {
+                const double mid = 0.5 * (lo + hi);
+                if (F(mid) > 0.0) lo = mid;
+                else hi = mid;
+            }
+            const double t = 0.5 * (lo + hi);
+            const double x0 = a * a * y0 / (t + a * a);
+            const double x1 = b * b * y1 / (t + b * b);
+            const double x2 = c * c * y2 / (t + c * c);
+            want = (y0 - x0) * (y0 - x0) + (y1 - x1) * (y1 - x1) + (y2 - x2) * (y2 - x2);
+        }
+        // 用距离（而不是距离平方）比：近表面时平方值本身趋于 0，相对误差没有意义。
+        // 分母取 max 轴长做尺度，量纲统一成"相对主轴"的误差。
+        const float got = gaussianDist2(p, q);
+        const float gotDist = std::sqrt(got);
+        const float wantDist = static_cast<float>(std::sqrt(want));
+        const float amax = std::max({q.scale.x, q.scale.y, q.scale.z});
+        const float rel = std::fabs(gotDist - wantDist) / (wantDist + amax);
+        worstRel = std::max(worstRel, rel);
+        refOk &= rel < 1e-4f;
+    }
+    if (!refOk) std::printf("       worst distance rel = %.3e\n", static_cast<double>(worstRel));
+    check(refOk, "gaussian: distance matches a float64 reference");
+
+    // BVH 与暴力法：索引、距离、并列顺序全部一致。
+    GaussianCloudSpec spec;
+    spec.kind = "sheet";
+    spec.count = 4096;
+    spec.seed = 5;
+    const GaussianCloud cloud = buildGaussianCloud(spec);
+    check(cloud.gaussians.size() == 4096, "gaussian cloud keeps every primitive");
+
+    const GaussBVH bvh = buildGaussBVH(cloud);
+    const std::vector<Vec3> points = makeQueryPoints(cloud.bounds, 100, 19);
+    const float radius = 0.08f * length(cloud.bounds.extent());
+
+    bool closestSame = true;
+    bool knnSame = true;
+    bool radiusSame = true;
+    bool distExact = true;
+
+    for (const Vec3& p : points) {
+        const ClosestHit b = closestGaussianBrute(cloud, p);
+        const ClosestHit f = closestGaussianBVH(bvh, p);
+        if (b.found != f.found || b.triangle != f.triangle || b.dist2 != f.dist2) closestSame = false;
+
+        const auto bk = kNearestGaussianBrute(cloud, p, 6);
+        const auto fk = kNearestGaussianBVH(bvh, p, 6);
+        if (bk.size() != fk.size()) {
+            knnSame = false;
+        } else {
+            for (size_t i = 0; i < bk.size(); ++i) {
+                if (bk[i].triangle != fk[i].triangle) knnSame = false;
+                if (bk[i].dist2 != fk[i].dist2) distExact = false;
+            }
+        }
+
+        const auto br = radiusGaussianBrute(cloud, p, radius);
+        const auto fr = radiusGaussianBVH(bvh, p, radius);
+        if (br.size() != fr.size()) {
+            radiusSame = false;
+        } else {
+            for (size_t i = 0; i < br.size(); ++i) {
+                if (br[i].triangle != fr[i].triangle) radiusSame = false;
+                if (br[i].dist2 != fr[i].dist2) distExact = false;
+            }
+        }
+    }
+
+    check(closestSame, "gaussian bvh: closest matches brute force bitwise");
+    check(knnSame, "gaussian bvh: kNN matches brute force");
+    check(radiusSame, "gaussian bvh: radius matches brute force");
+    check(distExact, "gaussian bvh: distances are bitwise identical");
+}
+
 void testDeterminism() {
     SceneSpec spec;
     spec.kind = "random";
@@ -334,6 +488,7 @@ bool runSelfTest() {
     testQueryBruteEqualsBVH();
     testBVHShape();
     testPointKdEqualsBrute();
+    testGaussians();
     testDeterminism();
 
     std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "SELFTEST PASS" : "SELFTEST FAIL",

@@ -2,6 +2,7 @@
 
 #include <vector>
 
+#include "core/gaussian.h"
 #include "core/geometry.h"
 #include "core/point_cloud.h"
 #include "core/scene.h"
@@ -22,3 +23,10 @@ std::vector<ClosestHit> radiusBrute(const Scene& scene, const Vec3& p, float rad
 ClosestHit closestVertexBrute(const PointCloud& cloud, const Vec3& p);
 std::vector<ClosestHit> kNearestVertexBrute(const PointCloud& cloud, const Vec3& p, int k);
 std::vector<ClosestHit> radiusVertexBrute(const PointCloud& cloud, const Vec3& p, float radius);
+
+// 高斯的暴力查询：距离是"到椭球实体"的平方距离（内部为 0），与 GPU 叶子测试
+// 用同一个 gaussianDist2。
+ClosestHit closestGaussianBrute(const GaussianCloud& cloud, const Vec3& p);
+std::vector<ClosestHit> kNearestGaussianBrute(const GaussianCloud& cloud, const Vec3& p, int k);
+std::vector<ClosestHit> radiusGaussianBrute(const GaussianCloud& cloud, const Vec3& p,
+                                            float radius);

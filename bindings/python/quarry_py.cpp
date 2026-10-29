@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "core/gaussian.h"
 #include "core/point_cloud.h"
 #include "core/scene.h"
 #include "gpu/gpu_bvh.h"
@@ -23,6 +24,10 @@ namespace {
 
 using F32Array = py::array_t<float, py::array::c_style | py::array::forcecast>;
 using I32Array = py::array_t<int32_t, py::array::c_style | py::array::forcecast>;
+
+// 叶子载荷的种类：三角形、点、高斯椭球。查询骨架与输出格式完全相同，
+// 三者的区别只在 gpu/prim_ops.h 里的距离函数。
+enum class LeafKind { Triangle, Vertex, Gaussian };
 
 std::vector<Tri> trianglesFromArray(const F32Array& arr) {
     if (arr.ndim() != 3 || arr.shape(1) != 3 || arr.shape(2) != 3) {
@@ -99,6 +104,40 @@ std::vector<Vec3> pointsFromArray(const F32Array& arr, const char* what) {
     return out;
 }
 
+// 三个数组拼成 Gaussian 列表：均值 (N,3)、四元数 (N,4)（xyzw，可不归一化）、
+// 半轴 (N,3)。拆成三个数组而不是一个 (N,10)，是为了让调用方按列自然读写。
+std::vector<Gaussian> gaussiansFromArrays(const F32Array& means, const F32Array& rot,
+                                          const F32Array& scale) {
+    for (const auto* pair : {&means, &scale}) {
+        const F32Array& arr = *pair;
+        if (arr.ndim() != 2 || arr.shape(1) != 3) {
+            throw std::invalid_argument("means and scales must have shape (N, 3)");
+        }
+    }
+    if (rot.ndim() != 2 || rot.shape(1) != 4) {
+        throw std::invalid_argument("rotations must have shape (N, 4) as xyzw quaternions");
+    }
+    const int n = static_cast<int>(means.shape(0));
+    if (static_cast<int>(rot.shape(0)) != n || static_cast<int>(scale.shape(0)) != n) {
+        throw std::invalid_argument("means, rotations and scales must have the same length");
+    }
+
+    std::vector<Gaussian> out(static_cast<size_t>(n));
+    auto m = means.unchecked<2>();
+    auto q = rot.unchecked<2>();
+    auto s = scale.unchecked<2>();
+    for (int i = 0; i < n; ++i) {
+        Gaussian& g = out[static_cast<size_t>(i)];
+        g.mean = {m(i, 0), m(i, 1), m(i, 2)};
+        g.rot = {q(i, 0), q(i, 1), q(i, 2), q(i, 3)};
+        g.scale = {s(i, 0), s(i, 1), s(i, 2)};
+        if (!(g.scale.x > 0.0f) || !(g.scale.y > 0.0f) || !(g.scale.z > 0.0f)) {
+            throw std::invalid_argument("semi-axes must be positive");
+        }
+    }
+    return out;
+}
+
 py::array_t<float> floatArray(const std::vector<float>& v) {
     py::array_t<float> out(static_cast<py::ssize_t>(v.size()));
     std::memcpy(out.mutable_data(), v.data(), v.size() * sizeof(float));
@@ -119,9 +158,9 @@ py::dict boundsDict(const AABB& box) {
 }
 
 // ---- 三条查询的"跑 + 拷回 + 打包"流水线 ----
-// vertex 只决定叶子载荷是三角形还是点；两条路径的输出格式完全一样，
+// kind 只决定叶子载荷与距离函数；三条路径的输出格式完全一样，
 // 所以打包代码只写一份。
-py::tuple closestRun(GpuBVH& bvh, const F32Array& points, bool vertex, double* msOut) {
+py::tuple closestRun(GpuBVH& bvh, const F32Array& points, LeafKind kind, double* msOut) {
     const std::vector<Vec3> pts = pointsFromArray(points, "points");
     std::vector<GpuClosestResult> res;
     double ms = 0.0;
@@ -129,7 +168,11 @@ py::tuple closestRun(GpuBVH& bvh, const F32Array& points, bool vertex, double* m
         py::gil_scoped_release release;
         GpuPointBuffer buf = uploadPointsGPU(pts, 1);
         try {
-            ms = vertex ? closestVertexGPU(bvh, buf, false) : closestPointGPU(bvh, buf, false);
+            switch (kind) {
+                case LeafKind::Triangle: ms = closestPointGPU(bvh, buf, false); break;
+                case LeafKind::Vertex: ms = closestVertexGPU(bvh, buf, false); break;
+                case LeafKind::Gaussian: ms = closestGaussianGPU(bvh, buf, false); break;
+            }
             res = readQueryResultsGPU(buf);
         } catch (...) {
             destroyPointBufferGPU(buf);
@@ -149,7 +192,7 @@ py::tuple closestRun(GpuBVH& bvh, const F32Array& points, bool vertex, double* m
     return py::make_tuple(floatArray(dist2), intArray(idx));
 }
 
-py::tuple knnRun(GpuBVH& bvh, const F32Array& points, int k, bool vertex, double* msOut) {
+py::tuple knnRun(GpuBVH& bvh, const F32Array& points, int k, LeafKind kind, double* msOut) {
     if (k < 1 || k > 32) throw std::invalid_argument("k must be in [1, 32]");
     const std::vector<Vec3> pts = pointsFromArray(points, "points");
     std::vector<GpuClosestResult> res;
@@ -158,7 +201,11 @@ py::tuple knnRun(GpuBVH& bvh, const F32Array& points, int k, bool vertex, double
         py::gil_scoped_release release;
         GpuPointBuffer buf = uploadPointsGPU(pts, k);
         try {
-            ms = vertex ? kNearestVertexGPU(bvh, buf, k, false) : kNearestGPU(bvh, buf, k, false);
+            switch (kind) {
+                case LeafKind::Triangle: ms = kNearestGPU(bvh, buf, k, false); break;
+                case LeafKind::Vertex: ms = kNearestVertexGPU(bvh, buf, k, false); break;
+                case LeafKind::Gaussian: ms = kNearestGaussianGPU(bvh, buf, k, false); break;
+            }
             res = readQueryResultsGPU(buf);
         } catch (...) {
             destroyPointBufferGPU(buf);
@@ -186,7 +233,7 @@ py::tuple knnRun(GpuBVH& bvh, const F32Array& points, int k, bool vertex, double
     return py::make_tuple(dist2, idx);
 }
 
-py::tuple radiusRun(GpuBVH& bvh, const F32Array& points, float radius, bool vertex,
+py::tuple radiusRun(GpuBVH& bvh, const F32Array& points, float radius, LeafKind kind,
                     double* msOut) {
     if (!(radius >= 0.0f)) throw std::invalid_argument("radius must be >= 0");
     const std::vector<Vec3> pts = pointsFromArray(points, "points");
@@ -197,8 +244,17 @@ py::tuple radiusRun(GpuBVH& bvh, const F32Array& points, float radius, bool vert
         GpuPointBuffer buf = uploadPointsGPU(pts, 1);
         GpuRadiusBuffer out;
         try {
-            ms = vertex ? radiusQueryVertexGPU(bvh, buf, radius, out, false)
-                        : radiusQueryGPU(bvh, buf, radius, out, false);
+            switch (kind) {
+                case LeafKind::Triangle:
+                    ms = radiusQueryGPU(bvh, buf, radius, out, false);
+                    break;
+                case LeafKind::Vertex:
+                    ms = radiusQueryVertexGPU(bvh, buf, radius, out, false);
+                    break;
+                case LeafKind::Gaussian:
+                    ms = radiusQueryGaussianGPU(bvh, buf, radius, out, false);
+                    break;
+            }
             hits = readRadiusResultsGPU(out);
         } catch (...) {
             destroyRadiusBufferGPU(out);
@@ -326,15 +382,15 @@ public:
     }
 
     py::tuple closest(const F32Array& points) {
-        return closestRun(bvh_, points, false, &lastQueryMs_);
+        return closestRun(bvh_, points, LeafKind::Triangle, &lastQueryMs_);
     }
 
     py::tuple knn(const F32Array& points, int k) {
-        return knnRun(bvh_, points, k, false, &lastQueryMs_);
+        return knnRun(bvh_, points, k, LeafKind::Triangle, &lastQueryMs_);
     }
 
     py::tuple radius(const F32Array& points, float radius) {
-        return radiusRun(bvh_, points, radius, false, &lastQueryMs_);
+        return radiusRun(bvh_, points, radius, LeafKind::Triangle, &lastQueryMs_);
     }
 
 private:
@@ -454,15 +510,15 @@ public:
     std::string validate() const { return validatePointBVHGPU(bvh_, cloud_); }
 
     py::tuple closest(const F32Array& points) {
-        return closestRun(bvh_, points, true, &lastQueryMs_);
+        return closestRun(bvh_, points, LeafKind::Vertex, &lastQueryMs_);
     }
 
     py::tuple knn(const F32Array& points, int k) {
-        return knnRun(bvh_, points, k, true, &lastQueryMs_);
+        return knnRun(bvh_, points, k, LeafKind::Vertex, &lastQueryMs_);
     }
 
     py::tuple radius(const F32Array& points, float radius) {
-        return radiusRun(bvh_, points, radius, true, &lastQueryMs_);
+        return radiusRun(bvh_, points, radius, LeafKind::Vertex, &lastQueryMs_);
     }
 
     // 与 Scene.update_triangles 同一份合同：点 i 必须还是建树时那个点，
@@ -500,6 +556,143 @@ private:
     double lastQueryMs_ = 0.0;
     double refitMs_ = 0.0;
 };
+
+// 高斯云：查询语义是椭球实体（内部距离 0，外部到表面），不是概率密度。
+// 因此 closest / knn / radius 的输出与点云完全同构：dist2 + 图元下标。
+class PyGaussianCloud {
+public:
+    PyGaussianCloud(const F32Array& means, const F32Array& rot, const F32Array& scale)
+        : gaussians_(gaussiansFromArrays(means, rot, scale)) {
+        if (gaussians_.size() < 2) throw std::invalid_argument("at least 2 gaussians required");
+        cloud_.gaussians = gaussians_;
+        cloud_.updateBounds();
+        bounds_ = cloud_.bounds;
+        {
+            py::gil_scoped_release release;
+            bvh_ = buildGaussianBVHGPU(cloud_, &timings_);
+        }
+        buildMs_ = timings_.totalMs;
+    }
+
+    ~PyGaussianCloud() { destroyBVHGPU(bvh_); }
+
+    PyGaussianCloud(const PyGaussianCloud&) = delete;
+    PyGaussianCloud& operator=(const PyGaussianCloud&) = delete;
+
+    int gaussianCount() const { return bvh_.primCount; }
+    int nodeCount() const { return bvh_.nodeCount; }
+    int depth() const { return bvh_.depth; }
+    double buildMs() const { return buildMs_; }
+    double lastQueryMs() const { return lastQueryMs_; }
+    double refitMs() const { return refitMs_; }
+    py::dict bounds() const { return boundsDict(bounds_); }
+
+    py::dict buildStats() const {
+        py::dict out;
+        out["morton_ms"] = timings_.mortonMs;
+        out["sort_ms"] = timings_.sortMs;
+        out["scatter_ms"] = timings_.scatterMs;
+        out["tree_ms"] = timings_.treeMs;
+        out["refit_ms"] = timings_.refitMs;
+        out["total_ms"] = timings_.totalMs;
+        return out;
+    }
+
+    py::dict refitStats() const {
+        py::dict out;
+        out["upload_ms"] = refitTimings_.uploadMs;
+        out["scatter_ms"] = refitTimings_.gatherMs;
+        out["tree_ms"] = refitTimings_.treeMs;
+        out["mark_ms"] = refitTimings_.markMs;
+        out["merge_ms"] = refitTimings_.mergeMs;
+        out["total_ms"] = refitTimings_.totalMs;
+        out["updated"] = refitTimings_.updated;
+        return out;
+    }
+
+    std::string validate() const { return validateGaussianBVHGPU(bvh_, cloud_); }
+
+    py::tuple closest(const F32Array& points) {
+        return closestRun(bvh_, points, LeafKind::Gaussian, &lastQueryMs_);
+    }
+
+    py::tuple knn(const F32Array& points, int k) {
+        return knnRun(bvh_, points, k, LeafKind::Gaussian, &lastQueryMs_);
+    }
+
+    py::tuple radius(const F32Array& points, float radius) {
+        return radiusRun(bvh_, points, radius, LeafKind::Gaussian, &lastQueryMs_);
+    }
+
+    // 与另外两个 update 同一份合同：第 i 个高斯必须还是建树时那一族（均值可以动，
+    // 朝向和半轴也可以动——叶子盒会重算），dirty 里的下标才允许变。
+    // 不传 dirty 表示整份上传。
+    void update(const F32Array& means, const F32Array& rot, const F32Array& scale,
+                const py::object& dirty) {
+        std::vector<Gaussian> gs = gaussiansFromArrays(means, rot, scale);
+        if (static_cast<int>(gs.size()) != bvh_.primCount) {
+            throw std::invalid_argument("update must keep the gaussian count; rebuild instead");
+        }
+        std::vector<int> ids;
+        const bool partial = !dirty.is_none();
+        if (partial) {
+            const I32Array arr = dirty.cast<I32Array>();
+            ids.assign(arr.data(), arr.data() + arr.size());
+        }
+
+        gaussians_ = std::move(gs);
+        cloud_.gaussians = gaussians_;
+        cloud_.updateBounds();
+        bounds_ = cloud_.bounds;
+
+        {
+            py::gil_scoped_release release;
+            refitMs_ = partial ? refitGaussianBVHGPU(bvh_, cloud_, ids, &refitTimings_)
+                               : refitGaussianBVHGPU(bvh_, cloud_, &refitTimings_);
+        }
+    }
+
+private:
+    std::vector<Gaussian> gaussians_;
+    GaussianCloud cloud_;
+    AABB bounds_;
+    GpuBVH bvh_;
+    GpuBuildTimings timings_{};
+    GpuRefitTimings refitTimings_{};
+    double buildMs_ = 0.0;
+    double lastQueryMs_ = 0.0;
+    double refitMs_ = 0.0;
+};
+
+py::tuple demoGaussians(const std::string& kind, int count, uint64_t seed) {
+    GaussianCloudSpec spec;
+    spec.kind = kind;
+    spec.count = count;
+    spec.seed = seed;
+    const GaussianCloud cloud = buildGaussianCloud(spec);
+
+    const py::ssize_t n = static_cast<py::ssize_t>(cloud.gaussians.size());
+    py::array_t<float> means({n, static_cast<py::ssize_t>(3)});
+    py::array_t<float> rot({n, static_cast<py::ssize_t>(4)});
+    py::array_t<float> scale({n, static_cast<py::ssize_t>(3)});
+    auto m = means.mutable_unchecked<2>();
+    auto q = rot.mutable_unchecked<2>();
+    auto s = scale.mutable_unchecked<2>();
+    for (py::ssize_t i = 0; i < n; ++i) {
+        const Gaussian& g = cloud.gaussians[static_cast<size_t>(i)];
+        m(i, 0) = g.mean.x;
+        m(i, 1) = g.mean.y;
+        m(i, 2) = g.mean.z;
+        q(i, 0) = g.rot.x;
+        q(i, 1) = g.rot.y;
+        q(i, 2) = g.rot.z;
+        q(i, 3) = g.rot.w;
+        s(i, 0) = g.scale.x;
+        s(i, 1) = g.scale.y;
+        s(i, 2) = g.scale.z;
+    }
+    return py::make_tuple(means, rot, scale);
+}
 
 py::tuple demoMesh(const std::string& kind, int grid, int randomTris, uint64_t seed) {
     SceneSpec spec;
@@ -543,6 +736,10 @@ PYBIND11_MODULE(quarry, m) {
     m.def("demo_mesh", &demoMesh, py::arg("kind") = "terrain", py::arg("grid") = 64,
           py::arg("random_tris") = 0, py::arg("seed") = 1,
           "Return (vertices (N,3) float32, indices (M,3) int32) for a demo scene");
+
+    m.def("demo_gaussians", &demoGaussians, py::arg("kind") = "sheet", py::arg("count") = 131072,
+          py::arg("seed") = 1,
+          "Return (means (N,3), rot (N,4) xyzw, scales (N,3)) for a demo gaussian cloud");
 
     py::class_<PyScene>(m, "Scene", "Static triangle mesh with a GPU LBVH")
         .def(py::init<const F32Array&>(), py::arg("triangles"),
@@ -609,6 +806,38 @@ PYBIND11_MODULE(quarry, m) {
              "Return (dist2 float32[N,k], index int32[N,k]) sorted by (dist2, index); "
              "missing slots are -1")
         .def("radius", &PyPointCloud::radius, py::arg("points"), py::arg("radius"),
+             "Return CSR (offsets int64[N+1], dist2 float32[total], index int32[total]) "
+             "sorted by (dist2, index) inside each segment");
+
+    py::class_<PyGaussianCloud>(
+        m, "GaussianCloud",
+        "Static gaussian cloud with a GPU LBVH. Query semantics are the solid ellipsoid: "
+        "dist2 is 0 inside, otherwise the squared euclidean distance to the surface")
+        .def(py::init<const F32Array&, const F32Array&, const F32Array&>(), py::arg("means"),
+             py::arg("rot"), py::arg("scale"),
+             "Build from means (N,3), rotations (N,4) xyzw quaternions, semi-axes (N,3)")
+        .def_property_readonly("gaussian_count", &PyGaussianCloud::gaussianCount)
+        .def_property_readonly("node_count", &PyGaussianCloud::nodeCount)
+        .def_property_readonly("depth", &PyGaussianCloud::depth)
+        .def_property_readonly("build_ms", &PyGaussianCloud::buildMs)
+        .def_property_readonly("last_query_ms", &PyGaussianCloud::lastQueryMs,
+                               "Kernel time of the most recent query (CUDA events, no copies)")
+        .def_property_readonly("refit_ms", &PyGaussianCloud::refitMs)
+        .def_property_readonly("refit_stats", &PyGaussianCloud::refitStats)
+        .def_property_readonly("bounds", &PyGaussianCloud::bounds)
+        .def_property_readonly("build_stats", &PyGaussianCloud::buildStats)
+        .def("validate", &PyGaussianCloud::validate,
+             "Check tree invariants; empty string means pass")
+        .def("update", &PyGaussianCloud::update, py::arg("means"), py::arg("rot"),
+             py::arg("scale"), py::arg("dirty") = py::none(),
+             "Refit in place: gaussian i must still be the same primitive. dirty is an int32 "
+             "array of indices to upload; omit it to upload everything")
+        .def("closest", &PyGaussianCloud::closest, py::arg("points"),
+             "Return (dist2 float32[N], index int32[N]); index is -1 on a miss")
+        .def("knn", &PyGaussianCloud::knn, py::arg("points"), py::arg("k"),
+             "Return (dist2 float32[N,k], index int32[N,k]) sorted by (dist2, index); "
+             "missing slots are -1")
+        .def("radius", &PyGaussianCloud::radius, py::arg("points"), py::arg("radius"),
              "Return CSR (offsets int64[N+1], dist2 float32[total], index int32[total]) "
              "sorted by (dist2, index) inside each segment");
 }

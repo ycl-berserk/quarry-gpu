@@ -467,6 +467,11 @@ double closestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStat
     return closestImpl<PointOps>(bvh, buf, collectStats);
 }
 
+// 高斯最近点：载荷换成 Gaussian，叶子距离是到椭球实体的平方距离。
+double closestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
+    return closestImpl<GaussianOps>(bvh, buf, collectStats);
+}
+
 template <typename Ops>
 double kNearestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats) {
     if (buf.count <= 0 || bvh.nodeCount <= 0) return 0.0;
@@ -528,6 +533,10 @@ double kNearestGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectSt
 
 double kNearestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats) {
     return kNearestImpl<PointOps>(bvh, buf, k, collectStats);
+}
+
+double kNearestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats) {
+    return kNearestImpl<GaussianOps>(bvh, buf, k, collectStats);
 }
 
 template <typename Ops>
@@ -668,6 +677,11 @@ double radiusQueryGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuR
 double radiusQueryVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
                             GpuRadiusBuffer& out, bool collectStats) {
     return radiusQueryImpl<PointOps>(bvh, buf, radius, out, collectStats);
+}
+
+double radiusQueryGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
+                              GpuRadiusBuffer& out, bool collectStats) {
+    return radiusQueryImpl<GaussianOps>(bvh, buf, radius, out, collectStats);
 }
 
 void destroyRadiusBufferGPU(GpuRadiusBuffer& buf) {

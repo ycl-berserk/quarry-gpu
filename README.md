@@ -6,14 +6,15 @@ GPU 原生空间查询引擎：构建加速结构（BVH / 八叉树 / 哈希网�
 
 许可证 Apache-2.0（见 `LICENSE`）。CPU 参考实现已完整；GPU 侧（CUDA 12.4，sm_89）已有
 并行 LBVH 构建、光线遍历、closest / kNN / radius 三条点查询路径，拓扑冻结的增量更新
-（refit），以及**点云图元**（同一套 LBVH + 三条查询 + refit，只在叶子里换"测什么"）。
+（refit），以及**三种图元**：三角形、点云、高斯。三者共用同一棵 LBVH 与同一套查询，
+只在叶子里换"测什么"——高斯的叶子测试是精确的**点到椭球实体**距离。
 没有 CUDA 工具链时自动降级为纯 CPU 构建，CI 与本文档的 CPU 数字不受影响。
 
 ## 现在能跑什么
 
 ```bat
 build.bat                                  :: CMake + Ninja（用 VS 2022 自带的，无需另装）
-build\quarry.exe selftest                  :: 正确性自测（34 项）
+build\quarry.exe selftest                  :: 正确性自测（43 项）
 build\quarry.exe run --scene terrain --grid 256 --rays 1000000 --engine bvh
 build\quarry.exe query --type closest --grid 256 --points 20000 --stats
 build\quarry.exe query --type knn --k 16 --grid 256 --points 20000
@@ -29,6 +30,11 @@ build\gpu_cloud_bench.exe --points 131072 --queries 20000                   :: �
 build\gpu_cloud_bench.exe --points 1048576 --queries 20000 --query knn --k 8
 build\gpu_cloud_bench.exe --kind volume --points 1048576 --query radius --radius 1.0
 build\gpu_cloud_bench.exe --points 1048576 --refit --refit-dirty 0.01 --refit-motion coherent
+
+build\gpu_gauss_bench.exe --gaussians 131072 --queries 20000                :: 高斯 closest，GPU 对椭球 BVH
+build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --query knn --k 8
+build\gpu_gauss_bench.exe --kind volume --gaussians 1048576 --query radius --radius 1.0
+build\gpu_gauss_bench.exe --gaussians 1048576 --refit --refit-dirty 0.01 --refit-motion coherent
 ```
 
 输出包含一个**正确性指纹**（每条射线的命中标志 + t 值，按 FNV-1a 折叠）：
@@ -172,6 +178,47 @@ sheet 点云（x/z ∈ [-50, 50]，y 贴地形面 + 2 cm 抖动），20,000 个�
   `sum_dist2` + 指纹逐位一致（独立实现的第三个见证），kNN 的 `sum_dist2` 相对差
   在 1e-13 量级（scipy 用 float64 距离选点）。
 
+## 高斯（M2 后半，2026-10-29）
+
+语义先钉死：**椭球实体**。查询点在高斯内部时距离为 0，在外时是到椭球表面的欧氏距离。
+`radius` 于是回答"哪些椭球与这个球相交"。中心密度（Mahalanobis）和屏幕空间投影不做，
+理由见第 09 章——前者不是欧氏距离、剪枝规则要重写，后者依赖相机、失去静态索引的意义。
+
+**基线口径**：`rtcPointQuery` 只对三角网格找最近点，Warp 只有 `mesh_query_point`，
+3DGS 渲染器没有静态索引，3DGRT（NVIDIA 2024）查的是**射线**与高斯的求交。所以点到
+椭球的最近/半径查询**没有可引用的外部实现**，下表括号内是**对自写的单线程椭球 BVH**
+（`src/cpu/gauss_bvh.cpp`）的倍数，不是对 Embree/Warp。
+
+20,000 个随机查询点，CPU/GPU 同一批浮点数，每格取 5 轮中位数（10M 的 CPU 只跑 3 轮）：
+
+| 分布 | 高斯数 | closest | kNN k=8 | radius | GPU 构建 |
+|---|---|---|---|---|---|
+| sheet | 131,072 | 2.40 ms (55.2×) | 5.42 ms (44.4×) | 6.62 ms (17.6×) | 1.41 ms |
+| sheet | 1,048,576 | 8.01 ms (49.8×) | — | — | 5.81 ms |
+| sheet | 10,485,760 | 46.12 ms (65.6×) | — | — | 70.2 ms |
+| volume | 131,072 | 0.27 ms (219×) | 0.91 ms (169×) | 1.15 ms (44.9×) | 1.30 ms |
+| volume | 1,048,576 | 0.47 ms (168×) | — | — | 5.72 ms |
+
+- **椭球距离不是"贵到不能用"**：一次叶子测试是 14 轮 ×（3 次除法 + 约 12 次乘加），
+  同规模点云是 3 次乘加，但总时间只差 1.3–3.5×（sheet 131k closest 0.68 → 2.35 ms；
+  volume 1.3×）——节点测试与显存延迟把除法的延迟藏掉了。
+- **sheet 分布是剪枝的坏情况**：10M 每查询 1775 次节点、348 次椭球测试
+  （sheet 131k 138.3 / 19.0，volume 131k 46.4 / 3.5）。10M sheet 的 GPU 只有
+  0.43 Mq/s，比 volume 慢两个数量级——倍数是两侧共同决定的，不能只看吞吐。
+- **求根器必须"括号 + 牛顿/二分兜底"**：纯牛顿从 0 起步在远点线性收敛（12 轮仍差 12%），
+  球近似初值在扁椭球上落在根上方、第一步冲成负数（误差 30%）。现在给一个符号有保证的
+  括号 `[0, 2·a_max·|y|]`，固定 14 轮、不提前退出，对 float64 参考的最差距离相对误差
+  **1.7e-7**。
+- **CPU/GPU 逐位一致**：所有乘加走 `QUARRY_FMA`（CUDA `fmaf` / MSVC `std::fma`），
+  nvcc 加 `--fmad=false`，除法依赖两边的 IEEE 正确舍入，禁止 `--use_fast_math`。
+  9 格矩阵 `id/dist/count_mismatch` 全 0，指纹逐位相同（sheet 131k closest
+  `0x2ccb47efc9f4d3c7`）。
+- 增量更新：1M sheet、1% 相干位移，局部 refit **1.61 ms**（重建 5.73 ms，3.6×）；
+  全量 refit 7.42 ms **比重建还慢**，因为 40 MB 上传是硬成本——和点云同一个结论。
+  上一会话同一配置测到 0.93 ms，H2D 延迟随电源状态变化，配对倍数是 3.6–6.8×。
+- 每个高斯 40 字节（mean 12 + 四元数 16 + 半轴 12），10M 高斯的载荷是 400 MB，
+  节点内存 640 MB。这是"每叶 1 个图元"在 8 GB 卡上的实际上限。
+
 ## Python 绑定
 
 有 Python 3.8+ 和 `pip install pybind11 numpy` 时，`build.bat` 会顺带把扩展模块建到
@@ -188,28 +235,32 @@ d2, tri = scene.closest(points)             # (N,) float32, (N,) int32
 
 ```bat
 py -3.13 python/demo.py          :: 建场景 + 四种查询 + 开销拆分
-py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（55 项检查）
+py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（72 项检查）
 ```
 
 | 入口 | 返回 |
 |---|---|
 | `quarry.describe()` | 显卡字符串；无 CUDA 时为空串 |
 | `quarry.demo_mesh(kind, grid, random_tris, seed)` | `(vertices (N,3) f32, indices (M,3) i32)` |
+| `quarry.demo_gaussians(kind, count, seed)` | `(means (N,3) f32, rot (N,4) f32 xyzw, scale (N,3) f32 半轴)` |
 | `Scene(vertices, indices)` / `Scene(triangles)` | 构建 GPU BVH；`triangle_count` / `node_count` / `depth` / `bounds` / `build_stats` |
 | `PointCloud(points)` | 构建点云 LBVH；`point_count` / `node_count` / `depth` / `bounds` / `build_stats` |
-| `scene.validate()` / `cloud.validate()` | 树结构自检，空串表示通过 |
+| `GaussianCloud(means, rot, scale)` | 构建高斯 LBVH；`gaussian_count` / `node_count` / `depth` / `bounds` / `build_stats` |
+| `scene.validate()` / `cloud.validate()` / `gcloud.validate()` | 树结构自检，空串表示通过 |
 | `scene.raycast(origins, dirs, tmax=inf)` | `(hit bool[N], t f32[N])`，未命中 `t=inf` |
-| `scene.closest(points)` / `cloud.closest(points)` | `(dist2 f32[N], triangle/point i32[N])` |
-| `scene.knn(points, k)` / `cloud.knn(points, k)` | `(dist2 f32[N,k], index i32[N,k])`，按 `(dist2, 索引)` 升序，缺位 -1 |
-| `scene.radius(points, r)` / `cloud.radius(points, r)` | CSR：`(offsets i64[N+1], dist2 f32[total], index i32[total])`，段内有序 |
+| `scene.closest(points)` / `cloud.closest(points)` / `gcloud.closest(points)` | `(dist2 f32[N], triangle/point/gaussian i32[N])` |
+| `scene.knn(points, k)` / ... | `(dist2 f32[N,k], index i32[N,k])`，按 `(dist2, 索引)` 升序，缺位 -1 |
+| `scene.radius(points, r)` / ... | CSR：`(offsets i64[N+1], dist2 f32[total], index i32[total])`，段内有序 |
 | `scene.update_vertices(vertices, dirty=None)` | 拓扑冻结的 refit：顶点换位、三角形数不变；`dirty` 是改动三角形索引 |
 | `scene.update_triangles(triangles, dirty=None)` | 同上，直接给 `(M,3,3)`；`refit_ms` / `refit_stats` 读上一次的耗时 |
 | `cloud.update_points(points, dirty=None)` | 点云 refit：点数不变；`dirty` 是改动的点索引 |
+| `gcloud.update(means, rot, scale, dirty=None)` | 高斯 refit：数量不变，中心/朝向/半轴可一起换；半轴必须 > 0 |
 
 - 入参统一按 `float32` / C 连续处理（`forcecast`），传 float64 或非连续数组会先拷贝。
   返回数组在重新拿到 GIL 之后才分配，构建与查询期间 GIL 是释放的。
-- `PointCloud` 与 `Scene` 的查询形状完全一致，`closest/knn/radius` 可以互换；
-  区别是前者的 `triangle` 字段装的是点索引，且没有 `raycast`。
+- 三个类的查询形状完全一致，`closest/knn/radius` 可以互换；区别是结果里的
+  `triangle` 字段装的是三角形 / 点 / 高斯索引，且只有 `Scene` 有 `raycast`。
+  `GaussianCloud` 的 `closest` 在椭球内部返回 0，并列按索引最小。
 - `last_query_ms` 是 CUDA event 计的内核时间，`build_ms` 是构建路径的墙钟；
   端到端还包含上传、回读和建 Python 数组。131k 场景、20k 查询点的 closest：
   墙钟中位数 1.44 ms，内核 1.29 ms，**Python 侧固定开销约 0.14 ms**。
@@ -270,7 +321,7 @@ scene.refit_ms, scene.refit_stats       # {upload_ms, scatter_ms, mark_ms, merge
 做：
 
 - 加速结构的**构建**与**查询**都在 GPU 上
-- 三角形、点云、高斯三种图元用同一套查询接口（已覆盖前两种，高斯在 M2 后半）
+- 三角形、点云、高斯三种图元用同一套查询接口（均已实现：`TriOps` / `PointOps` / `GaussianOps`）
 - 每瓦吞吐与端到端延迟作为一等指标
 - 可复现基准：同 seed 同输入，逐条对拍
 
@@ -284,9 +335,9 @@ scene.refit_ms, scene.refit_stats       # {upload_ms, scatter_ms, mark_ms, merge
 ## 目录
 
 ```text
-src/core/     几何、场景与点云生成、可复现输入（host/device 共用）
-src/cpu/      暴力法真值 + 朴素 BVH 参照 + 点云 kd-tree 基线
-src/gpu/      CUDA：并行 LBVH（lbvh.cu，按 Ops 同时服务三角形与点）、光线遍历、点查询
+src/core/     几何、场景 / 点云 / 高斯生成、可复现输入（host/device 共用）
+src/cpu/      暴力法真值 + 朴素 BVH 参照 + 点云 kd-tree 基线 + 椭球 BVH 基线
+src/gpu/      CUDA：并行 LBVH（lbvh.cu，按 Ops 服务三角形 / 点 / 高斯）、光线遍历、点查询
 src/cli/      quarry 命令行
 bindings/     pybind11 绑定（quarry_py.cpp）
 bench/        Embree 对照、Warp / scipy 对照与 gpu_*_bench（同一份输入，二进制转储互通）
@@ -308,6 +359,11 @@ learn/        教程配套的单文件练习
 - 点云查询没有 Embree 对照物（`rtcPointQuery` 只吃三角形）；基线是自写的单线程
   kd-tree，另有 scipy `cKDTree` 作第二把尺子。scipy 在 2D 流形数据上会退化
   （10M 慢 72×），所以 headline 倍数只用自家 kd
+- 高斯查询**没有外部基线**：Embree/Warp 没有椭球图元，3DGRT 查的是射线与高斯的求交。
+  倍数是相对自写的单线程椭球 BVH；语义是椭球实体，Mahalanobis 密度与屏幕投影未做
+- 高斯每个 40 字节，10M 是 400 MB 载荷 + 640 MB 节点；同规模点云约 3.3 倍上传量
+- 椭球距离固定 14 轮求根，最差距离相对误差 1.7e-7；没有做自适应提前退出，
+  因为 CPU/GPU 逐位一致优先于最后一位精度
 - 点云仍是每叶 1 个图元：10M 点 → 2000 万节点、约 640 MB 节点内存，这是 8 GB 卡上
   的实际上限；叶子批量在三角形上是负结果（射线 2.2× 慢），点云没有重试
 - Python 绑定是同步的：每次调用都上传、同步、回读，没有异步 / 零拷贝接口

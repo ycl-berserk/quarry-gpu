@@ -624,6 +624,11 @@ GpuBVH buildPointBVHGPU(const PointCloud& cloud, GpuBuildTimings* timings) {
     return buildLBVH<PointOps>(cloud.pts.data(), static_cast<int>(cloud.pts.size()), timings);
 }
 
+GpuBVH buildGaussianBVHGPU(const GaussianCloud& cloud, GpuBuildTimings* timings) {
+    return buildLBVH<GaussianOps>(cloud.gaussians.data(), static_cast<int>(cloud.gaussians.size()),
+                                  timings);
+}
+
 void destroyBVHGPU(GpuBVH& bvh) {
     if (bvh.d_nodes) cudaFree(bvh.d_nodes);
     if (bvh.d_tris) cudaFree(bvh.d_tris);
@@ -857,6 +862,16 @@ double refitPointBVHGPU(GpuBVH& bvh, const PointCloud& cloud, const std::vector<
     return refitImpl<PointOps>(bvh, cloud.pts, &dirty, timings);
 }
 
+double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
+                           GpuRefitTimings* timings) {
+    return refitImpl<GaussianOps>(bvh, cloud.gaussians, nullptr, timings);
+}
+
+double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
+                           const std::vector<int>& dirty, GpuRefitTimings* timings) {
+    return refitImpl<GaussianOps>(bvh, cloud.gaussians, &dirty, timings);
+}
+
 template <typename Ops>
 std::string validateImpl(const GpuBVH& bvh, const std::vector<typename Ops::Item>& items,
                          const AABB& bounds) {
@@ -906,4 +921,8 @@ std::string validateBVHGPU(const GpuBVH& bvh, const Scene& scene) {
 
 std::string validatePointBVHGPU(const GpuBVH& bvh, const PointCloud& cloud) {
     return validateImpl<PointOps>(bvh, cloud.pts, cloud.bounds);
+}
+
+std::string validateGaussianBVHGPU(const GpuBVH& bvh, const GaussianCloud& cloud) {
+    return validateImpl<GaussianOps>(bvh, cloud.gaussians, cloud.bounds);
 }
