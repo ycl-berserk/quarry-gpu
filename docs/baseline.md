@@ -787,8 +787,23 @@ Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
    算术重，少读节点仍值）。随机方向次生射线遍历太浅，无收益。
 4. **逐位不变**：2M 100 万射线逐条对拍 `hit_mismatch=0 t_mismatch=0`；三角形 131k、
    点云 131k、高斯 131k 三条查询在二叉/宽下指纹相同，与 CPU 参考三种 `*_mismatch=0`。
-5. **宽节点 + refit 未接**：refit 改的是二叉盒子，宽节点是拷贝，会变旧；基准
-   `--wide --refit` 直接拒绝。接法是 refit 后用保留的 `wideId` 重跑一次折叠。
+5. **宽节点 + refit 已接（同日追加）**：refit 结束时用不变的 `wideId` 重发宽节点。
+   局部路径只重发脏祖先里偶数深度的节点（按层 launch，计数留显存）；小树
+   （≤262144 个宽节点 ≈ 52 万图元）或 ≥1/8 叶子都脏时改为整层重发，因为按层
+   重发在 131k 上要 0.23–0.37 ms、整层只要 0.13–0.17 ms，而 2M 上按层 0.40、
+   整层 1.37–1.5 ms。实测（2M 三角形、1% dirty、3 轮）：
+
+   | 项 | 二叉 | 宽 | 宽的重发 |
+   |---|---|---|---|
+   | 局部 refit | 1.26 ms | 1.78 ms | 0.40 ms |
+   | refit 后 closest 20k | 3.41 ms | 2.39 ms | — |
+   | 全量 refit | 15.44 ms | 17.47 ms | 1.37 ms |
+   | 全量后 closest 20k | 3.83 ms | 2.53 ms | — |
+
+   100 万点云局部 refit 1.30 → 1.18–1.40 ms（重发 0.35 ms，查询 4.25 → 3.29 ms）、
+   全量 5.35 → 6.11 ms（重发 0.95 ms）；100 万高斯局部 1.05 → 1.40 ms（重发 0.35）、
+   全量 11.05 → 11.09 ms（重发 0.97）；131k 局部重发 0.13 ms。refit 后宽/二叉
+   两条路径与 CPU 参考仍逐位一致（三角形、点云、高斯各两种 refit，全部零失配）。
 6. 默认 `wide=false`；原始日志 `out/wide_*.txt`（gitignore）。
 
 ## 结论
@@ -849,7 +864,8 @@ Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
     1.72×、closest 1.69×、kNN 1.42×；射线一旦按 Morton 排序（二叉已 4.27 ms），
     宽节点 1.01×。点查询上两者可叠加：宽 + 排序端到端 1.86×。点云 radius 持平、
     高斯三条查询 1.24–1.38×。结构上对齐 Embree 的 BVH4 传统，但仍是单射线/单查询
-    与 Morton 划分，不能据此宣称追平 Embree。
+    与 Morton 划分，不能据此宣称追平 Embree。refit 也接上了：结束时重发受影响的
+    宽节点，2M 局部多付 0.40 ms、全量多付 1.37 ms，之后查询仍有 1.4–1.5×。
 
 
 ## 正确性交叉核对
@@ -959,6 +975,11 @@ build\gpu_cloud_bench.exe --points 1048576 --queries 50000 --no-cpu --wide
 build\gpu_cloud_bench.exe --points 1048576 --queries 50000 --query radius --no-cpu --wide
 build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --no-cpu --wide
 build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --query knn --k 8 --no-cpu --wide
+
+:: 宽节点 + refit（重发宽节点）
+build\gpu_query_bench.exe --grid 1024 --points 20000 --runs 3 --no-cpu --wide --refit --refit-dirty 0.01
+build\gpu_cloud_bench.exe --points 1048576 --queries 20000 --wide --refit --refit-dirty 0.01
+build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --wide --refit --refit-dirty 0.01
 ```
 
 ## 已知缺口
@@ -986,8 +1007,9 @@ build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --query knn --k 8 
   落地，追 Warp 的树质量仍需 GPU 自顶向下 SAH
 - 查询排序只在 ≥10 万查询的三角形场景证明有效；20k 低占用下的延迟假说未做单独
   实验，radius 没有收益，高斯小批次倒退。分块排序与按深度分桶未做
-- 宽节点暂不支持 refit（宽盒子是二叉盒子的拷贝，refit 后会变旧，基准直接拒绝）；
-  重折叠与"只重发脏祖先"未接。射线已排序时宽节点无收益，次生射线遍历太浅，同样无收益
+- 宽节点 + refit 靠"重发"保持正确，不是直接维护宽盒子；局部路径按脏祖先重发，
+  但重发 kernel 仍按层 launch（小树改走整层重发来摊掉启动开销），没有做"只重发
+  盒子真变了的节点"。射线已排序时宽节点无收益，次生射线遍历太浅，同样无收益
 - 宽节点未配 SIMD packet（单射线/单查询）、未接 SAH；BVH8 未试。每宽节点读 128 B
   在本机 L2（24 MB）上的收益随树规模变化，更小场景只有 1.06–1.29×
 - 第一轮结果（不同场景、20 万条射线）已作废，勿引用
