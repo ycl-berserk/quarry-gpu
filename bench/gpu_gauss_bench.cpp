@@ -49,6 +49,7 @@ struct Options {
     bool stats = false;
     bool refit = false;
     bool querySort = false;
+    bool wide = false;
     double refitShift = 0.002;
     double refitDirty = 0.01;
     std::string motion = "random";
@@ -73,7 +74,8 @@ void printUsage() {
         "  --refit-shift F               每次位移幅度（包围盒对角线的比例），default 0.002\n"
         "  --refit-dirty F               局部 refit 改动的高斯比例，default 0.01\n"
         "  --refit-motion random|coherent 位移方式，default random\n"
-        "  --query-sort                  查询点按 Morton 序重排后再遍历\n");
+        "  --query-sort                  查询点按 Morton 序重排后再遍历\n"
+        "  --wide                        遍历用 4 宽折叠节点（可与 --query-sort 叠加）\n");
 }
 
 bool parseArgs(int argc, char** argv, Options& opt) {
@@ -136,6 +138,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             if (opt.refitShift < 0.0) opt.refitShift = 0.0;
         } else if (arg == "--query-sort") {
             opt.querySort = true;
+        } else if (arg == "--wide") {
+            opt.wide = true;
         } else if (arg == "--refit-dirty") {
             const char* v = needValue("--refit-dirty");
             if (!v) return false;
@@ -183,13 +187,13 @@ QueryOutput queryGpu(GpuBVH& bvh, GpuPointBuffer& buf, const Options& opt, float
     const QueryOrder order = opt.querySort ? QueryOrder::Morton : QueryOrder::Input;
     if (opt.query == "radius") {
         GpuRadiusBuffer rb;
-        out.ms = radiusQueryGaussianGPU(bvh, buf, radius, rb, collectStats, order);
+        out.ms = radiusQueryGaussianGPU(bvh, buf, radius, rb, collectStats, order, opt.wide);
         out.perPoint = readRadiusResultsGPU(rb);
         destroyRadiusBufferGPU(rb);
     } else {
         const bool knn = opt.query == "knn";
-        out.ms = knn ? kNearestGaussianGPU(bvh, buf, opt.k, collectStats, order)
-                     : closestGaussianGPU(bvh, buf, collectStats, order);
+        out.ms = knn ? kNearestGaussianGPU(bvh, buf, opt.k, collectStats, order, opt.wide)
+                     : closestGaussianGPU(bvh, buf, collectStats, order, opt.wide);
         const int stride = knn ? opt.k : 1;
         const std::vector<GpuClosestResult> flat = readQueryResultsGPU(buf);
         for (size_t i = 0; i < out.perPoint.size(); ++i) {
@@ -334,6 +338,10 @@ int main(int argc, char** argv) {
         std::printf("k must be in [1, 32]\n");
         return 1;
     }
+    if (opt.wide && opt.refit) {
+        std::printf("--wide does not support --refit yet (collapsed boxes go stale)\n");
+        return 1;
+    }
 
     GaussianCloudSpec spec;
     spec.kind = opt.kind;
@@ -348,6 +356,7 @@ int main(int argc, char** argv) {
                 cloud.gaussians.size(), queries.size(), opt.query.c_str());
     if (opt.query == "knn") std::printf(" k=%d", opt.k);
     if (opt.query == "radius") std::printf(" radius=%g", static_cast<double>(radius));
+    if (opt.wide) std::printf(" traversal=wide4");
     std::printf(" seed=%llu iterations=%d\n", static_cast<unsigned long long>(opt.seed),
                 kGaussianNewtonIters);
 
@@ -394,6 +403,16 @@ int main(int argc, char** argv) {
     const std::string treeError = validateGaussianBVHGPU(gpu, cloud);
     std::printf("gpu tree %s%s\n", treeError.empty() ? "PASS" : "FAIL: ", treeError.c_str());
     if (!treeError.empty()) return 4;
+
+    if (opt.wide) {
+        try {
+            const double wideMs = buildWideNodesGPU(gpu);
+            std::printf("wide nodes=%d build_ms=%.2f node_bytes=128\n", gpu.wideCount, wideMs);
+        } catch (const std::exception& e) {
+            std::printf("wide build failed: %s\n", e.what());
+            return 5;
+        }
+    }
 
     // ---- GPU 查询 ----
     const int stride = opt.query == "knn" ? opt.k : 1;

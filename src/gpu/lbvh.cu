@@ -39,6 +39,11 @@ struct DevBuf {
     ~DevBuf() {
         if (p) cudaFree(p);
     }
+    T* release() {
+        T* q = p;
+        p = nullptr;
+        return q;
+    }
     DevBuf(const DevBuf&) = delete;
     DevBuf& operator=(const DevBuf&) = delete;
 };
@@ -425,6 +430,78 @@ __global__ void checkRefsKernel(const int* __restrict__ visited, int nodeCount,
     if (visited[i] != want) atomicAdd(&errors[2], 1);
 }
 
+// ---------------------------------------------------------------------------
+// 4 宽折叠。偶数深度的内部节点各生成一个 128B 节点，四个槽填"孩子 + 孙子"：
+//   孩子是叶子  → 直接占一个槽；
+//   孩子是内部  → 把它的两个孩子（孙辈）各占一个槽；
+//   孩子是叶子、兄弟是内部 → 剩下的槽留空（空盒 + kWideEmpty）。
+// 叶子的深度非奇即偶，这两条规则覆盖了全部叶子；偶数深度的内部孙辈自己也是
+// wide 节点的根，所以用前缀和算出的 wideId 互相引用。每个线程只写自己的节点。
+// ---------------------------------------------------------------------------
+__global__ void wideCountKernel(const int* __restrict__ depth, int internalCount,
+                                int* __restrict__ flags) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= internalCount) return;
+    flags[i] = (depth[i] & 1) == 0 ? 1 : 0;
+}
+
+__device__ __forceinline__ void clearWideEntry(GpuBVH4Entry& e) {
+    e.mnx = CUDART_INF_F;
+    e.mny = CUDART_INF_F;
+    e.mnz = CUDART_INF_F;
+    e.mxx = -CUDART_INF_F;
+    e.mxy = -CUDART_INF_F;
+    e.mxz = -CUDART_INF_F;
+    e.child = kWideEmpty;
+    e.pad = 0;
+}
+
+__device__ __forceinline__ void fillWideEntry(GpuBVH4Entry& e, const GpuBVHNode& box,
+                                              int child) {
+    e.mnx = box.mnx;
+    e.mny = box.mny;
+    e.mnz = box.mnz;
+    e.mxx = box.mxx;
+    e.mxy = box.mxy;
+    e.mxz = box.mxz;
+    e.child = child;
+    e.pad = 0;
+}
+
+__global__ void wideEmitKernel(const GpuBVHNode* __restrict__ nodes, int n,
+                               const int* __restrict__ depth, const int* __restrict__ wideId,
+                               GpuBVH4Node* __restrict__ wide) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= n - 1) return;
+    if ((depth[i] & 1) != 0) return;
+
+    GpuBVH4Node out;
+#pragma unroll
+    for (int s = 0; s < 4; ++s) clearWideEntry(out.c[s]);
+
+    const GpuBVHNode nd = nodes[i];
+    const int kids[2] = {nd.left, nd.right};
+    int slot = 0;
+    for (int k = 0; k < 2; ++k) {
+        const int c = kids[k];
+        if (c >= n - 1) {
+            fillWideEntry(out.c[slot++], nodes[c], nodes[c].left);
+            continue;
+        }
+        const GpuBVHNode mid = nodes[c];
+        const int gkids[2] = {mid.left, mid.right};
+        for (int g = 0; g < 2; ++g) {
+            const int gc = gkids[g];
+            if (gc >= n - 1) {
+                fillWideEntry(out.c[slot++], nodes[gc], nodes[gc].left);
+            } else {
+                fillWideEntry(out.c[slot++], nodes[gc], wideId[gc]);
+            }
+        }
+    }
+    wide[wideId[i]] = out;
+}
+
 }  // namespace
 
 bool gpuDescribe(std::string* out) {
@@ -629,6 +706,63 @@ GpuBVH buildGaussianBVHGPU(const GaussianCloud& cloud, GpuBuildTimings* timings)
                                   timings);
 }
 
+double buildWideNodesGPU(GpuBVH& bvh) {
+    if (bvh.nodeCount <= 0 || bvh.d_depth == nullptr) {
+        throw std::runtime_error("buildWideNodesGPU: tree has no depth table");
+    }
+    if (bvh.d_wideNodes) {
+        cudaFree(bvh.d_wideNodes);
+        bvh.d_wideNodes = nullptr;
+    }
+    if (bvh.d_wideId) {
+        cudaFree(bvh.d_wideId);
+        bvh.d_wideId = nullptr;
+    }
+    bvh.wideCount = 0;
+
+    const int n = bvh.primCount;
+    const int internal = n - 1;
+    const int nodeCount = bvh.nodeCount;
+    const int* depth = static_cast<const int*>(bvh.d_depth);
+    const auto* nodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
+
+    DevBuf<int> dFlags(internal);
+    DevBuf<int> dWideId(nodeCount);
+    wideCountKernel<<<blocksFor(internal), kBlock>>>(depth, internal, dFlags.p);
+    cudaOk(cudaGetLastError(), "wide flags");
+
+    size_t scanBytes = 0;
+    cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, dFlags.p, dWideId.p, internal),
+           "wide scan(probe)");
+    DevBuf<unsigned char> dScanTemp(scanBytes > 0 ? scanBytes : 1);
+    cudaOk(cub::DeviceScan::ExclusiveSum(dScanTemp.p, scanBytes, dFlags.p, dWideId.p, internal),
+           "wide scan");
+
+    // 前缀和只到 internal-1，总数要单独加最后一项的 flag。
+    int tail[2] = {0, 0};
+    cudaOk(cudaMemcpy(&tail[0], dWideId.p + (internal - 1), sizeof(int), cudaMemcpyDeviceToHost),
+           "D2H prefix");
+    cudaOk(cudaMemcpy(&tail[1], dFlags.p + (internal - 1), sizeof(int), cudaMemcpyDeviceToHost),
+           "D2H flag");
+    const int wideCount = tail[0] + tail[1];
+    if (wideCount <= 0) throw std::runtime_error("buildWideNodesGPU: no wide nodes");
+
+    cudaOk(cudaMalloc(&bvh.d_wideNodes, static_cast<size_t>(wideCount) * sizeof(GpuBVH4Node)),
+           "wide nodes");
+    bvh.wideCount = wideCount;
+    bvh.d_wideId = dWideId.release();
+
+    StageClock clock;
+    clock.mark();  // 0
+    wideEmitKernel<<<blocksFor(internal), kBlock>>>(nodes, n, depth,
+                                                    static_cast<const int*>(bvh.d_wideId),
+                                                    static_cast<GpuBVH4Node*>(bvh.d_wideNodes));
+    cudaOk(cudaGetLastError(), "wide emit");
+    clock.mark();  // 1
+    cudaOk(cudaEventSynchronize(clock.ev[clock.marks - 1]), "sync");
+    return clock.ms(0, 1);
+}
+
 void destroyBVHGPU(GpuBVH& bvh) {
     if (bvh.d_nodes) cudaFree(bvh.d_nodes);
     if (bvh.d_tris) cudaFree(bvh.d_tris);
@@ -643,6 +777,8 @@ void destroyBVHGPU(GpuBVH& bvh) {
     if (bvh.d_dirtyOrder) cudaFree(bvh.d_dirtyOrder);
     if (bvh.d_refitOffsets) cudaFree(bvh.d_refitOffsets);
     if (bvh.d_levelCounts) cudaFree(bvh.d_levelCounts);
+    if (bvh.d_wideNodes) cudaFree(bvh.d_wideNodes);
+    if (bvh.d_wideId) cudaFree(bvh.d_wideId);
     bvh = GpuBVH{};
 }
 

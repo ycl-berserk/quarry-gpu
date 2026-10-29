@@ -19,7 +19,9 @@
 namespace {
 
 constexpr int kBlock = 512;
-constexpr int kStack = 64;  // 每层最多压一个远端子节点，depth<=63 的树不会溢出
+constexpr int kStack = 64;      // 每层最多压一个远端子节点，depth<=63 的树不会溢出
+constexpr int kStackWide = 128; // 4 宽节点每层最多压 3 个远端，树深约为二叉的一半
+
 
 void cudaOk(cudaError_t err, const char* what) {
     if (err != cudaSuccess) {
@@ -154,6 +156,94 @@ __global__ __launch_bounds__(kBlock) void raycastKernel(
     }
 }
 
+// 4 宽节点的遍历：一次读 128B 拿到最多 4 个孩子（或孙子）的盒，按入口 t 升序
+// 压栈，近的先出。叶子在压栈时就测掉，省一次栈往返；结果与二叉遍历逐位相同，
+// 因为最近命中只由 t 决定（并列时保留先遇到的，t 的位模式一样）。
+// 计数口径是"成功的盒测试次数"，和二叉版本同一个单位。
+template <bool kStats>
+__global__ __launch_bounds__(kBlock) void raycastWideKernel(
+    const GpuBVH4Node* __restrict__ nodes, const Tri* __restrict__ tris,
+    const Ray* __restrict__ rays, int count, uint64_t* __restrict__ out) {
+    const int idx = blockIdx.x * kBlock + threadIdx.x;
+    const bool active = idx < count;
+
+    float best = 0.0f;
+    bool any = false;
+    int nodeTests = 0;
+    int triTests = 0;
+    bool overflow = false;
+
+    if (active) {
+        const Ray ray = rays[idx];
+        best = ray.tMax;
+
+        int stack[kStackWide];
+        int sp = 0;
+        stack[sp++] = 0;  // 根是 4 宽节点，没有单一盒可测，直接从根开始
+
+        while (sp > 0) {
+            const int id = stack[--sp];
+            const GpuBVH4Node nd = nodes[id];
+
+            int child[4];
+            float key[4];
+            int hits = 0;
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const GpuBVH4Entry e = nd.c[s];
+                if (e.child == kWideEmpty) continue;
+                float t;
+                if (intersectAABB(ray, wideBox(e), best, t)) {
+                    ++nodeTests;
+                    int j = hits++;
+                    while (j > 0 && key[j - 1] > t) {
+                        key[j] = key[j - 1];
+                        child[j] = child[j - 1];
+                        --j;
+                    }
+                    key[j] = t;
+                    child[j] = e.child;
+                }
+            }
+
+            if (sp + hits > kStackWide) {
+                overflow = true;
+                break;
+            }
+            // 远的先压，近的后压先出；叶子当场测掉，顺便收紧 best。
+            for (int j = hits - 1; j >= 0; --j) {
+                const int c = child[j];
+                if (c >= 0) {
+                    stack[sp++] = c;
+                    continue;
+                }
+                const Tri& tri = tris[-c - 1];
+                ++triTests;
+                float t;
+                if (intersectTriangle(ray, tri, t) && t < best) {
+                    best = t;
+                    any = true;
+                }
+            }
+        }
+
+        uint64_t v = 0;
+        if (any) v = (uint64_t{1} << 32) | static_cast<uint64_t>(__float_as_uint(best));
+        out[idx] = v;
+    }
+
+    if (kStats) {
+        const unsigned mask = __ballot_sync(0xffffffffu, active);
+        const int sumNodes = __reduce_add_sync(mask, nodeTests);
+        const int sumTris = __reduce_add_sync(mask, triTests);
+        if ((threadIdx.x & 31) == 0) {
+            if (sumNodes) atomicAdd(&gNodeTests, static_cast<unsigned long long>(sumNodes));
+            if (sumTris) atomicAdd(&gTriTests, static_cast<unsigned long long>(sumTris));
+            if (overflow) atomicAdd(&gOverflows, 1ull);
+        }
+    }
+}
+
 GpuTraversalStats gLastStats;
 
 // 排序路径的全部暂存区，上传时一次分配。放在计时区外，避免每轮 cudaMalloc
@@ -244,7 +334,8 @@ void destroyRayBufferGPU(GpuRayBuffer& buf) {
     buf = GpuRayBuffer{};
 }
 
-double raycastGPU(const GpuBVH& bvh, GpuRayBuffer& buf, bool collectStats, RayOrder order) {
+double raycastGPU(const GpuBVH& bvh, GpuRayBuffer& buf, bool collectStats, RayOrder order,
+                  bool wide) {
     if (buf.count <= 0 || bvh.nodeCount <= 0) return 0.0;
 
     gLastStats = GpuTraversalStats{};
@@ -263,9 +354,29 @@ double raycastGPU(const GpuBVH& bvh, GpuRayBuffer& buf, bool collectStats, RayOr
     const int count = buf.count;
     const int blocks = (count + kBlock - 1) / kBlock;
     const auto* nodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
+    const auto* wideNodes = static_cast<const GpuBVH4Node*>(bvh.d_wideNodes);
     const auto* tris = static_cast<const Tri*>(bvh.d_tris);
     const auto* rays = static_cast<const Ray*>(buf.d_rays);
     auto* out = static_cast<uint64_t*>(buf.d_results);
+    if (wide && wideNodes == nullptr) {
+        throw std::runtime_error("raycastGPU: wide nodes not built");
+    }
+
+    auto launch = [&](const Ray* raysPtr, uint64_t* outPtr, bool stats) {
+        if (wide) {
+            if (stats) {
+                raycastWideKernel<true><<<blocks, kBlock>>>(wideNodes, tris, raysPtr, count,
+                                                            outPtr);
+            } else {
+                raycastWideKernel<false><<<blocks, kBlock>>>(wideNodes, tris, raysPtr, count,
+                                                             outPtr);
+            }
+        } else if (stats) {
+            raycastKernel<true><<<blocks, kBlock>>>(nodes, tris, raysPtr, count, outPtr);
+        } else {
+            raycastKernel<false><<<blocks, kBlock>>>(nodes, tris, raysPtr, count, outPtr);
+        }
+    };
 
     cudaOk(cudaEventRecord(start), "record start");
 
@@ -291,13 +402,7 @@ double raycastGPU(const GpuBVH& bvh, GpuRayBuffer& buf, bool collectStats, RayOr
         cudaOk(cudaGetLastError(), "gather rays");
 
         cudaOk(cudaEventRecord(mark), "record mark");
-        if (collectStats) {
-            raycastKernel<true><<<blocks, kBlock>>>(nodes, tris, s->sortedRays, count,
-                                                    s->sortedOut);
-        } else {
-            raycastKernel<false><<<blocks, kBlock>>>(nodes, tris, s->sortedRays, count,
-                                                     s->sortedOut);
-        }
+        launch(s->sortedRays, s->sortedOut, collectStats);
         cudaOk(cudaGetLastError(), "raycast");
         cudaOk(cudaEventRecord(mark2), "record mark2");
 
@@ -326,11 +431,7 @@ double raycastGPU(const GpuBVH& bvh, GpuRayBuffer& buf, bool collectStats, RayOr
         return static_cast<double>(ms);
     }
 
-    if (collectStats) {
-        raycastKernel<true><<<blocks, kBlock>>>(nodes, tris, rays, count, out);
-    } else {
-        raycastKernel<false><<<blocks, kBlock>>>(nodes, tris, rays, count, out);
-    }
+    launch(rays, out, collectStats);
 
     cudaOk(cudaGetLastError(), "raycast");
     cudaOk(cudaEventRecord(stop), "record stop");

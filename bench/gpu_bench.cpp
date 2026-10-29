@@ -41,6 +41,7 @@ struct Options {
     RaySort raySort = RaySort::None;
     int diagRay = -1;
     int warmupMs = 3000;
+    bool wide = false;
 };
 
 void printUsage() {
@@ -59,6 +60,7 @@ void printUsage() {
         "  --ray-sort                     GPU 内按原点 Morton 序重排射线（端到端计时）\n"
         "  --ray-sort-dir                 GPU 内按方向 Morton 序重排（次生射线用）\n"
         "  --ray-sort-host                主机排序后上传，只测遍历收益（对照实验）\n"
+        "  --wide                         遍历 4 宽折叠节点（先折叠二叉 LBVH）\n"
         "  --diag-ray N                   打印第 N 条射线的 CPU/GPU/暴力三方命中\n"
         "  --verify / --no-verify         是否逐条射线对拍（default verify）\n"
         "  --no-cpu                       跳过 CPU 参考遍历（大场景省时间）\n");
@@ -115,6 +117,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             opt.raySort = Options::RaySort::GpuDir;
         } else if (arg == "--ray-sort-host") {
             opt.raySort = Options::RaySort::Host;
+        } else if (arg == "--wide") {
+            opt.wide = true;
         } else if (arg == "--diag-ray") {
             const char* v = needValue("--diag-ray");
             if (!v) return false;
@@ -243,6 +247,16 @@ int main(int argc, char** argv) {
     std::printf("gpu tree %s%s\n", treeError.empty() ? "PASS" : "FAIL: ", treeError.c_str());
     if (!treeError.empty()) return 4;
 
+    if (opt.wide) {
+        try {
+            const double wideMs = buildWideNodesGPU(gpu);
+            std::printf("wide nodes=%d build_ms=%.2f node_bytes=128\n", gpu.wideCount, wideMs);
+        } catch (const std::exception& e) {
+            std::printf("wide build failed: %s\n", e.what());
+            return 5;
+        }
+    }
+
     // ---- 可选：按原点 Morton 序重排射线，只影响遍历顺序，不影响逐条结果 ----
     std::vector<Ray> uploadRays = rays;
     std::vector<int> sortedToOrig;
@@ -267,18 +281,18 @@ int main(int argc, char** argv) {
     // 第一次 kernel 会带上上下文初始化；之后持续跑 warmup_ms，让 DVFS 把 SM 时钟
     // 拉到稳定档。笔记本上 32 ms 级的遍历 kernel 单独跑多少次都升不了频，实测
     // 冷态 780 MHz、热态 2025 MHz，同一二进制的吞吐差 2.5× 以上。
-    raycastGPU(gpu, rayBuf, false, gpuOrder);
+    raycastGPU(gpu, rayBuf, false, gpuOrder, opt.wide);
     const double warmStart = nowMs();
     int warmRuns = 0;
     while (nowMs() - warmStart < opt.warmupMs) {
-        raycastGPU(gpu, rayBuf, false, gpuOrder);
+        raycastGPU(gpu, rayBuf, false, gpuOrder, opt.wide);
         ++warmRuns;
     }
     std::printf("gpu warmup_ms=%.0f runs=%d\n", nowMs() - warmStart, warmRuns);
 
     std::vector<double> gpuTimes;
     for (int run = 0; run < opt.runs; ++run)
-        gpuTimes.push_back(raycastGPU(gpu, rayBuf, false, gpuOrder));
+        gpuTimes.push_back(raycastGPU(gpu, rayBuf, false, gpuOrder, opt.wide));
     const double gpuMedian = median(gpuTimes);
     const double gpuBest = *std::min_element(gpuTimes.begin(), gpuTimes.end());
     const double gpuWorst = *std::max_element(gpuTimes.begin(), gpuTimes.end());
@@ -288,7 +302,7 @@ int main(int argc, char** argv) {
                 gpuMedian > 0.0 ? static_cast<double>(rays.size()) / (gpuMedian * 1e3) : 0.0);
 
     if (opt.stats) {
-        raycastGPU(gpu, rayBuf, true, gpuOrder);
+        raycastGPU(gpu, rayBuf, true, gpuOrder, opt.wide);
         const GpuTraversalStats st = lastTraversalStatsGPU();
         const double n = static_cast<double>(rays.size());
         std::printf("gpu traversal avg_node_tests=%.1f avg_tri_tests=%.1f stack_overflows=%llu "

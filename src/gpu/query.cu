@@ -29,7 +29,8 @@
 namespace {
 
 constexpr int kBlock = 256;
-constexpr int kStack = 64;  // 每层最多压一个远端子节点，depth<=63 的树不会溢出
+constexpr int kStack = 64;      // 每层最多压一个远端子节点，depth<=63 的树不会溢出
+constexpr int kStackWide = 128; // 4 宽节点每层最多压 3 个远端，树深约为二叉的一半
 constexpr int kMaxKnn = 32; // 每线程定长候选表的上限，超了在主机侧报错
 
 void cudaOk(cudaError_t err, const char* what) {
@@ -239,6 +240,178 @@ __global__ __launch_bounds__(kBlock) void kNearestKernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// 4 宽节点的三条点查询。骨架与二叉版本逐行对应，只是"取两个孩子的盒"换成
+// "读 128B 拿最多四个槽"：按盒下界升序压栈，近的先出，叶子在弹出时测。
+// 剪枝条件与二叉版本完全一样（closest/kNN 用 <=，radius 用 <=），所以结果
+// 逐位相同；计数口径同 raycast.cu，数的是成功的盒测试次数。
+// ---------------------------------------------------------------------------
+template <typename Ops, bool kStats>
+__global__ __launch_bounds__(kBlock) void closestPointWideKernel(
+    const GpuBVH4Node* __restrict__ nodes, const typename Ops::Item* __restrict__ prims,
+    const int* __restrict__ primIds, const Vec3* __restrict__ points, int count,
+    GpuClosestResult* __restrict__ out) {
+    const int idx = blockIdx.x * kBlock + threadIdx.x;
+    const bool active = idx < count;
+
+    GpuClosestResult result;
+    int nodeTests = 0;
+    int triTests = 0;
+    bool overflow = false;
+
+    if (active) {
+        const Vec3 p = points[idx];
+        float best2 = CUDART_INF_F;
+        int bestPrim = -1;
+
+        int stack[kStackWide];
+        int sp = 0;
+        stack[sp++] = 0;  // 根是 4 宽节点，直接从根开始
+
+        while (sp > 0) {
+            const int id = stack[--sp];
+            if (id < 0) {
+                const int slot = -id - 1;
+                ++triTests;
+                const float d2 = Ops::dist2(p, prims[slot]);
+                const int prim = primIds[slot];
+                if (bestPrim < 0 || d2 < best2 || (d2 == best2 && prim < bestPrim)) {
+                    best2 = d2;
+                    bestPrim = prim;
+                }
+                continue;
+            }
+
+            const GpuBVH4Node nd = nodes[id];
+            int child[4];
+            float key[4];
+            int hits = 0;
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const GpuBVH4Entry e = nd.c[s];
+                if (e.child == kWideEmpty) continue;
+                const float d = distanceSquaredToAABB(p, wideBox(e));
+                if (bestPrim >= 0 && d > best2) continue;
+                ++nodeTests;
+                int j = hits++;
+                while (j > 0 && key[j - 1] > d) {
+                    key[j] = key[j - 1];
+                    child[j] = child[j - 1];
+                    --j;
+                }
+                key[j] = d;
+                child[j] = e.child;
+            }
+
+            if (sp + hits > kStackWide) {
+                overflow = true;
+                break;
+            }
+            for (int j = hits - 1; j >= 0; --j) stack[sp++] = child[j];
+        }
+
+        if (bestPrim >= 0) {
+            result.dist2Bits = __float_as_uint(best2);
+            result.triangle = bestPrim;
+        }
+        out[idx] = result;
+    }
+
+    if (kStats) {
+        const unsigned mask = __ballot_sync(0xffffffffu, active);
+        const int sumNodes = __reduce_add_sync(mask, nodeTests);
+        const int sumTris = __reduce_add_sync(mask, triTests);
+        if ((threadIdx.x & 31) == 0) {
+            if (sumNodes) atomicAdd(&gNodeTests, static_cast<unsigned long long>(sumNodes));
+            if (sumTris) atomicAdd(&gTriTests, static_cast<unsigned long long>(sumTris));
+            if (overflow) atomicAdd(&gOverflows, 1ull);
+        }
+    }
+}
+
+template <typename Ops, bool kStats>
+__global__ __launch_bounds__(kBlock) void kNearestWideKernel(
+    const GpuBVH4Node* __restrict__ nodes, const typename Ops::Item* __restrict__ prims,
+    const int* __restrict__ primIds, const Vec3* __restrict__ points, int count, int k,
+    GpuClosestResult* __restrict__ out) {
+    const int idx = blockIdx.x * kBlock + threadIdx.x;
+    const bool active = idx < count;
+
+    int nodeTests = 0;
+    int triTests = 0;
+    bool overflow = false;
+
+    if (active) {
+        const Vec3 p = points[idx];
+        KnnEntry best[kMaxKnn];
+        int n = 0;
+
+        int stack[kStackWide];
+        int sp = 0;
+        stack[sp++] = 0;
+
+        while (sp > 0) {
+            const int id = stack[--sp];
+            if (id < 0) {
+                const int slot = -id - 1;
+                ++triTests;
+                const KnnEntry e{Ops::dist2(p, prims[slot]), primIds[slot]};
+                if (n == k && !knnBetter(e, best[k - 1])) continue;
+                knnInsert(best, n, k, e);
+                continue;
+            }
+
+            const GpuBVH4Node nd = nodes[id];
+            int child[4];
+            float key[4];
+            int hits = 0;
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const GpuBVH4Entry e = nd.c[s];
+                if (e.child == kWideEmpty) continue;
+                const float d = distanceSquaredToAABB(p, wideBox(e));
+                if (n == k && d > best[k - 1].dist2) continue;
+                ++nodeTests;
+                int j = hits++;
+                while (j > 0 && key[j - 1] > d) {
+                    key[j] = key[j - 1];
+                    child[j] = child[j - 1];
+                    --j;
+                }
+                key[j] = d;
+                child[j] = e.child;
+            }
+
+            if (sp + hits > kStackWide) {
+                overflow = true;
+                break;
+            }
+            for (int j = hits - 1; j >= 0; --j) stack[sp++] = child[j];
+        }
+
+        GpuClosestResult* dst = out + static_cast<size_t>(idx) * k;
+        for (int i = 0; i < n; ++i) {
+            dst[i].dist2Bits = __float_as_uint(best[i].dist2);
+            dst[i].triangle = best[i].tri;
+        }
+        for (int i = n; i < k; ++i) {
+            dst[i].dist2Bits = 0;
+            dst[i].triangle = -1;
+        }
+    }
+
+    if (kStats) {
+        const unsigned mask = __ballot_sync(0xffffffffu, active);
+        const int sumNodes = __reduce_add_sync(mask, nodeTests);
+        const int sumTris = __reduce_add_sync(mask, triTests);
+        if ((threadIdx.x & 31) == 0) {
+            if (sumNodes) atomicAdd(&gNodeTests, static_cast<unsigned long long>(sumNodes));
+            if (sumTris) atomicAdd(&gTriTests, static_cast<unsigned long long>(sumTris));
+            if (overflow) atomicAdd(&gOverflows, 1ull);
+        }
+    }
+}
+
 // 半径查询的两遍遍历：第一遍只数条数，第二遍按前缀和写进 CSR 段。
 // 遍历规则与 CPU 的 radiusBVH 一致：AABB 下界 > r2 的节点不进，三角形
 // dist2 > r2 的丢掉（含相等），所以两边的结果集合逐条相同。
@@ -337,6 +510,129 @@ __global__ __launch_bounds__(kBlock) void radiusFillKernel(
             stack[sp++] = nd.right;
             stack[sp++] = nd.left;
         }
+    }
+}
+
+template <typename Ops, bool kStats>
+__global__ __launch_bounds__(kBlock) void radiusCountWideKernel(
+    const GpuBVH4Node* __restrict__ nodes, const typename Ops::Item* __restrict__ prims,
+    const Vec3* __restrict__ points, int count, float r2, int* __restrict__ counts) {
+    const int idx = blockIdx.x * kBlock + threadIdx.x;
+    const bool active = idx < count;
+
+    int nodeTests = 0;
+    int triTests = 0;
+    bool overflow = false;
+
+    if (active) {
+        const Vec3 p = points[idx];
+        int found = 0;
+
+        int stack[kStackWide];
+        int sp = 0;
+        stack[sp++] = 0;
+
+        while (sp > 0) {
+            const int id = stack[--sp];
+            if (id < 0) {
+                const int slot = -id - 1;
+                ++triTests;
+                if (Ops::dist2(p, prims[slot]) <= r2) ++found;
+                continue;
+            }
+
+            const GpuBVH4Node nd = nodes[id];
+            int child[4];
+            float key[4];
+            int hits = 0;
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const GpuBVH4Entry e = nd.c[s];
+                if (e.child == kWideEmpty) continue;
+                const float d = distanceSquaredToAABB(p, wideBox(e));
+                if (d > r2) continue;
+                ++nodeTests;
+                int j = hits++;
+                while (j > 0 && key[j - 1] > d) {
+                    key[j] = key[j - 1];
+                    child[j] = child[j - 1];
+                    --j;
+                }
+                key[j] = d;
+                child[j] = e.child;
+            }
+
+            if (sp + hits > kStackWide) {
+                overflow = true;
+                break;
+            }
+            for (int j = hits - 1; j >= 0; --j) stack[sp++] = child[j];
+        }
+        counts[idx] = found;
+    }
+
+    if (kStats) {
+        const unsigned mask = __ballot_sync(0xffffffffu, active);
+        const int sumNodes = __reduce_add_sync(mask, nodeTests);
+        const int sumTris = __reduce_add_sync(mask, triTests);
+        if ((threadIdx.x & 31) == 0) {
+            if (sumNodes) atomicAdd(&gNodeTests, static_cast<unsigned long long>(sumNodes));
+            if (sumTris) atomicAdd(&gTriTests, static_cast<unsigned long long>(sumTris));
+            if (overflow) atomicAdd(&gOverflows, 1ull);
+        }
+    }
+}
+
+template <typename Ops>
+__global__ __launch_bounds__(kBlock) void radiusFillWideKernel(
+    const GpuBVH4Node* __restrict__ nodes, const typename Ops::Item* __restrict__ prims,
+    const int* __restrict__ primIds, const Vec3* __restrict__ points, int count, float r2,
+    const int* __restrict__ offsets, unsigned long long* __restrict__ keys) {
+    const int idx = blockIdx.x * kBlock + threadIdx.x;
+    if (idx >= count) return;
+
+    const Vec3 p = points[idx];
+    int write = offsets[idx];
+
+    int stack[kStackWide];
+    int sp = 0;
+    stack[sp++] = 0;
+
+    while (sp > 0) {
+        const int id = stack[--sp];
+        if (id < 0) {
+            const int slot = -id - 1;
+            const float d2 = Ops::dist2(p, prims[slot]);
+            if (d2 > r2) continue;
+            const int prim = primIds[slot];
+            keys[write] = (static_cast<unsigned long long>(__float_as_uint(d2)) << 32) |
+                          static_cast<unsigned int>(prim);
+            ++write;
+            continue;
+        }
+
+        const GpuBVH4Node nd = nodes[id];
+        int child[4];
+        float key[4];
+        int hits = 0;
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const GpuBVH4Entry e = nd.c[s];
+            if (e.child == kWideEmpty) continue;
+            const float d = distanceSquaredToAABB(p, wideBox(e));
+            if (d > r2) continue;
+            int j = hits++;
+            while (j > 0 && key[j - 1] > d) {
+                key[j] = key[j - 1];
+                child[j] = child[j - 1];
+                --j;
+            }
+            key[j] = d;
+            child[j] = e.child;
+        }
+
+        if (sp + hits > kStackWide) break;
+        for (int j = hits - 1; j >= 0; --j) stack[sp++] = child[j];
     }
 }
 
@@ -558,8 +854,13 @@ void destroyPointBufferGPU(GpuPointBuffer& buf) {
 }
 
 template <typename Ops>
-double closestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats, QueryOrder order) {
+double closestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats, QueryOrder order,
+                   bool wide) {
     if (buf.count <= 0 || bvh.nodeCount <= 0) return 0.0;
+    const auto* wideNodes = static_cast<const GpuBVH4Node*>(bvh.d_wideNodes);
+    if (wide && wideNodes == nullptr) {
+        throw std::runtime_error("closestPointGPU: wide nodes not built");
+    }
 
     gLastStats = GpuQueryStats{};
     if (collectStats) {
@@ -590,7 +891,15 @@ double closestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats, Qu
         cudaOk(cudaEventRecord(mark), "record mark");
     }
 
-    if (collectStats) {
+    if (wide) {
+        if (collectStats) {
+            closestPointWideKernel<Ops, true><<<blocks, kBlock>>>(
+                wideNodes, prims, primIds, points, buf.count, sortedOut);
+        } else {
+            closestPointWideKernel<Ops, false><<<blocks, kBlock>>>(
+                wideNodes, prims, primIds, points, buf.count, sortedOut);
+        }
+    } else if (collectStats) {
         closestPointKernel<Ops, true><<<blocks, kBlock>>>(nodes, prims, primIds, points, buf.count,
                                                           sortedOut);
     } else {
@@ -631,28 +940,32 @@ double closestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats, Qu
     return static_cast<double>(ms);
 }
 
-double closestPointGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats,
-                       QueryOrder order) {
-    return closestImpl<TriOps>(bvh, buf, collectStats, order);
+double closestPointGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats, QueryOrder order,
+                       bool wide) {
+    return closestImpl<TriOps>(bvh, buf, collectStats, order, wide);
 }
 
 // 点云最近点：同一条遍历，只是叶子载荷换成 Vec3、距离换成点距。
 // 输出的 triangle 字段装的是点索引。
 double closestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats,
-                        QueryOrder order) {
-    return closestImpl<PointOps>(bvh, buf, collectStats, order);
+                        QueryOrder order, bool wide) {
+    return closestImpl<PointOps>(bvh, buf, collectStats, order, wide);
 }
 
 // 高斯最近点：载荷换成 Gaussian，叶子距离是到椭球实体的平方距离。
 double closestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats,
-                          QueryOrder order) {
-    return closestImpl<GaussianOps>(bvh, buf, collectStats, order);
+                          QueryOrder order, bool wide) {
+    return closestImpl<GaussianOps>(bvh, buf, collectStats, order, wide);
 }
 
 template <typename Ops>
 double kNearestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats,
-                    QueryOrder order) {
+                    QueryOrder order, bool wide) {
     if (buf.count <= 0 || bvh.nodeCount <= 0) return 0.0;
+    const auto* wideNodes = static_cast<const GpuBVH4Node*>(bvh.d_wideNodes);
+    if (wide && wideNodes == nullptr) {
+        throw std::runtime_error("kNearestGPU: wide nodes not built");
+    }
     if (k < 1 || k > kMaxKnn) {
         throw std::runtime_error("kNearestGPU: k must be in [1, 32]");
     }
@@ -689,7 +1002,15 @@ double kNearestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectS
         cudaOk(cudaEventRecord(mark), "record mark");
     }
 
-    if (collectStats) {
+    if (wide) {
+        if (collectStats) {
+            kNearestWideKernel<Ops, true><<<blocks, kBlock>>>(wideNodes, prims, primIds, points,
+                                                              buf.count, k, sortedOut);
+        } else {
+            kNearestWideKernel<Ops, false><<<blocks, kBlock>>>(wideNodes, prims, primIds, points,
+                                                               buf.count, k, sortedOut);
+        }
+    } else if (collectStats) {
         kNearestKernel<Ops, true><<<blocks, kBlock>>>(nodes, prims, primIds, points, buf.count, k,
                                                       sortedOut);
     } else {
@@ -731,25 +1052,29 @@ double kNearestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectS
 }
 
 double kNearestGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats,
-                   QueryOrder order) {
-    return kNearestImpl<TriOps>(bvh, buf, k, collectStats, order);
+                   QueryOrder order, bool wide) {
+    return kNearestImpl<TriOps>(bvh, buf, k, collectStats, order, wide);
 }
 
 double kNearestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats,
-                         QueryOrder order) {
-    return kNearestImpl<PointOps>(bvh, buf, k, collectStats, order);
+                         QueryOrder order, bool wide) {
+    return kNearestImpl<PointOps>(bvh, buf, k, collectStats, order, wide);
 }
 
 double kNearestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats,
-                           QueryOrder order) {
-    return kNearestImpl<GaussianOps>(bvh, buf, k, collectStats, order);
+                           QueryOrder order, bool wide) {
+    return kNearestImpl<GaussianOps>(bvh, buf, k, collectStats, order, wide);
 }
 
 template <typename Ops>
 double radiusQueryImpl(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuRadiusBuffer& out,
-                       bool collectStats, QueryOrder order) {
+                       bool collectStats, QueryOrder order, bool wide) {
     out = GpuRadiusBuffer{};
     if (buf.count <= 0 || bvh.nodeCount <= 0) return 0.0;
+    const auto* wideNodes = static_cast<const GpuBVH4Node*>(bvh.d_wideNodes);
+    if (wide && wideNodes == nullptr) {
+        throw std::runtime_error("radiusQueryGPU: wide nodes not built");
+    }
 
     const float r2 = radius * radius;
     const int n = buf.count;
@@ -791,7 +1116,15 @@ double radiusQueryImpl(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, Gpu
         cudaOk(cudaEventRecord(mark), "record mark");
     }
 
-    if (collectStats) {
+    if (wide) {
+        if (collectStats) {
+            radiusCountWideKernel<Ops, true><<<blocks, kBlock>>>(wideNodes, prims, points, n, r2,
+                                                                 dCounts);
+        } else {
+            radiusCountWideKernel<Ops, false><<<blocks, kBlock>>>(wideNodes, prims, points, n, r2,
+                                                                  dCounts);
+        }
+    } else if (collectStats) {
         radiusCountKernel<Ops, true><<<blocks, kBlock>>>(nodes, prims, points, n, r2, dCounts);
     } else {
         radiusCountKernel<Ops, false><<<blocks, kBlock>>>(nodes, prims, points, n, r2, dCounts);
@@ -824,8 +1157,13 @@ double radiusQueryImpl(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, Gpu
         const size_t bytes = static_cast<size_t>(total);
         cudaOk(cudaMalloc(&dKeys, bytes * sizeof(uint64_t)), "radius keys");
 
-        radiusFillKernel<Ops><<<blocks, kBlock>>>(nodes, prims, primIds, points, n, r2, dOffsets,
-                                                  dKeys);
+        if (wide) {
+            radiusFillWideKernel<Ops><<<blocks, kBlock>>>(wideNodes, prims, primIds, points, n, r2,
+                                                          dOffsets, dKeys);
+        } else {
+            radiusFillKernel<Ops><<<blocks, kBlock>>>(nodes, prims, primIds, points, n, r2, dOffsets,
+                                                      dKeys);
+        }
         cudaOk(cudaGetLastError(), "radius fill");
 
         if (maxSeg <= kRadiusSortCap) {
@@ -922,20 +1260,21 @@ double radiusQueryImpl(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, Gpu
 }
 
 double radiusQueryGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuRadiusBuffer& out,
-                      bool collectStats, QueryOrder order) {
-    return radiusQueryImpl<TriOps>(bvh, buf, radius, out, collectStats, order);
+                      bool collectStats, QueryOrder order, bool wide) {
+    return radiusQueryImpl<TriOps>(bvh, buf, radius, out, collectStats, order, wide);
 }
 
 // 点云的半径查询：CSR 的键里装点索引，短段的 warp 双调排序和长段的 CUB
 // 分段排序都与三角形路径共用。
 double radiusQueryVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
-                            GpuRadiusBuffer& out, bool collectStats, QueryOrder order) {
-    return radiusQueryImpl<PointOps>(bvh, buf, radius, out, collectStats, order);
+                            GpuRadiusBuffer& out, bool collectStats, QueryOrder order, bool wide) {
+    return radiusQueryImpl<PointOps>(bvh, buf, radius, out, collectStats, order, wide);
 }
 
 double radiusQueryGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
-                              GpuRadiusBuffer& out, bool collectStats, QueryOrder order) {
-    return radiusQueryImpl<GaussianOps>(bvh, buf, radius, out, collectStats, order);
+                              GpuRadiusBuffer& out, bool collectStats, QueryOrder order,
+                              bool wide) {
+    return radiusQueryImpl<GaussianOps>(bvh, buf, radius, out, collectStats, order, wide);
 }
 
 void destroyRadiusBufferGPU(GpuRadiusBuffer& buf) {

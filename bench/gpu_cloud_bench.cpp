@@ -48,6 +48,7 @@ struct Options {
     bool cpu = true;
     bool stats = false;
     bool refit = false;
+    bool wide = false;
     double refitShift = 0.002;
     double refitDirty = 0.01;
     std::string motion = "random";
@@ -73,6 +74,7 @@ void printUsage() {
         "  --refit-shift F               每次位移幅度（包围盒对角线的比例），default 0.002\n"
         "  --refit-dirty F               局部 refit 改动的点比例，default 0.01\n"
         "  --refit-motion random|coherent 位移方式，default random\n"
+        "  --wide                        遍历用 4 宽折叠节点（需先构建 wide 层）\n"
         "  --dump FILE                   把点云与查询点写成 QRCD 二进制，供外部 kd-tree 对照\n");
 }
 
@@ -129,6 +131,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             opt.cpu = false;
         } else if (arg == "--refit") {
             opt.refit = true;
+        } else if (arg == "--wide") {
+            opt.wide = true;
         } else if (arg == "--refit-shift") {
             const char* v = needValue("--refit-shift");
             if (!v) return false;
@@ -185,13 +189,15 @@ QueryOutput queryGpu(GpuBVH& bvh, GpuPointBuffer& buf, const Options& opt, float
     out.perPoint.resize(static_cast<size_t>(buf.count));
     if (opt.query == "radius") {
         GpuRadiusBuffer rb;
-        out.ms = radiusQueryVertexGPU(bvh, buf, radius, rb, collectStats);
+        out.ms = radiusQueryVertexGPU(bvh, buf, radius, rb, collectStats, QueryOrder::Input,
+                                      opt.wide);
         out.perPoint = readRadiusResultsGPU(rb);
         destroyRadiusBufferGPU(rb);
     } else {
         const bool knn = opt.query == "knn";
-        out.ms = knn ? kNearestVertexGPU(bvh, buf, opt.k, collectStats)
-                     : closestVertexGPU(bvh, buf, collectStats);
+        out.ms = knn
+                     ? kNearestVertexGPU(bvh, buf, opt.k, collectStats, QueryOrder::Input, opt.wide)
+                     : closestVertexGPU(bvh, buf, collectStats, QueryOrder::Input, opt.wide);
         const int stride = knn ? opt.k : 1;
         const std::vector<GpuClosestResult> flat = readQueryResultsGPU(buf);
         for (size_t i = 0; i < out.perPoint.size(); ++i) {
@@ -360,6 +366,10 @@ int main(int argc, char** argv) {
         std::printf("k must be in [1, 32]\n");
         return 1;
     }
+    if (opt.wide && opt.refit) {
+        std::printf("--wide does not support --refit yet (collapsed boxes go stale)\n");
+        return 1;
+    }
 
     PointCloud cloud = buildPointCloud(PointCloudSpec{opt.kind, opt.points, opt.seed});
     const std::vector<Vec3> queries = makeQueryPoints(cloud.bounds, opt.queries, opt.seed + 1);
@@ -370,6 +380,7 @@ int main(int argc, char** argv) {
                 queries.size(), opt.query.c_str());
     if (opt.query == "knn") std::printf(" k=%d", opt.k);
     if (opt.query == "radius") std::printf(" radius=%g", static_cast<double>(radius));
+    if (opt.wide) std::printf(" traversal=wide4");
     std::printf(" seed=%llu\n", static_cast<unsigned long long>(opt.seed));
 
     if (!opt.dump.empty()) {
@@ -425,6 +436,16 @@ int main(int argc, char** argv) {
     const std::string treeError = validatePointBVHGPU(gpu, cloud);
     std::printf("gpu tree %s%s\n", treeError.empty() ? "PASS" : "FAIL: ", treeError.c_str());
     if (!treeError.empty()) return 4;
+
+    if (opt.wide) {
+        try {
+            const double wideMs = buildWideNodesGPU(gpu);
+            std::printf("wide nodes=%d build_ms=%.2f node_bytes=128\n", gpu.wideCount, wideMs);
+        } catch (const std::exception& e) {
+            std::printf("wide build failed: %s\n", e.what());
+            return 5;
+        }
+    }
 
     // ---- GPU 查询 ----
     const int stride = opt.query == "knn" ? opt.k : 1;

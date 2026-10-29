@@ -50,6 +50,7 @@ struct Options {
     double refitDirty = 0.01;
     std::string refitMotion = "random";
     bool querySort = false;
+    bool wide = false;
 };
 
 void printUsage() {
@@ -160,6 +161,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
                 std::fprintf(stderr, "unknown --refit-motion: %s\n", v);
                 return false;
             }
+        } else if (arg == "--wide") {
+            opt.wide = true;
         } else if (arg == "--query-sort") {
             opt.querySort = true;
         } else if (arg == "-h" || arg == "--help") {
@@ -221,18 +224,18 @@ struct QueryOutput {
 };
 
 QueryOutput queryGpu(GpuBVH& bvh, GpuPointBuffer& buf, int stride, const std::string& query, int k,
-                     float radius, bool collectStats, QueryOrder order) {
+                     float radius, bool collectStats, QueryOrder order, bool wide = false) {
     QueryOutput out;
     out.perPoint.resize(static_cast<size_t>(buf.count));
     if (query == "radius") {
         GpuRadiusBuffer rb;
-        out.ms = radiusQueryGPU(bvh, buf, radius, rb, collectStats, order);
+        out.ms = radiusQueryGPU(bvh, buf, radius, rb, collectStats, order, wide);
         std::vector<std::vector<ClosestHit>> lists = readRadiusResultsGPU(rb);
         destroyRadiusBufferGPU(rb);
         out.perPoint = std::move(lists);
     } else {
-        out.ms = (query == "knn") ? kNearestGPU(bvh, buf, k, collectStats, order)
-                                  : closestPointGPU(bvh, buf, collectStats, order);
+        out.ms = (query == "knn") ? kNearestGPU(bvh, buf, k, collectStats, order, wide)
+                                  : closestPointGPU(bvh, buf, collectStats, order, wide);
         const std::vector<GpuClosestResult> flat = readQueryResultsGPU(buf);
         for (size_t i = 0; i < out.perPoint.size(); ++i) {
             const GpuClosestResult* row = flat.data() + i * stride;
@@ -368,9 +371,14 @@ int main(int argc, char** argv) {
     if (knnMode) std::printf(" k=%d", opt.k);
     if (radiusMode) std::printf(" radius=%g", static_cast<double>(opt.radius));
     if (opt.querySort) std::printf(" order=morton");
+    if (opt.wide) std::printf(" traversal=wide4");
     std::printf(" seed=%llu\n", static_cast<unsigned long long>(opt.seed));
     if (opt.querySort && opt.refit) {
         std::printf("--query-sort does not support --refit yet\n");
+        return 1;
+    }
+    if (opt.wide && opt.refit) {
+        std::printf("--wide does not support --refit yet (collapsed boxes go stale)\n");
         return 1;
     }
 
@@ -443,6 +451,16 @@ int main(int argc, char** argv) {
     std::printf("gpu tree %s%s\n", treeError.empty() ? "PASS" : "FAIL: ", treeError.c_str());
     if (!treeError.empty()) return 4;
 
+    if (opt.wide) {
+        try {
+            const double wideMs = buildWideNodesGPU(gpu);
+            std::printf("wide nodes=%d build_ms=%.2f node_bytes=128\n", gpu.wideCount, wideMs);
+        } catch (const std::exception& e) {
+            std::printf("wide build failed: %s\n", e.what());
+            return 5;
+        }
+    }
+
     // ---- GPU 查询 ----
     GpuPointBuffer buf;
     try {
@@ -464,11 +482,11 @@ int main(int argc, char** argv) {
         while (nowMs() - warmStart < opt.warmupMs) {
             if (radiusMode) {
                 destroyRadiusBufferGPU(radiusBuf);
-                radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, false, order);
+                radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, false, order, opt.wide);
             } else if (knnMode) {
-                kNearestGPU(gpu, buf, opt.k, false, order);
+                kNearestGPU(gpu, buf, opt.k, false, order, opt.wide);
             } else {
-                closestPointGPU(gpu, buf, false, order);
+                closestPointGPU(gpu, buf, false, order, opt.wide);
             }
             ++warmRuns;
         }
@@ -477,10 +495,10 @@ int main(int argc, char** argv) {
         for (int run = 0; run < opt.runs; ++run) {
             if (radiusMode) {
                 destroyRadiusBufferGPU(radiusBuf);  // 每轮重新分配，分配时间不计入 event
-                gpuTimes.push_back(radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, false, order));
+                gpuTimes.push_back(radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, false, order, opt.wide));
             } else {
-                gpuTimes.push_back(knnMode ? kNearestGPU(gpu, buf, opt.k, false, order)
-                                           : closestPointGPU(gpu, buf, false, order));
+                gpuTimes.push_back(knnMode ? kNearestGPU(gpu, buf, opt.k, false, order, opt.wide)
+                                           : closestPointGPU(gpu, buf, false, order, opt.wide));
             }
         }
     } catch (const std::exception& e) {
@@ -570,11 +588,11 @@ int main(int argc, char** argv) {
     if (opt.stats) {
         if (radiusMode) {
             destroyRadiusBufferGPU(radiusBuf);
-            radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, true, order);
+            radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, true, order, opt.wide);
         } else if (knnMode) {
-            kNearestGPU(gpu, buf, opt.k, true, order);
+            kNearestGPU(gpu, buf, opt.k, true, order, opt.wide);
         } else {
-            closestPointGPU(gpu, buf, true, order);
+            closestPointGPU(gpu, buf, true, order, opt.wide);
         }
         const GpuQueryStats st = lastQueryStatsGPU();
         const double n = static_cast<double>(points.size());

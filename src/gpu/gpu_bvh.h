@@ -43,6 +43,12 @@ struct GpuBVH {
     void* d_levelCounts = nullptr;  // int[]，每层本次要合并的节点数
     void* d_refitOffsets = nullptr; // int[]，refitOffsets 的设备副本（标记 kernel 用）
     int refitEpoch = 0;
+
+    // 可选的 4 宽折叠（buildWideNodesGPU 生成）。d_wideId 把二叉内部节点映射到
+    // wide 下标，只对偶数深度的内部节点有效；refit 后重新折叠要复用它。
+    void* d_wideNodes = nullptr;    // GpuBVH4Node[]
+    void* d_wideId = nullptr;       // int[]，nodeCount
+    int wideCount = 0;
 };
 
 struct GpuBuildTimings {
@@ -123,9 +129,15 @@ void destroyRayBufferGPU(GpuRayBuffer& buf);
 // 原点序适合主射线（相机/竖直射线），方向序适合原点分散的次生射线。
 enum class RayOrder { Input, Morton, MortonDirection };
 
+// 把二叉 LBVH 折叠成 4 宽节点（偶数深度的内部节点各占一个 128B 节点，孩子 +
+// 孙子填满四个槽），返回折叠耗时。结果存进 bvh.d_wideNodes，可随时重新调用
+// （refit 之后必须重调，因为折叠节点里存的是二叉节点的盒的拷贝）。
+double buildWideNodesGPU(GpuBVH& bvh);
+
 // 跑一遍遍历，返回 kernel 毫秒数（CUDA event 计时，不含拷贝）。
+// wide = true 时走 4 宽节点，要求先调用 buildWideNodesGPU。
 double raycastGPU(const GpuBVH& bvh, GpuRayBuffer& buf, bool collectStats = false,
-                  RayOrder order = RayOrder::Input);
+                  RayOrder order = RayOrder::Input, bool wide = false);
 
 // 把显存里的逐射线结果按射线顺序折叠成指纹；perRay 非空时顺便拷回主机。
 RayStats summarizeGPU(const GpuRayBuffer& buf, std::vector<uint64_t>* perRay = nullptr);
@@ -173,14 +185,15 @@ void destroyPointBufferGPU(GpuPointBuffer& buf);
 // 单点最近三角形：每线程一个查询点，显式栈 DFS。
 // 剪枝与 CPU 参考实现同规则（下界 <= 当前最优才入栈），并列时取场景索引更小者，
 // 因此逐点的 (dist2 位模式, triangle) 与 closestPointBVH 完全一致。
+// wide = true 时走 4 宽折叠节点（先调用 buildWideNodesGPU）；结果与二叉路径逐位相同。
 double closestPointGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats = false,
-                       QueryOrder order = QueryOrder::Input);
+                       QueryOrder order = QueryOrder::Input, bool wide = false);
 
 // k 近邻：每线程维护一个按 (dist2, 场景索引) 升序的定长表（上限 32），
 // 满 k 后用第 k 近当剪枝阈值，替换规则与 CPU 的大顶堆一致。
 // 输出按查询点顺序每个 stride=k 条，不足 k 条的位置 triangle = -1。
 double kNearestGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats = false,
-                   QueryOrder order = QueryOrder::Input);
+                   QueryOrder order = QueryOrder::Input, bool wide = false);
 
 // 半径查询的输出是 CSR（压缩稀疏行）：第 i 个查询点的结果是
 // [offsets[i], offsets[i+1]) 区间，段内按 (dist2, 场景索引) 升序——和 CPU 的
@@ -198,7 +211,8 @@ void destroyRadiusBufferGPU(GpuRadiusBuffer& buf);
 // 一次完整的半径查询流水线，返回 GPU 侧总毫秒数（计数、前缀和、填充、分段排序；
 // 不含 H2D/D2H 结果拷贝）。out 每次调用都会重新分配。
 double radiusQueryGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuRadiusBuffer& out,
-                      bool collectStats = false, QueryOrder order = QueryOrder::Input);
+                      bool collectStats = false, QueryOrder order = QueryOrder::Input,
+                      bool wide = false);
 
 // 按查询点顺序把 CSR 结果拷回主机，还原成 ClosestHit 列表。
 std::vector<std::vector<ClosestHit>> readRadiusResultsGPU(const GpuRadiusBuffer& buf);
@@ -207,23 +221,25 @@ std::vector<std::vector<ClosestHit>> readRadiusResultsGPU(const GpuRadiusBuffer&
 // 与三角形路径共用遍历骨架和输出格式，只是叶子载荷换成 Vec3、距离换成点距。
 // GpuClosestResult.triangle 里装的是点索引，其余读写接口完全复用。
 double closestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats = false,
-                        QueryOrder order = QueryOrder::Input);
+                        QueryOrder order = QueryOrder::Input, bool wide = false);
 double kNearestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k,
-                         bool collectStats = false, QueryOrder order = QueryOrder::Input);
+                         bool collectStats = false, QueryOrder order = QueryOrder::Input,
+                         bool wide = false);
 double radiusQueryVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
                             GpuRadiusBuffer& out, bool collectStats = false,
-                            QueryOrder order = QueryOrder::Input);
+                            QueryOrder order = QueryOrder::Input, bool wide = false);
 
 // ---- 高斯查询（M2 后半）----
 // 距离是到椭球实体的平方距离（落在椭球内为 0）。GpuClosestResult.triangle 里装
 // 的是高斯索引；输出格式与读写接口和点云完全相同。
 double closestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats = false,
-                          QueryOrder order = QueryOrder::Input);
+                          QueryOrder order = QueryOrder::Input, bool wide = false);
 double kNearestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k,
-                           bool collectStats = false, QueryOrder order = QueryOrder::Input);
+                           bool collectStats = false, QueryOrder order = QueryOrder::Input,
+                           bool wide = false);
 double radiusQueryGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
                               GpuRadiusBuffer& out, bool collectStats = false,
-                              QueryOrder order = QueryOrder::Input);
+                              QueryOrder order = QueryOrder::Input, bool wide = false);
 
 // 把显存结果拷回主机（按查询点顺序）。
 std::vector<GpuClosestResult> readQueryResultsGPU(const GpuPointBuffer& buf);
