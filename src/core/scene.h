@@ -34,6 +34,9 @@ std::vector<Ray> makeRays(const AABB& bounds, RayMode mode, int count, uint64_t 
 
 const char* rayModeName(RayMode mode);
 
+// 地形高度场。点云生成器也用它，好让"扫面"点云和 terrain 场景重合。
+float terrainHeight(float x, float z);
+
 // 最近点 / kNN / 半径查询的查询点：均匀落在包围盒放大 1.2 倍的范围内，
 // 一部分在物体内部、一部分在外部，两种剪枝路径都会被走到。
 std::vector<Vec3> makeQueryPoints(const AABB& bounds, int count, uint64_t seed);

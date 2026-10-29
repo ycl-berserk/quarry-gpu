@@ -6,6 +6,7 @@
 
 #include "core/fingerprint.h"
 #include "core/geometry.h"
+#include "core/point_cloud.h"
 #include "core/scene.h"
 
 // GPU 后端的主机侧 API。头文件里不出现任何 CUDA 类型，设备指针一律用 void*：
@@ -15,9 +16,9 @@
 //   内部节点 0 .. n-2，叶子 n-1 .. 2n-2。
 struct GpuBVH {
     void* d_nodes = nullptr;    // GpuBVHNode[]，共 2n-1 个
-    void* d_tris = nullptr;     // Tri[]，按叶子顺序重排
+    void* d_tris = nullptr;     // Tri[] 或 Vec3[]（点云），按叶子顺序重排
     void* d_primIds = nullptr;  // int[]，tris[i] 对应的场景索引
-    int triCount = 0;
+    int primCount = 0;
     int nodeCount = 0;
     int depth = 0;
 
@@ -66,6 +67,10 @@ bool gpuDescribe(std::string* why);
 // 可能抛 std::runtime_error（CUDA 调用失败时）。
 GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings = nullptr);
 
+// 点云走同一条 LBVH 骨架：Morton 码按点坐标、叶子盒退化成单点。只有叶子载荷
+// （Tri vs Vec3）和求距函数不同，见 gpu/prim_ops.h。
+GpuBVH buildPointBVHGPU(const PointCloud& cloud, GpuBuildTimings* timings = nullptr);
+
 // 在计时构建之前空跑一个小 kernel：CUDA 默认懒加载模块，第一次启动 kernel 才会
 // 把整个 cubin 载入设备（~2 ms），不算这一次就把它记到构建头上。
 void warmupBuildGPU();
@@ -92,6 +97,10 @@ double refitBVHGPU(GpuBVH& bvh, const Scene& scene, GpuRefitTimings* timings = n
 // 也只处理这些叶子的祖先——耗时随改动量 × 树高走，不再与场景大小成正比。
 double refitBVHGPU(GpuBVH& bvh, const Scene& scene, const std::vector<int>& dirty,
                    GpuRefitTimings* timings = nullptr);
+
+double refitPointBVHGPU(GpuBVH& bvh, const PointCloud& cloud, GpuRefitTimings* timings = nullptr);
+double refitPointBVHGPU(GpuBVH& bvh, const PointCloud& cloud, const std::vector<int>& dirty,
+                        GpuRefitTimings* timings = nullptr);
 
 void destroyBVHGPU(GpuBVH& bvh);
 
@@ -136,7 +145,7 @@ struct GpuPointBuffer {
 
 struct GpuQueryStats {
     uint64_t nodeTests = 0;
-    uint64_t triTests = 0;
+    uint64_t triTests = 0;  // 叶子测试数；点云路径这里数的是点
     uint64_t stackOverflows = 0;
 };
 
@@ -174,6 +183,15 @@ double radiusQueryGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuR
 // 按查询点顺序把 CSR 结果拷回主机，还原成 ClosestHit 列表。
 std::vector<std::vector<ClosestHit>> readRadiusResultsGPU(const GpuRadiusBuffer& buf);
 
+// ---- 点云查询（M2）----
+// 与三角形路径共用遍历骨架和输出格式，只是叶子载荷换成 Vec3、距离换成点距。
+// GpuClosestResult.triangle 里装的是点索引，其余读写接口完全复用。
+double closestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats = false);
+double kNearestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k,
+                         bool collectStats = false);
+double radiusQueryVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
+                            GpuRadiusBuffer& out, bool collectStats = false);
+
 // 把显存结果拷回主机（按查询点顺序）。
 std::vector<GpuClosestResult> readQueryResultsGPU(const GpuPointBuffer& buf);
 
@@ -184,3 +202,4 @@ void warmupQueryGPU();
 // 检查树的结构不变量：父盒逐位等于两个子盒的并、叶子盒逐位等于三角形包围盒、
 // 每个非根节点被恰好引用一次、根盒等于场景包围盒。返回空串表示通过。
 std::string validateBVHGPU(const GpuBVH& bvh, const Scene& scene);
+std::string validatePointBVHGPU(const GpuBVH& bvh, const PointCloud& cloud);

@@ -15,8 +15,10 @@ endif()
 
 add_library(quarry_core STATIC
     src/core/scene.cpp
+    src/core/point_cloud.cpp
     src/cpu/brute.cpp
     src/cpu/bvh.cpp
+    src/cpu/point_kd.cpp
     src/cpu/selftest.cpp
 )
 target_include_directories(quarry_core PUBLIC src)
@@ -70,6 +72,9 @@ if(QUARRY_GPU)
 
         add_executable(gpu_query_bench bench/gpu_query_bench.cpp)
         target_link_libraries(gpu_query_bench PRIVATE quarry_gpu)
+
+        add_executable(gpu_cloud_bench bench/gpu_cloud_bench.cpp)
+        target_link_libraries(gpu_cloud_bench PRIVATE quarry_gpu)
 
         # Python 绑定：pybind11 由 pip 安装时不是系统包，向解释器要 cmakedir。
         # 没装就跳过，CI（无 CUDA）和纯 C++ 构建都不受影响。

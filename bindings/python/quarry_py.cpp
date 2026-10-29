@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "core/point_cloud.h"
 #include "core/scene.h"
 #include "gpu/gpu_bvh.h"
 
@@ -110,6 +111,129 @@ py::array_t<int32_t> intArray(const std::vector<int32_t>& v) {
     return out;
 }
 
+py::dict boundsDict(const AABB& box) {
+    py::dict out;
+    out["min"] = py::make_tuple(box.mn.x, box.mn.y, box.mn.z);
+    out["max"] = py::make_tuple(box.mx.x, box.mx.y, box.mx.z);
+    return out;
+}
+
+// ---- 三条查询的"跑 + 拷回 + 打包"流水线 ----
+// vertex 只决定叶子载荷是三角形还是点；两条路径的输出格式完全一样，
+// 所以打包代码只写一份。
+py::tuple closestRun(GpuBVH& bvh, const F32Array& points, bool vertex, double* msOut) {
+    const std::vector<Vec3> pts = pointsFromArray(points, "points");
+    std::vector<GpuClosestResult> res;
+    double ms = 0.0;
+    {
+        py::gil_scoped_release release;
+        GpuPointBuffer buf = uploadPointsGPU(pts, 1);
+        try {
+            ms = vertex ? closestVertexGPU(bvh, buf, false) : closestPointGPU(bvh, buf, false);
+            res = readQueryResultsGPU(buf);
+        } catch (...) {
+            destroyPointBufferGPU(buf);
+            throw;
+        }
+        destroyPointBufferGPU(buf);
+    }
+    *msOut = ms;
+
+    std::vector<float> dist2(res.size());
+    std::vector<int32_t> idx(res.size());
+    for (size_t i = 0; i < res.size(); ++i) {
+        const uint32_t bits = res[i].dist2Bits;
+        std::memcpy(&dist2[i], &bits, sizeof(float));
+        idx[i] = res[i].triangle;
+    }
+    return py::make_tuple(floatArray(dist2), intArray(idx));
+}
+
+py::tuple knnRun(GpuBVH& bvh, const F32Array& points, int k, bool vertex, double* msOut) {
+    if (k < 1 || k > 32) throw std::invalid_argument("k must be in [1, 32]");
+    const std::vector<Vec3> pts = pointsFromArray(points, "points");
+    std::vector<GpuClosestResult> res;
+    double ms = 0.0;
+    {
+        py::gil_scoped_release release;
+        GpuPointBuffer buf = uploadPointsGPU(pts, k);
+        try {
+            ms = vertex ? kNearestVertexGPU(bvh, buf, k, false) : kNearestGPU(bvh, buf, k, false);
+            res = readQueryResultsGPU(buf);
+        } catch (...) {
+            destroyPointBufferGPU(buf);
+            throw;
+        }
+        destroyPointBufferGPU(buf);
+    }
+    *msOut = ms;
+
+    const py::ssize_t n = static_cast<py::ssize_t>(pts.size());
+    py::array_t<float> dist2({n, static_cast<py::ssize_t>(k)});
+    py::array_t<int32_t> idx({n, static_cast<py::ssize_t>(k)});
+    auto dv = dist2.mutable_unchecked<2>();
+    auto tv = idx.mutable_unchecked<2>();
+    for (py::ssize_t i = 0; i < n; ++i) {
+        for (int j = 0; j < k; ++j) {
+            const GpuClosestResult& h = res[static_cast<size_t>(i) * k + j];
+            uint32_t bits = h.dist2Bits;
+            float d = 0.0f;
+            std::memcpy(&d, &bits, sizeof(float));
+            dv(i, j) = d;
+            tv(i, j) = h.triangle;
+        }
+    }
+    return py::make_tuple(dist2, idx);
+}
+
+py::tuple radiusRun(GpuBVH& bvh, const F32Array& points, float radius, bool vertex,
+                    double* msOut) {
+    if (!(radius >= 0.0f)) throw std::invalid_argument("radius must be >= 0");
+    const std::vector<Vec3> pts = pointsFromArray(points, "points");
+    std::vector<std::vector<ClosestHit>> hits;
+    double ms = 0.0;
+    {
+        py::gil_scoped_release release;
+        GpuPointBuffer buf = uploadPointsGPU(pts, 1);
+        GpuRadiusBuffer out;
+        try {
+            ms = vertex ? radiusQueryVertexGPU(bvh, buf, radius, out, false)
+                        : radiusQueryGPU(bvh, buf, radius, out, false);
+            hits = readRadiusResultsGPU(out);
+        } catch (...) {
+            destroyRadiusBufferGPU(out);
+            destroyPointBufferGPU(buf);
+            throw;
+        }
+        destroyRadiusBufferGPU(out);
+        destroyPointBufferGPU(buf);
+    }
+    *msOut = ms;
+
+    const py::ssize_t n = static_cast<py::ssize_t>(pts.size());
+    py::array_t<int64_t> offsets(n + 1);
+    auto off = offsets.mutable_unchecked<1>();
+    off(0) = 0;
+    size_t total = 0;
+    for (py::ssize_t i = 0; i < n; ++i) {
+        total += hits[static_cast<size_t>(i)].size();
+        off(i + 1) = static_cast<int64_t>(total);
+    }
+    py::array_t<float> dist2(static_cast<py::ssize_t>(total));
+    py::array_t<int32_t> idx(static_cast<py::ssize_t>(total));
+    auto dv = dist2.mutable_unchecked<1>();
+    auto tv = idx.mutable_unchecked<1>();
+    size_t at = 0;
+    for (py::ssize_t i = 0; i < n; ++i) {
+        for (const ClosestHit& h : hits[static_cast<size_t>(i)]) {
+            dv(static_cast<py::ssize_t>(at)) = h.dist2;
+            tv(static_cast<py::ssize_t>(at)) = h.triangle;
+            ++at;
+        }
+    }
+    return py::make_tuple(offsets, dist2, idx);
+}
+
 class PyScene {
 public:
     explicit PyScene(const F32Array& triangles) : tris_(trianglesFromArray(triangles)) { build(); }
@@ -125,7 +249,7 @@ public:
     PyScene(const PyScene&) = delete;
     PyScene& operator=(const PyScene&) = delete;
 
-    int triangleCount() const { return bvh_.triCount; }
+    int triangleCount() const { return bvh_.primCount; }
     int nodeCount() const { return bvh_.nodeCount; }
     int depth() const { return bvh_.depth; }
     double buildMs() const { return buildMs_; }
@@ -144,12 +268,7 @@ public:
         return out;
     }
 
-    py::dict bounds() const {
-        py::dict out;
-        out["min"] = py::make_tuple(bounds_.mn.x, bounds_.mn.y, bounds_.mn.z);
-        out["max"] = py::make_tuple(bounds_.mx.x, bounds_.mx.y, bounds_.mx.z);
-        return out;
-    }
+    py::dict bounds() const { return boundsDict(bounds_); }
 
     py::dict buildStats() const {
         py::dict out;
@@ -207,114 +326,15 @@ public:
     }
 
     py::tuple closest(const F32Array& points) {
-        const std::vector<Vec3> pts = pointsFromArray(points, "points");
-        std::vector<GpuClosestResult> res;
-        double ms = 0.0;
-        {
-            py::gil_scoped_release release;
-            GpuPointBuffer buf = uploadPointsGPU(pts, 1);
-            try {
-                ms = closestPointGPU(bvh_, buf, false);
-                res = readQueryResultsGPU(buf);
-            } catch (...) {
-                destroyPointBufferGPU(buf);
-                throw;
-            }
-            destroyPointBufferGPU(buf);
-        }
-        lastQueryMs_ = ms;
-
-        std::vector<float> dist2(res.size());
-        std::vector<int32_t> tri(res.size());
-        for (size_t i = 0; i < res.size(); ++i) {
-            const uint32_t bits = res[i].dist2Bits;
-            std::memcpy(&dist2[i], &bits, sizeof(float));
-            tri[i] = res[i].triangle;
-        }
-        return py::make_tuple(floatArray(dist2), intArray(tri));
+        return closestRun(bvh_, points, false, &lastQueryMs_);
     }
 
     py::tuple knn(const F32Array& points, int k) {
-        if (k < 1 || k > 32) throw std::invalid_argument("k must be in [1, 32]");
-        const std::vector<Vec3> pts = pointsFromArray(points, "points");
-        std::vector<GpuClosestResult> res;
-        double ms = 0.0;
-        {
-            py::gil_scoped_release release;
-            GpuPointBuffer buf = uploadPointsGPU(pts, k);
-            try {
-                ms = kNearestGPU(bvh_, buf, k, false);
-                res = readQueryResultsGPU(buf);
-            } catch (...) {
-                destroyPointBufferGPU(buf);
-                throw;
-            }
-            destroyPointBufferGPU(buf);
-        }
-        lastQueryMs_ = ms;
-
-        const py::ssize_t n = static_cast<py::ssize_t>(pts.size());
-        py::array_t<float> dist2({n, static_cast<py::ssize_t>(k)});
-        py::array_t<int32_t> tri({n, static_cast<py::ssize_t>(k)});
-        auto dv = dist2.mutable_unchecked<2>();
-        auto tv = tri.mutable_unchecked<2>();
-        for (py::ssize_t i = 0; i < n; ++i) {
-            for (int j = 0; j < k; ++j) {
-                const GpuClosestResult& h = res[static_cast<size_t>(i) * k + j];
-                uint32_t bits = h.dist2Bits;
-                float d = 0.0f;
-                std::memcpy(&d, &bits, sizeof(float));
-                dv(i, j) = d;
-                tv(i, j) = h.triangle;
-            }
-        }
-        return py::make_tuple(dist2, tri);
+        return knnRun(bvh_, points, k, false, &lastQueryMs_);
     }
 
     py::tuple radius(const F32Array& points, float radius) {
-        if (!(radius >= 0.0f)) throw std::invalid_argument("radius must be >= 0");
-        const std::vector<Vec3> pts = pointsFromArray(points, "points");
-        std::vector<std::vector<ClosestHit>> hits;
-        double ms = 0.0;
-        {
-            py::gil_scoped_release release;
-            GpuPointBuffer buf = uploadPointsGPU(pts, 1);
-            GpuRadiusBuffer out;
-            try {
-                ms = radiusQueryGPU(bvh_, buf, radius, out, false);
-                hits = readRadiusResultsGPU(out);
-            } catch (...) {
-                destroyRadiusBufferGPU(out);
-                destroyPointBufferGPU(buf);
-                throw;
-            }
-            destroyRadiusBufferGPU(out);
-            destroyPointBufferGPU(buf);
-        }
-        lastQueryMs_ = ms;
-
-        const py::ssize_t n = static_cast<py::ssize_t>(pts.size());
-        py::array_t<int64_t> offsets(n + 1);
-        auto off = offsets.mutable_unchecked<1>();
-        off(0) = 0;
-        size_t total = 0;
-        for (py::ssize_t i = 0; i < n; ++i) {
-            total += hits[static_cast<size_t>(i)].size();
-            off(i + 1) = static_cast<int64_t>(total);
-        }
-        py::array_t<float> dist2(static_cast<py::ssize_t>(total));
-        py::array_t<int32_t> tri(static_cast<py::ssize_t>(total));
-        auto dv = dist2.mutable_unchecked<1>();
-        auto tv = tri.mutable_unchecked<1>();
-        size_t at = 0;
-        for (py::ssize_t i = 0; i < n; ++i) {
-            for (const ClosestHit& h : hits[static_cast<size_t>(i)]) {
-                dv(static_cast<py::ssize_t>(at)) = h.dist2;
-                tv(static_cast<py::ssize_t>(at)) = h.triangle;
-                ++at;
-            }
-        }
-        return py::make_tuple(offsets, dist2, tri);
+        return radiusRun(bvh_, points, radius, false, &lastQueryMs_);
     }
 
 private:
@@ -332,7 +352,7 @@ private:
     // dirty 非 None 时只上传这些场景三角形（未列出的三角形在树里保持旧值），
     // 调用方必须保证"没列出来的都没动"——这是增量接口的合同，不会被逐位校验兜住。
     void update(std::vector<Tri> tris, const py::object& dirty) {
-        if (static_cast<int>(tris.size()) != bvh_.triCount) {
+        if (static_cast<int>(tris.size()) != bvh_.primCount) {
             throw std::invalid_argument("update must keep the triangle count; rebuild instead");
         }
         std::vector<int> ids;
@@ -371,6 +391,107 @@ private:
     std::vector<Tri> tris_;
     std::vector<int32_t> indices_;  // 只有 (vertices, indices) 构造时才有
     ::Scene sceneView_;
+    AABB bounds_;
+    GpuBVH bvh_;
+    GpuBuildTimings timings_{};
+    GpuRefitTimings refitTimings_{};
+    double buildMs_ = 0.0;
+    double lastQueryMs_ = 0.0;
+    double refitMs_ = 0.0;
+};
+
+class PyPointCloud {
+public:
+    explicit PyPointCloud(const F32Array& points) {
+        std::vector<Vec3> pts = pointsFromArray(points, "points");
+        if (pts.size() < 2) throw std::invalid_argument("at least 2 points are required");
+        cloud_.pts = std::move(pts);
+        cloud_.updateBounds();
+        bounds_ = cloud_.bounds;
+        {
+            py::gil_scoped_release release;
+            bvh_ = buildPointBVHGPU(cloud_, &timings_);
+        }
+        buildMs_ = timings_.totalMs;
+    }
+
+    ~PyPointCloud() { destroyBVHGPU(bvh_); }
+
+    PyPointCloud(const PyPointCloud&) = delete;
+    PyPointCloud& operator=(const PyPointCloud&) = delete;
+
+    int pointCount() const { return bvh_.primCount; }
+    int nodeCount() const { return bvh_.nodeCount; }
+    int depth() const { return bvh_.depth; }
+    double buildMs() const { return buildMs_; }
+    double lastQueryMs() const { return lastQueryMs_; }
+    double refitMs() const { return refitMs_; }
+    py::dict bounds() const { return boundsDict(bounds_); }
+
+    py::dict buildStats() const {
+        py::dict out;
+        out["morton_ms"] = timings_.mortonMs;
+        out["sort_ms"] = timings_.sortMs;
+        out["scatter_ms"] = timings_.scatterMs;
+        out["tree_ms"] = timings_.treeMs;
+        out["refit_ms"] = timings_.refitMs;
+        out["total_ms"] = timings_.totalMs;
+        return out;
+    }
+
+    py::dict refitStats() const {
+        py::dict out;
+        out["upload_ms"] = refitTimings_.uploadMs;
+        out["scatter_ms"] = refitTimings_.gatherMs;
+        out["tree_ms"] = refitTimings_.treeMs;
+        out["mark_ms"] = refitTimings_.markMs;
+        out["merge_ms"] = refitTimings_.mergeMs;
+        out["total_ms"] = refitTimings_.totalMs;
+        out["updated"] = refitTimings_.updated;
+        return out;
+    }
+
+    std::string validate() const { return validatePointBVHGPU(bvh_, cloud_); }
+
+    py::tuple closest(const F32Array& points) {
+        return closestRun(bvh_, points, true, &lastQueryMs_);
+    }
+
+    py::tuple knn(const F32Array& points, int k) {
+        return knnRun(bvh_, points, k, true, &lastQueryMs_);
+    }
+
+    py::tuple radius(const F32Array& points, float radius) {
+        return radiusRun(bvh_, points, radius, true, &lastQueryMs_);
+    }
+
+    // 与 Scene.update_triangles 同一份合同：点 i 必须还是建树时那个点，
+    // dirty 里的下标才允许改；不传 dirty 表示整份点云都上传。
+    void updatePoints(const F32Array& points, const py::object& dirty) {
+        std::vector<Vec3> pts = pointsFromArray(points, "points");
+        if (static_cast<int>(pts.size()) != bvh_.primCount) {
+            throw std::invalid_argument("update must keep the point count; rebuild instead");
+        }
+        std::vector<int> ids;
+        const bool partial = !dirty.is_none();
+        if (partial) {
+            const I32Array arr = dirty.cast<I32Array>();
+            ids.assign(arr.data(), arr.data() + arr.size());
+        }
+
+        cloud_.pts = std::move(pts);
+        cloud_.updateBounds();
+        bounds_ = cloud_.bounds;
+
+        {
+            py::gil_scoped_release release;
+            refitMs_ = partial ? refitPointBVHGPU(bvh_, cloud_, ids, &refitTimings_)
+                               : refitPointBVHGPU(bvh_, cloud_, &refitTimings_);
+        }
+    }
+
+private:
+    PointCloud cloud_;
     AABB bounds_;
     GpuBVH bvh_;
     GpuBuildTimings timings_{};
@@ -462,5 +583,32 @@ PYBIND11_MODULE(quarry, m) {
              "missing slots are -1")
         .def("radius", &PyScene::radius, py::arg("points"), py::arg("radius"),
              "Return CSR (offsets int64[N+1], dist2 float32[total], triangle int32[total]) "
+             "sorted by (dist2, index) inside each segment");
+
+    py::class_<PyPointCloud>(m, "PointCloud", "Static point cloud with a GPU LBVH")
+        .def(py::init<const F32Array&>(), py::arg("points"),
+             "Build from points with shape (N, 3) float32")
+        .def_property_readonly("point_count", &PyPointCloud::pointCount)
+        .def_property_readonly("node_count", &PyPointCloud::nodeCount)
+        .def_property_readonly("depth", &PyPointCloud::depth)
+        .def_property_readonly("build_ms", &PyPointCloud::buildMs)
+        .def_property_readonly("last_query_ms", &PyPointCloud::lastQueryMs,
+                               "Kernel time of the most recent query (CUDA events, no copies)")
+        .def_property_readonly("refit_ms", &PyPointCloud::refitMs)
+        .def_property_readonly("refit_stats", &PyPointCloud::refitStats)
+        .def_property_readonly("bounds", &PyPointCloud::bounds)
+        .def_property_readonly("build_stats", &PyPointCloud::buildStats)
+        .def("validate", &PyPointCloud::validate, "Check tree invariants; empty string means pass")
+        .def("update_points", &PyPointCloud::updatePoints, py::arg("points"),
+             py::arg("dirty") = py::none(),
+             "Refit in place: point i must still be the same sample. dirty is an int32 array "
+             "of point indices to upload; omit it to upload everything")
+        .def("closest", &PyPointCloud::closest, py::arg("points"),
+             "Return (dist2 float32[N], index int32[N]); index is -1 on a miss")
+        .def("knn", &PyPointCloud::knn, py::arg("points"), py::arg("k"),
+             "Return (dist2 float32[N,k], index int32[N,k]) sorted by (dist2, index); "
+             "missing slots are -1")
+        .def("radius", &PyPointCloud::radius, py::arg("points"), py::arg("radius"),
+             "Return CSR (offsets int64[N+1], dist2 float32[total], index int32[total]) "
              "sorted by (dist2, index) inside each segment");
 }

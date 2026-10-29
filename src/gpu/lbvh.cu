@@ -17,6 +17,7 @@
 #include <string>
 
 #include "gpu/gpu_node.h"
+#include "gpu/prim_ops.h"
 
 namespace {
 
@@ -86,7 +87,8 @@ __global__ void resetCentroidBoundsKernel() {
     }
 }
 
-__global__ void centroidBoundsKernel(const Tri* __restrict__ tris, int n) {
+template <typename Ops>
+__global__ void centroidBoundsKernel(const typename Ops::Item* __restrict__ items, int n) {
     __shared__ float s[6][kBlock];
     const int tid = threadIdx.x;
 
@@ -94,17 +96,13 @@ __global__ void centroidBoundsKernel(const Tri* __restrict__ tris, int n) {
     float hi0 = -CUDART_INF_F, hi1 = -CUDART_INF_F, hi2 = -CUDART_INF_F;
 
     for (int i = blockIdx.x * kBlock + tid; i < n; i += kBlock * gridDim.x) {
-        const Tri t = tris[i];
-        // 与 CPU 完全相同的重心公式（先加后除，三步顺序一致）
-        const float cx = (t.a.x + t.b.x + t.c.x) / 3.0f;
-        const float cy = (t.a.y + t.b.y + t.c.y) / 3.0f;
-        const float cz = (t.a.z + t.b.z + t.c.z) / 3.0f;
-        lo0 = fminf(lo0, cx);
-        lo1 = fminf(lo1, cy);
-        lo2 = fminf(lo2, cz);
-        hi0 = fmaxf(hi0, cx);
-        hi1 = fmaxf(hi1, cy);
-        hi2 = fmaxf(hi2, cz);
+        const Vec3 c = Ops::centroid(items[i]);
+        lo0 = fminf(lo0, c.x);
+        lo1 = fminf(lo1, c.y);
+        lo2 = fminf(lo2, c.z);
+        hi0 = fmaxf(hi0, c.x);
+        hi1 = fmaxf(hi1, c.y);
+        hi2 = fmaxf(hi2, c.z);
     }
 
     s[0][tid] = lo0;
@@ -153,8 +151,10 @@ __device__ __forceinline__ uint32_t quantize(float v, float lo, float extent) {
 }
 
 // 排序键 = 30 位 Morton 码 << 32 | 原始索引。低 32 位让键唯一，
-// 否则同一量化格子里的三角形无法区分，树的形状也就不唯一。
-__global__ void mortonKernel(const Tri* __restrict__ tris, int n, uint64_t* __restrict__ keys) {
+// 否则同一量化格子里的图元无法区分，树的形状也就不唯一。
+template <typename Ops>
+__global__ void mortonKernel(const typename Ops::Item* __restrict__ items, int n,
+                             uint64_t* __restrict__ keys) {
     const int i = blockIdx.x * kBlock + threadIdx.x;
     if (i >= n) return;
 
@@ -163,13 +163,11 @@ __global__ void mortonKernel(const Tri* __restrict__ tris, int n, uint64_t* __re
     const float hi[3] = {floatFromOrdered(gCentroidHi[0]), floatFromOrdered(gCentroidHi[1]),
                          floatFromOrdered(gCentroidHi[2])};
 
-    const Tri t = tris[i];
-    const float c[3] = {(t.a.x + t.b.x + t.c.x) / 3.0f, (t.a.y + t.b.y + t.c.y) / 3.0f,
-                        (t.a.z + t.b.z + t.c.z) / 3.0f};
+    const Vec3 c = Ops::centroid(items[i]);
 
-    const uint32_t code = morton3D(quantize(c[0], lo[0], hi[0] - lo[0]),
-                                   quantize(c[1], lo[1], hi[1] - lo[1]),
-                                   quantize(c[2], lo[2], hi[2] - lo[2]));
+    const uint32_t code = morton3D(quantize(c.x, lo[0], hi[0] - lo[0]),
+                                   quantize(c.y, lo[1], hi[1] - lo[1]),
+                                   quantize(c.z, lo[2], hi[2] - lo[2]));
     keys[i] = (static_cast<uint64_t>(code) << 32) | static_cast<uint32_t>(i);
 }
 
@@ -178,8 +176,11 @@ __global__ void iotaKernel(int* __restrict__ v, int n) {
     if (i < n) v[i] = i;
 }
 
-__global__ void scatterTrisKernel(const Tri* __restrict__ src, const int* __restrict__ order,
-                                  int n, Tri* __restrict__ dst, int* __restrict__ primIds) {
+template <typename Ops>
+__global__ void scatterTrisKernel(const typename Ops::Item* __restrict__ src,
+                                  const int* __restrict__ order, int n,
+                                  typename Ops::Item* __restrict__ dst,
+                                  int* __restrict__ primIds) {
     const int k = blockIdx.x * kBlock + threadIdx.x;
     if (k >= n) return;
     const int slot = order[k];
@@ -198,20 +199,23 @@ __global__ void internalInitKernel(GpuBVHNode* __restrict__ nodes, int internalC
     nodes[i].mxz = -CUDART_INF_F;
 }
 
-__global__ void leafInitKernel(GpuBVHNode* __restrict__ nodes, const Tri* __restrict__ sortedTris,
-                               int n) {
+template <typename Ops>
+__global__ void leafInitKernel(GpuBVHNode* __restrict__ nodes,
+                               const typename Ops::Item* __restrict__ sortedItems, int n) {
     const int k = blockIdx.x * kBlock + threadIdx.x;
     if (k >= n) return;
     GpuBVHNode& leaf = nodes[n - 1 + k];
-    setNodeBox(leaf, sortedTris[k].bounds());
+    setNodeBox(leaf, Ops::bounds(sortedItems[k]));
     leaf.left = -(k + 1);
     leaf.right = 1;
 }
 
-// refit 的第一步：调用方给的是场景顺序的三角形，树里存的是叶子顺序。
+// refit 的第一步：调用方给的是场景顺序的图元，树里存的是叶子顺序。
 // primIds 是建树时定下的叶子槽 -> 场景索引，所以重排不需要在主机上做置换。
-__global__ void gatherTrisKernel(const Tri* __restrict__ src, const int* __restrict__ primIds,
-                                 int n, Tri* __restrict__ dst) {
+template <typename Ops>
+__global__ void gatherTrisKernel(const typename Ops::Item* __restrict__ src,
+                                 const int* __restrict__ primIds, int n,
+                                 typename Ops::Item* __restrict__ dst) {
     const int i = blockIdx.x * kBlock + threadIdx.x;
     if (i < n) dst[i] = src[primIds[i]];
 }
@@ -371,9 +375,11 @@ __global__ void refitAncestorKernel(GpuBVHNode* __restrict__ nodes,
 // 结构校验：父盒必须逐位等于两个子盒的并，叶子盒必须逐位等于三角形包围盒，
 // 每个非根节点必须被恰好引用一次。
 // ---------------------------------------------------------------------------
+template <typename Ops>
 __global__ void checkNodesKernel(const GpuBVHNode* __restrict__ nodes,
-                                 const Tri* __restrict__ sortedTris, int n, int nodeCount,
-                                 int* __restrict__ visited, int* __restrict__ errors) {
+                                 const typename Ops::Item* __restrict__ sortedItems, int n,
+                                 int nodeCount, int* __restrict__ visited,
+                                 int* __restrict__ errors) {
     const int i = blockIdx.x * kBlock + threadIdx.x;
     if (i >= nodeCount) return;
 
@@ -403,9 +409,9 @@ __global__ void checkNodesKernel(const GpuBVHNode* __restrict__ nodes,
             return;
         }
         const AABB mine = nodeBox(nd);
-        const AABB tri = sortedTris[slot].bounds();
-        if (mine.mn.x != tri.mn.x || mine.mn.y != tri.mn.y || mine.mn.z != tri.mn.z ||
-            mine.mx.x != tri.mx.x || mine.mx.y != tri.mx.y || mine.mx.z != tri.mx.z) {
+        const AABB prim = Ops::bounds(sortedItems[slot]);
+        if (mine.mn.x != prim.mn.x || mine.mn.y != prim.mn.y || mine.mn.z != prim.mn.z ||
+            mine.mx.x != prim.mx.x || mine.mx.y != prim.mx.y || mine.mx.z != prim.mx.z) {
             atomicAdd(&errors[1], 1);
         }
     }
@@ -450,29 +456,30 @@ void warmupBuildGPU() {
     cudaOk(cudaDeviceSynchronize(), "warmup sync");
 }
 
-GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
-    const int n = static_cast<int>(scene.tris.size());
-    if (n < 2) throw std::runtime_error("buildBVHGPU: at least 2 triangles required");
+template <typename Ops>
+GpuBVH buildLBVH(const typename Ops::Item* hostItems, int n, GpuBuildTimings* timings) {
+    using Item = typename Ops::Item;
+    if (n < 2) throw std::runtime_error("buildLBVH: at least 2 primitives required");
 
     const int nodeCount = 2 * n - 1;
     const int internalCount = n - 1;
 
     GpuBVH bvh;
-    bvh.triCount = n;
+    bvh.primCount = n;
     bvh.nodeCount = nodeCount;
     cudaOk(cudaMalloc(&bvh.d_nodes, static_cast<size_t>(nodeCount) * sizeof(GpuBVHNode)), "nodes");
-    cudaOk(cudaMalloc(&bvh.d_tris, static_cast<size_t>(n) * sizeof(Tri)), "tris");
+    cudaOk(cudaMalloc(&bvh.d_tris, static_cast<size_t>(n) * sizeof(Item)), "tris");
     cudaOk(cudaMalloc(&bvh.d_primIds, static_cast<size_t>(n) * sizeof(int)), "primIds");
 
     auto* nodes = static_cast<GpuBVHNode*>(bvh.d_nodes);
-    auto* sortedTris = static_cast<Tri*>(bvh.d_tris);
+    auto* sortedTris = static_cast<Item*>(bvh.d_tris);
     auto* primIds = static_cast<int*>(bvh.d_primIds);
 
     try {
-        DevBuf<Tri> dSrc(n);
-        cudaOk(cudaMemcpy(dSrc.p, scene.tris.data(), static_cast<size_t>(n) * sizeof(Tri),
+        DevBuf<Item> dSrc(n);
+        cudaOk(cudaMemcpy(dSrc.p, hostItems, static_cast<size_t>(n) * sizeof(Item),
                           cudaMemcpyHostToDevice),
-               "H2D tris");
+               "H2D prims");
 
         DevBuf<uint64_t> dKeys(n), dKeysSorted(n);
         DevBuf<int> dOrder(n), dOrderSorted(n);
@@ -487,8 +494,8 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
         clock.mark();  // 0
 
         resetCentroidBoundsKernel<<<1, 32>>>();
-        centroidBoundsKernel<<<blocksFor(n), kBlock>>>(dSrc.p, n);
-        mortonKernel<<<blocksFor(n), kBlock>>>(dSrc.p, n, dKeys.p);
+        centroidBoundsKernel<Ops><<<blocksFor(n), kBlock>>>(dSrc.p, n);
+        mortonKernel<Ops><<<blocksFor(n), kBlock>>>(dSrc.p, n, dKeys.p);
         cudaOk(cudaGetLastError(), "morton");
         clock.mark();  // 1
 
@@ -503,7 +510,8 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
                "sort");
         clock.mark();  // 2
 
-        scatterTrisKernel<<<blocksFor(n), kBlock>>>(dSrc.p, dOrderSorted.p, n, sortedTris, primIds);
+        scatterTrisKernel<Ops><<<blocksFor(n), kBlock>>>(dSrc.p, dOrderSorted.p, n, sortedTris,
+                                                         primIds);
         cudaOk(cudaGetLastError(), "scatter tris");
         clock.mark();  // 3
 
@@ -515,10 +523,10 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
         cudaOk(cudaMemset(dMaxDepth.p, 0, sizeof(int)), "maxDepth");
         depthKernel<<<blocksFor(nodeCount), kBlock>>>(dParent.p, nodeCount, dDepth.p, dMaxDepth.p);
         cudaOk(cudaMemcpy(&bvh.depth, dMaxDepth.p, sizeof(int), cudaMemcpyDeviceToHost), "depth");
-        if (bvh.depth >= kDepthBins) throw std::runtime_error("buildBVHGPU: depth exceeds bin table");
+        if (bvh.depth >= kDepthBins) throw std::runtime_error("buildLBVH: depth exceeds bin table");
         clock.mark();  // 4
 
-        leafInitKernel<<<blocksFor(n), kBlock>>>(nodes, sortedTris, n);
+        leafInitKernel<Ops><<<blocksFor(n), kBlock>>>(nodes, sortedTris, n);
         iotaKernel<<<blocksFor(internalCount), kBlock>>>(dDepthVal.p, internalCount);
 
         // 内部节点编号恰好是 0..n-2，叶子不会进桶——refit 少处理一半的节点。
@@ -548,7 +556,7 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
                           cudaMemcpyDeviceToHost),
                "D2H offsets");
         if (offsets[bins] != internalCount) {
-            throw std::runtime_error("buildBVHGPU: depth bucketing lost nodes");
+            throw std::runtime_error("buildLBVH: depth bucketing lost nodes");
         }
 
         // 拓扑不变，这个 (深度, 编号) 顺序也不变：留给 refit 逐层重放，
@@ -608,6 +616,14 @@ GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
     return bvh;
 }
 
+GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings) {
+    return buildLBVH<TriOps>(scene.tris.data(), static_cast<int>(scene.tris.size()), timings);
+}
+
+GpuBVH buildPointBVHGPU(const PointCloud& cloud, GpuBuildTimings* timings) {
+    return buildLBVH<PointOps>(cloud.pts.data(), static_cast<int>(cloud.pts.size()), timings);
+}
+
 void destroyBVHGPU(GpuBVH& bvh) {
     if (bvh.d_nodes) cudaFree(bvh.d_nodes);
     if (bvh.d_tris) cudaFree(bvh.d_tris);
@@ -625,18 +641,20 @@ void destroyBVHGPU(GpuBVH& bvh) {
     bvh = GpuBVH{};
 }
 
-// 只上传改动的三角形：主机侧已经按 dirty 顺序打包好，slot 是它的叶子槽。
+// 只上传改动的图元：主机侧已经按 dirty 顺序打包好，slot 是它的叶子槽。
 // 写入 + 重算叶子盒在同一个线程里做，省一次 kernel。
-__global__ void scatterLeafKernel(const int* __restrict__ slots, const Tri* __restrict__ src,
-                                  int count, Tri* __restrict__ sortedTris,
+template <typename Ops>
+__global__ void scatterLeafKernel(const int* __restrict__ slots,
+                                  const typename Ops::Item* __restrict__ src, int count,
+                                  typename Ops::Item* __restrict__ sortedTris,
                                   GpuBVHNode* __restrict__ nodes, int n) {
     const int i = blockIdx.x * kBlock + threadIdx.x;
     if (i >= count) return;
     const int slot = slots[i];
-    const Tri t = src[i];
-    sortedTris[slot] = t;
+    const auto item = src[i];
+    sortedTris[slot] = item;
     GpuBVHNode& leaf = nodes[n - 1 + slot];
-    setNodeBox(leaf, t.bounds());
+    setNodeBox(leaf, Ops::bounds(item));
 }
 
 // 脏叶子 → 祖先链：从父节点一路走到根。epoch 标记顺带做去重——同一棵子树被多个
@@ -660,20 +678,22 @@ __global__ void markAncestorsKernel(const int* __restrict__ slots, int count,
     }
 }
 
-double refitImpl(GpuBVH& bvh, const Scene& scene, const std::vector<int>* dirty,
-                 GpuRefitTimings* timings) {
-    const int n = bvh.triCount;
+template <typename Ops>
+double refitImpl(GpuBVH& bvh, const std::vector<typename Ops::Item>& items,
+                 const std::vector<int>* dirty, GpuRefitTimings* timings) {
+    using Item = typename Ops::Item;
+    const int n = bvh.primCount;
     if (n < 2 || bvh.d_nodes == nullptr) throw std::runtime_error("refitBVHGPU: BVH not built");
     if (bvh.d_refitOrder == nullptr) throw std::runtime_error("refitBVHGPU: missing refit order");
     if (dirty && bvh.d_parent == nullptr) {
         throw std::runtime_error("refitBVHGPU: missing parent links");
     }
-    if (static_cast<int>(scene.tris.size()) != n) {
-        throw std::runtime_error("refitBVHGPU: triangle count changed, rebuild instead");
+    if (static_cast<int>(items.size()) != n) {
+        throw std::runtime_error("refitBVHGPU: primitive count changed, rebuild instead");
     }
 
     auto* nodes = static_cast<GpuBVHNode*>(bvh.d_nodes);
-    auto* sortedTris = static_cast<Tri*>(bvh.d_tris);
+    auto* sortedTris = static_cast<Item*>(bvh.d_tris);
     const auto* primIds = static_cast<const int*>(bvh.d_primIds);
     const auto* order = static_cast<const int*>(bvh.d_refitOrder);
 
@@ -697,12 +717,12 @@ double refitImpl(GpuBVH& bvh, const Scene& scene, const std::vector<int>* dirty,
         dirtyCount = static_cast<int>(dirty->size());
         // 主机侧 gather：改动量通常远小于 n，拿到叶子序的紧凑数组再传一次。
         std::vector<int> slots(static_cast<size_t>(dirtyCount));
-        std::vector<Tri> moved(static_cast<size_t>(dirtyCount));
+        std::vector<Item> moved(static_cast<size_t>(dirtyCount));
         for (int i = 0; i < dirtyCount; ++i) {
             const int id = (*dirty)[static_cast<size_t>(i)];
             if (id < 0 || id >= n) throw std::runtime_error("refitBVHGPU: dirty index out of range");
             slots[static_cast<size_t>(i)] = bvh.primSlot[static_cast<size_t>(id)];
-            moved[static_cast<size_t>(i)] = scene.tris[static_cast<size_t>(id)];
+            moved[static_cast<size_t>(i)] = items[static_cast<size_t>(id)];
         }
 
         // 暂存区按需增长：每次 cudaMalloc 的固定开销比内容本身还贵。
@@ -711,25 +731,25 @@ double refitImpl(GpuBVH& bvh, const Scene& scene, const std::vector<int>* dirty,
             if (bvh.d_dirtyTris) cudaFree(bvh.d_dirtyTris);
             cudaOk(cudaMalloc(&bvh.d_dirtySlots, static_cast<size_t>(dirtyCount) * sizeof(int)),
                    "dirty slots");
-            cudaOk(cudaMalloc(&bvh.d_dirtyTris, static_cast<size_t>(dirtyCount) * sizeof(Tri)),
-                   "dirty tris");
+            cudaOk(cudaMalloc(&bvh.d_dirtyTris, static_cast<size_t>(dirtyCount) * sizeof(Item)),
+                   "dirty prims");
             bvh.dirtyCapacity = dirtyCount;
         }
         auto* dSlots = static_cast<int*>(bvh.d_dirtySlots);
-        auto* dMoved = static_cast<Tri*>(bvh.d_dirtyTris);
+        auto* dMoved = static_cast<Item*>(bvh.d_dirtyTris);
         if (dirtyCount > 0) {
             cudaOk(cudaMemcpy(dSlots, slots.data(), static_cast<size_t>(dirtyCount) * sizeof(int),
                               cudaMemcpyHostToDevice),
                    "refit H2D slots");
-            cudaOk(cudaMemcpy(dMoved, moved.data(), static_cast<size_t>(dirtyCount) * sizeof(Tri),
+            cudaOk(cudaMemcpy(dMoved, moved.data(), static_cast<size_t>(dirtyCount) * sizeof(Item),
                               cudaMemcpyHostToDevice),
-                   "refit H2D tris");
+                   "refit H2D prims");
         }
         clock.mark();  // 1
 
         if (dirtyCount > 0) {
-            scatterLeafKernel<<<blocksFor(dirtyCount), kBlock>>>(dSlots, dMoved, dirtyCount,
-                                                                 sortedTris, nodes, n);
+            scatterLeafKernel<Ops><<<blocksFor(dirtyCount), kBlock>>>(dSlots, dMoved, dirtyCount,
+                                                                      sortedTris, nodes, n);
         }
         cudaOk(cudaGetLastError(), "refit scatter");
         clock.mark();  // 2
@@ -753,17 +773,17 @@ double refitImpl(GpuBVH& bvh, const Scene& scene, const std::vector<int>* dirty,
         // 暂存区首次用到才分配：不 refit 的调用方不付这块显存。
         if (bvh.d_stage == nullptr || bvh.stageCount < n) {
             if (bvh.d_stage) cudaFree(bvh.d_stage);
-            cudaOk(cudaMalloc(&bvh.d_stage, static_cast<size_t>(n) * sizeof(Tri)), "refit stage");
+            cudaOk(cudaMalloc(&bvh.d_stage, static_cast<size_t>(n) * sizeof(Item)), "refit stage");
             bvh.stageCount = n;
         }
-        auto* dSrc = static_cast<Tri*>(bvh.d_stage);
-        cudaOk(cudaMemcpy(dSrc, scene.tris.data(), static_cast<size_t>(n) * sizeof(Tri),
+        auto* dSrc = static_cast<Item*>(bvh.d_stage);
+        cudaOk(cudaMemcpy(dSrc, items.data(), static_cast<size_t>(n) * sizeof(Item),
                           cudaMemcpyHostToDevice),
                "refit H2D");
         clock.mark();  // 1
 
-        gatherTrisKernel<<<blocksFor(n), kBlock>>>(dSrc, primIds, n, sortedTris);
-        leafInitKernel<<<blocksFor(n), kBlock>>>(nodes, sortedTris, n);
+        gatherTrisKernel<Ops><<<blocksFor(n), kBlock>>>(dSrc, primIds, n, sortedTris);
+        leafInitKernel<Ops><<<blocksFor(n), kBlock>>>(nodes, sortedTris, n);
         cudaOk(cudaGetLastError(), "refit scatter");
         clock.mark();  // 2
     }
@@ -820,29 +840,41 @@ double refitImpl(GpuBVH& bvh, const Scene& scene, const std::vector<int>* dirty,
 }
 
 double refitBVHGPU(GpuBVH& bvh, const Scene& scene, GpuRefitTimings* timings) {
-    return refitImpl(bvh, scene, nullptr, timings);
+    return refitImpl<TriOps>(bvh, scene.tris, nullptr, timings);
 }
 
 double refitBVHGPU(GpuBVH& bvh, const Scene& scene, const std::vector<int>& dirty,
                    GpuRefitTimings* timings) {
-    return refitImpl(bvh, scene, &dirty, timings);
+    return refitImpl<TriOps>(bvh, scene.tris, &dirty, timings);
 }
 
-std::string validateBVHGPU(const GpuBVH& bvh, const Scene& scene) {
-    const int n = bvh.triCount;
+double refitPointBVHGPU(GpuBVH& bvh, const PointCloud& cloud, GpuRefitTimings* timings) {
+    return refitImpl<PointOps>(bvh, cloud.pts, nullptr, timings);
+}
+
+double refitPointBVHGPU(GpuBVH& bvh, const PointCloud& cloud, const std::vector<int>& dirty,
+                        GpuRefitTimings* timings) {
+    return refitImpl<PointOps>(bvh, cloud.pts, &dirty, timings);
+}
+
+template <typename Ops>
+std::string validateImpl(const GpuBVH& bvh, const std::vector<typename Ops::Item>& items,
+                         const AABB& bounds) {
+    const int n = bvh.primCount;
     const int nodeCount = bvh.nodeCount;
     if (nodeCount != 2 * n - 1) return "nodeCount != 2n-1";
+    if (static_cast<int>(items.size()) != n) return "prim count mismatch";
 
     const auto* nodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
-    const auto* sortedTris = static_cast<const Tri*>(bvh.d_tris);
+    const auto* sortedTris = static_cast<const typename Ops::Item*>(bvh.d_tris);
 
     DevBuf<int> dVisited(nodeCount);
     DevBuf<int> dErrors(4);
     cudaOk(cudaMemset(dVisited.p, 0, static_cast<size_t>(nodeCount) * sizeof(int)), "visited");
     cudaOk(cudaMemset(dErrors.p, 0, 4 * sizeof(int)), "errors");
 
-    checkNodesKernel<<<blocksFor(nodeCount), kBlock>>>(nodes, sortedTris, n, nodeCount, dVisited.p,
-                                                       dErrors.p);
+    checkNodesKernel<Ops><<<blocksFor(nodeCount), kBlock>>>(nodes, sortedTris, n, nodeCount,
+                                                            dVisited.p, dErrors.p);
     checkRefsKernel<<<blocksFor(nodeCount), kBlock>>>(dVisited.p, nodeCount, dErrors.p);
 
     int errors[4] = {};
@@ -851,9 +883,9 @@ std::string validateBVHGPU(const GpuBVH& bvh, const Scene& scene) {
     GpuBVHNode root{};
     cudaOk(cudaMemcpy(&root, nodes, sizeof(GpuBVHNode), cudaMemcpyDeviceToHost), "root");
     const AABB rootBox = nodeBox(root);
-    const bool badRoot = rootBox.mn.x != scene.bounds.mn.x || rootBox.mn.y != scene.bounds.mn.y ||
-                         rootBox.mn.z != scene.bounds.mn.z || rootBox.mx.x != scene.bounds.mx.x ||
-                         rootBox.mx.y != scene.bounds.mx.y || rootBox.mx.z != scene.bounds.mx.z;
+    const bool badRoot = rootBox.mn.x != bounds.mn.x || rootBox.mn.y != bounds.mn.y ||
+                         rootBox.mn.z != bounds.mn.z || rootBox.mx.x != bounds.mx.x ||
+                         rootBox.mx.y != bounds.mx.y || rootBox.mx.z != bounds.mx.z;
 
     std::string why;
     char buf[160];
@@ -866,4 +898,12 @@ std::string validateBVHGPU(const GpuBVH& bvh, const Scene& scene) {
     if (errors[2]) add("bad_refcount", errors[2]);
     if (badRoot) add("root_box_mismatch", 1);
     return why;
+}
+
+std::string validateBVHGPU(const GpuBVH& bvh, const Scene& scene) {
+    return validateImpl<TriOps>(bvh, scene.tris, scene.bounds);
+}
+
+std::string validatePointBVHGPU(const GpuBVH& bvh, const PointCloud& cloud) {
+    return validateImpl<PointOps>(bvh, cloud.pts, cloud.bounds);
 }

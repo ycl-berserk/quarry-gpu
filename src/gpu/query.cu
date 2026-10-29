@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "gpu/gpu_node.h"
+#include "gpu/prim_ops.h"
 
 namespace {
 
@@ -45,9 +46,9 @@ __global__ void resetStatsKernel() {
     gOverflows = 0;
 }
 
-template <bool kStats>
+template <typename Ops, bool kStats>
 __global__ __launch_bounds__(kBlock) void closestPointKernel(
-    const GpuBVHNode* __restrict__ nodes, const Tri* __restrict__ tris,
+    const GpuBVHNode* __restrict__ nodes, const typename Ops::Item* __restrict__ prims,
     const int* __restrict__ primIds, const Vec3* __restrict__ points, int count,
     GpuClosestResult* __restrict__ out) {
     const int idx = blockIdx.x * kBlock + threadIdx.x;
@@ -61,7 +62,7 @@ __global__ __launch_bounds__(kBlock) void closestPointKernel(
     if (active) {
         const Vec3 p = points[idx];
         float best2 = CUDART_INF_F;
-        int bestTri = -1;
+        int bestPrim = -1;
 
         int stack[kStack];
         int sp = 0;
@@ -75,12 +76,12 @@ __global__ __launch_bounds__(kBlock) void closestPointKernel(
             if (nd.left < 0) {
                 const int slot = -nd.left - 1;
                 ++triTests;
-                const ClosestHit h = closestPointOnTriangle(p, tris[slot]);
-                const int tri = primIds[slot];
+                const float d2 = Ops::dist2(p, prims[slot]);
+                const int prim = primIds[slot];
                 // 与 closerHit 等价：(距离, 场景索引) 字典序严格更小才替换。
-                if (bestTri < 0 || h.dist2 < best2 || (h.dist2 == best2 && tri < bestTri)) {
-                    best2 = h.dist2;
-                    bestTri = tri;
+                if (bestPrim < 0 || d2 < best2 || (d2 == best2 && prim < bestPrim)) {
+                    best2 = d2;
+                    bestPrim = prim;
                 }
                 continue;
             }
@@ -88,8 +89,8 @@ __global__ __launch_bounds__(kBlock) void closestPointKernel(
             const float dl = distanceSquaredToAABB(p, nodeBox(nodes[nd.left]));
             const float dr = distanceSquaredToAABB(p, nodeBox(nodes[nd.right]));
             // 下界等于当前最优时仍可能藏着并列但索引更小的解，所以用 <=。
-            const bool okL = bestTri < 0 || dl <= best2;
-            const bool okR = bestTri < 0 || dr <= best2;
+            const bool okL = bestPrim < 0 || dl <= best2;
+            const bool okR = bestPrim < 0 || dr <= best2;
 
             if (sp + (okL ? 1 : 0) + (okR ? 1 : 0) > kStack) {
                 overflow = true;
@@ -111,9 +112,9 @@ __global__ __launch_bounds__(kBlock) void closestPointKernel(
             }
         }
 
-        if (bestTri >= 0) {
+        if (bestPrim >= 0) {
             result.dist2Bits = __float_as_uint(best2);
-            result.triangle = bestTri;
+            result.triangle = bestPrim;
         }
         out[idx] = result;
     }
@@ -153,9 +154,9 @@ __device__ __forceinline__ void knnInsert(KnnEntry* best, int& n, int k, const K
     best[pos] = h;
 }
 
-template <bool kStats>
+template <typename Ops, bool kStats>
 __global__ __launch_bounds__(kBlock) void kNearestKernel(
-    const GpuBVHNode* __restrict__ nodes, const Tri* __restrict__ tris,
+    const GpuBVHNode* __restrict__ nodes, const typename Ops::Item* __restrict__ prims,
     const int* __restrict__ primIds, const Vec3* __restrict__ points, int count, int k,
     GpuClosestResult* __restrict__ out) {
     const int idx = blockIdx.x * kBlock + threadIdx.x;
@@ -182,8 +183,7 @@ __global__ __launch_bounds__(kBlock) void kNearestKernel(
             if (nd.left < 0) {
                 const int slot = -nd.left - 1;
                 ++triTests;
-                const ClosestHit h = closestPointOnTriangle(p, tris[slot]);
-                const KnnEntry e{h.dist2, primIds[slot]};
+                const KnnEntry e{Ops::dist2(p, prims[slot]), primIds[slot]};
                 if (n == k && !knnBetter(e, best[k - 1])) continue;
                 knnInsert(best, n, k, e);
                 continue;
@@ -244,9 +244,9 @@ __device__ __forceinline__ bool radiusVisit(const Vec3& p, const GpuBVHNode& nd,
     return distanceSquaredToAABB(p, nodeBox(nd)) <= r2;
 }
 
-template <bool kStats>
+template <typename Ops, bool kStats>
 __global__ __launch_bounds__(kBlock) void radiusCountKernel(
-    const GpuBVHNode* __restrict__ nodes, const Tri* __restrict__ tris,
+    const GpuBVHNode* __restrict__ nodes, const typename Ops::Item* __restrict__ prims,
     const Vec3* __restrict__ points, int count, float r2, int* __restrict__ counts) {
     const int idx = blockIdx.x * kBlock + threadIdx.x;
     const bool active = idx < count;
@@ -272,7 +272,7 @@ __global__ __launch_bounds__(kBlock) void radiusCountKernel(
             if (nd.left < 0) {
                 const int slot = -nd.left - 1;
                 ++triTests;
-                if (closestPointOnTriangle(p, tris[slot]).dist2 <= r2) ++found;
+                if (Ops::dist2(p, prims[slot]) <= r2) ++found;
                 continue;
             }
 
@@ -298,8 +298,9 @@ __global__ __launch_bounds__(kBlock) void radiusCountKernel(
     }
 }
 
+template <typename Ops>
 __global__ __launch_bounds__(kBlock) void radiusFillKernel(
-    const GpuBVHNode* __restrict__ nodes, const Tri* __restrict__ tris,
+    const GpuBVHNode* __restrict__ nodes, const typename Ops::Item* __restrict__ prims,
     const int* __restrict__ primIds, const Vec3* __restrict__ points, int count, float r2,
     const int* __restrict__ offsets, unsigned long long* __restrict__ keys) {
     const int idx = blockIdx.x * kBlock + threadIdx.x;
@@ -319,14 +320,14 @@ __global__ __launch_bounds__(kBlock) void radiusFillKernel(
 
         if (nd.left < 0) {
             const int slot = -nd.left - 1;
-            const ClosestHit h = closestPointOnTriangle(p, tris[slot]);
-            if (h.dist2 > r2) continue;
-            const int tri = primIds[slot];
+            const float d2 = Ops::dist2(p, prims[slot]);
+            if (d2 > r2) continue;
+            const int prim = primIds[slot];
             // 非负浮点的位模式就是升序整数，拼上场景索引后按 64 位键升序排
-            // 就等价于 closerHit 的 (dist2, 索引) 字典序。三角形索引随键一起排，
+            // 就等价于 closerHit 的 (dist2, 索引) 字典序。图元索引随键一起排，
             // 不用再维护第二个数组。
-            keys[write] = (static_cast<unsigned long long>(__float_as_uint(h.dist2)) << 32) |
-                          static_cast<unsigned int>(tri);
+            keys[write] = (static_cast<unsigned long long>(__float_as_uint(d2)) << 32) |
+                          static_cast<unsigned int>(prim);
             ++write;
         } else {
             // 和计数那一遍一样在溢出处停下，否则写指针会越出本查询点的段。
@@ -407,7 +408,8 @@ void destroyPointBufferGPU(GpuPointBuffer& buf) {
     buf = GpuPointBuffer{};
 }
 
-double closestPointGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
+template <typename Ops>
+double closestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
     if (buf.count <= 0 || bvh.nodeCount <= 0) return 0.0;
 
     gLastStats = GpuQueryStats{};
@@ -423,15 +425,17 @@ double closestPointGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats
 
     const int blocks = (buf.count + kBlock - 1) / kBlock;
     const auto* nodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
-    const auto* tris = static_cast<const Tri*>(bvh.d_tris);
+    const auto* prims = static_cast<const typename Ops::Item*>(bvh.d_tris);
     const auto* primIds = static_cast<const int*>(bvh.d_primIds);
     const auto* points = static_cast<const Vec3*>(buf.d_points);
     auto* out = static_cast<GpuClosestResult*>(buf.d_results);
 
     if (collectStats) {
-        closestPointKernel<true><<<blocks, kBlock>>>(nodes, tris, primIds, points, buf.count, out);
+        closestPointKernel<Ops, true><<<blocks, kBlock>>>(nodes, prims, primIds, points, buf.count,
+                                                          out);
     } else {
-        closestPointKernel<false><<<blocks, kBlock>>>(nodes, tris, primIds, points, buf.count, out);
+        closestPointKernel<Ops, false><<<blocks, kBlock>>>(nodes, prims, primIds, points, buf.count,
+                                                           out);
     }
 
     cudaOk(cudaGetLastError(), "closest point");
@@ -453,7 +457,18 @@ double closestPointGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats
     return static_cast<double>(ms);
 }
 
-double kNearestGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats) {
+double closestPointGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
+    return closestImpl<TriOps>(bvh, buf, collectStats);
+}
+
+// 点云最近点：同一条遍历，只是叶子载荷换成 Vec3、距离换成点距。
+// 输出的 triangle 字段装的是点索引。
+double closestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
+    return closestImpl<PointOps>(bvh, buf, collectStats);
+}
+
+template <typename Ops>
+double kNearestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats) {
     if (buf.count <= 0 || bvh.nodeCount <= 0) return 0.0;
     if (k < 1 || k > kMaxKnn) {
         throw std::runtime_error("kNearestGPU: k must be in [1, 32]");
@@ -475,15 +490,17 @@ double kNearestGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectSt
 
     const int blocks = (buf.count + kBlock - 1) / kBlock;
     const auto* nodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
-    const auto* tris = static_cast<const Tri*>(bvh.d_tris);
+    const auto* prims = static_cast<const typename Ops::Item*>(bvh.d_tris);
     const auto* primIds = static_cast<const int*>(bvh.d_primIds);
     const auto* points = static_cast<const Vec3*>(buf.d_points);
     auto* out = static_cast<GpuClosestResult*>(buf.d_results);
 
     if (collectStats) {
-        kNearestKernel<true><<<blocks, kBlock>>>(nodes, tris, primIds, points, buf.count, k, out);
+        kNearestKernel<Ops, true><<<blocks, kBlock>>>(nodes, prims, primIds, points, buf.count, k,
+                                                      out);
     } else {
-        kNearestKernel<false><<<blocks, kBlock>>>(nodes, tris, primIds, points, buf.count, k, out);
+        kNearestKernel<Ops, false><<<blocks, kBlock>>>(nodes, prims, primIds, points, buf.count, k,
+                                                       out);
     }
 
     cudaOk(cudaGetLastError(), "k nearest");
@@ -505,8 +522,17 @@ double kNearestGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectSt
     return static_cast<double>(ms);
 }
 
-double radiusQueryGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuRadiusBuffer& out,
-                      bool collectStats) {
+double kNearestGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats) {
+    return kNearestImpl<TriOps>(bvh, buf, k, collectStats);
+}
+
+double kNearestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats) {
+    return kNearestImpl<PointOps>(bvh, buf, k, collectStats);
+}
+
+template <typename Ops>
+double radiusQueryImpl(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuRadiusBuffer& out,
+                       bool collectStats) {
     out = GpuRadiusBuffer{};
     if (buf.count <= 0 || bvh.nodeCount <= 0) return 0.0;
 
@@ -537,14 +563,14 @@ double radiusQueryGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuR
 
     const int blocks = (n + kBlock - 1) / kBlock;
     const auto* nodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
-    const auto* tris = static_cast<const Tri*>(bvh.d_tris);
+    const auto* prims = static_cast<const typename Ops::Item*>(bvh.d_tris);
     const auto* primIds = static_cast<const int*>(bvh.d_primIds);
     const auto* points = static_cast<const Vec3*>(buf.d_points);
 
     if (collectStats) {
-        radiusCountKernel<true><<<blocks, kBlock>>>(nodes, tris, points, n, r2, dCounts);
+        radiusCountKernel<Ops, true><<<blocks, kBlock>>>(nodes, prims, points, n, r2, dCounts);
     } else {
-        radiusCountKernel<false><<<blocks, kBlock>>>(nodes, tris, points, n, r2, dCounts);
+        radiusCountKernel<Ops, false><<<blocks, kBlock>>>(nodes, prims, points, n, r2, dCounts);
     }
     cudaOk(cudaGetLastError(), "radius count");
 
@@ -574,7 +600,8 @@ double radiusQueryGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuR
         const size_t bytes = static_cast<size_t>(total);
         cudaOk(cudaMalloc(&dKeys, bytes * sizeof(uint64_t)), "radius keys");
 
-        radiusFillKernel<<<blocks, kBlock>>>(nodes, tris, primIds, points, n, r2, dOffsets, dKeys);
+        radiusFillKernel<Ops><<<blocks, kBlock>>>(nodes, prims, primIds, points, n, r2, dOffsets,
+                                                  dKeys);
         cudaOk(cudaGetLastError(), "radius fill");
 
         if (maxSeg <= kRadiusSortCap) {
@@ -629,6 +656,18 @@ double radiusQueryGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuR
     out.count = n;
     out.total = total;
     return static_cast<double>(ms);
+}
+
+double radiusQueryGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuRadiusBuffer& out,
+                      bool collectStats) {
+    return radiusQueryImpl<TriOps>(bvh, buf, radius, out, collectStats);
+}
+
+// 点云的半径查询：CSR 的键里装点索引，短段的 warp 双调排序和长段的 CUB
+// 分段排序都与三角形路径共用。
+double radiusQueryVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
+                            GpuRadiusBuffer& out, bool collectStats) {
+    return radiusQueryImpl<PointOps>(bvh, buf, radius, out, collectStats);
 }
 
 void destroyRadiusBufferGPU(GpuRadiusBuffer& buf) {

@@ -69,3 +69,51 @@ std::vector<ClosestHit> radiusBrute(const Scene& scene, const Vec3& p, float rad
     std::sort(out.begin(), out.end(), closerHit);
     return out;
 }
+
+namespace {
+
+ClosestHit vertexHit(const Vec3& p, const Vec3& v, int index) {
+    ClosestHit h;
+    h.found = true;
+    h.point = v;
+    const Vec3 d = p - v;
+    h.dist2 = dot(d, d);
+    h.triangle = index;
+    return h;
+}
+
+}  // namespace
+
+ClosestHit closestVertexBrute(const PointCloud& cloud, const Vec3& p) {
+    ClosestHit best;
+    for (int i = 0; i < static_cast<int>(cloud.pts.size()); ++i) {
+        const ClosestHit h = vertexHit(p, cloud.pts[i], i);
+        if (!best.found || h.dist2 < best.dist2) best = h;
+    }
+    return best;
+}
+
+std::vector<ClosestHit> kNearestVertexBrute(const PointCloud& cloud, const Vec3& p, int k) {
+    std::vector<ClosestHit> all;
+    all.reserve(cloud.pts.size());
+    for (int i = 0; i < static_cast<int>(cloud.pts.size()); ++i) {
+        all.push_back(vertexHit(p, cloud.pts[i], i));
+    }
+
+    const size_t n = std::min(all.size(), static_cast<size_t>(std::max(k, 0)));
+    std::partial_sort(all.begin(), all.begin() + n, all.end(), closerHit);
+    all.resize(n);
+    return all;
+}
+
+std::vector<ClosestHit> radiusVertexBrute(const PointCloud& cloud, const Vec3& p, float radius) {
+    std::vector<ClosestHit> out;
+    const float r2 = radius * radius;
+    for (int i = 0; i < static_cast<int>(cloud.pts.size()); ++i) {
+        const ClosestHit h = vertexHit(p, cloud.pts[i], i);
+        if (h.dist2 > r2) continue;
+        out.push_back(h);
+    }
+    std::sort(out.begin(), out.end(), closerHit);
+    return out;
+}

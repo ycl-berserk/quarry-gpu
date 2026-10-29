@@ -6,9 +6,11 @@
 #include <vector>
 
 #include "core/fingerprint.h"
+#include "core/point_cloud.h"
 #include "core/scene.h"
 #include "cpu/brute.h"
 #include "cpu/bvh.h"
+#include "cpu/point_kd.h"
 
 namespace {
 
@@ -240,6 +242,59 @@ void testBVHShape() {
     check(bvhDepth(bvh) < 64, "BVH depth fits traversal stack");
 }
 
+// 点云 kd-tree 与暴力法：距离、索引、并列顺序三者都要一致。
+void testPointKdEqualsBrute() {
+    PointCloudSpec spec;
+    spec.kind = "sheet";
+    spec.count = 4096;
+    spec.seed = 3;
+    const PointCloud cloud = buildPointCloud(spec);
+    check(cloud.pts.size() == 4096, "point cloud keeps every point");
+
+    const PointKdTree tree = buildPointKdTree(cloud);
+    const std::vector<Vec3> points = makeQueryPoints(cloud.bounds, 100, 17);
+    const float radius = 0.08f * length(cloud.bounds.extent());
+
+    bool closestSame = true;
+    bool knnSame = true;
+    bool radiusSame = true;
+    bool distOk = true;
+
+    for (const Vec3& p : points) {
+        const ClosestHit b = closestVertexBrute(cloud, p);
+        const ClosestHit k = kdClosest(tree, p);
+        if (b.found != k.found || b.triangle != k.triangle) closestSame = false;
+        if (std::fabs(b.dist2 - k.dist2) > 1e-6f) distOk = false;
+
+        const auto bk = kNearestVertexBrute(cloud, p, 8);
+        const auto kk = kdKNearest(tree, p, 8);
+        if (bk.size() != kk.size()) {
+            knnSame = false;
+        } else {
+            for (size_t i = 0; i < bk.size(); ++i) {
+                if (bk[i].triangle != kk[i].triangle) knnSame = false;
+                if (std::fabs(bk[i].dist2 - kk[i].dist2) > 1e-6f) distOk = false;
+            }
+        }
+
+        const auto br = radiusVertexBrute(cloud, p, radius);
+        const auto kr = kdRadius(tree, p, radius);
+        if (br.size() != kr.size()) {
+            radiusSame = false;
+        } else {
+            for (size_t i = 0; i < br.size(); ++i) {
+                if (br[i].triangle != kr[i].triangle) radiusSame = false;
+                if (std::fabs(br[i].dist2 - kr[i].dist2) > 1e-6f) distOk = false;
+            }
+        }
+    }
+
+    check(closestSame, "point kd: closest matches brute force");
+    check(knnSame, "point kd: kNN matches brute force");
+    check(radiusSame, "point kd: radius matches brute force");
+    check(distOk, "point kd: distances agree");
+}
+
 void testDeterminism() {
     SceneSpec spec;
     spec.kind = "random";
@@ -278,6 +333,7 @@ bool runSelfTest() {
     testBruteEqualsBVH();
     testQueryBruteEqualsBVH();
     testBVHShape();
+    testPointKdEqualsBrute();
     testDeterminism();
 
     std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "SELFTEST PASS" : "SELFTEST FAIL",

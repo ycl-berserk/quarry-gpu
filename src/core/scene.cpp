@@ -4,13 +4,13 @@
 
 #include "core/rng.h"
 
-namespace {
-
 float terrainHeight(float x, float z) {
     return 3.0f * std::sin(0.13f * x) * std::cos(0.11f * z)
          + 1.2f * std::sin(0.37f * x + 0.7f) * std::sin(0.31f * z + 1.3f)
          + 0.4f * std::sin(0.90f * x) * std::sin(0.80f * z);
 }
+
+namespace {
 
 Scene makeTerrain(int grid) {
     Scene scene;

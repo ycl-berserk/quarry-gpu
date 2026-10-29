@@ -224,11 +224,100 @@ def main():
     check("second partial update validate", scene.validate() == "", scene.validate())
     check_closest(scene, points, again, "second partial update closest")
 
+    # ---- 点云：与 numpy 暴力法逐位对拍 ----
+    npts = 20000
+    nq = 200
+    pts = (lo + (hi - lo) * rng.random((npts, 3))).astype(np.float32)
+    cloud = quarry.PointCloud(pts)
+    check("point_count", cloud.point_count == npts, cloud.point_count)
+    check("point node_count", cloud.node_count == 2 * npts - 1, cloud.node_count)
+    check("point validate", cloud.validate() == "", cloud.validate())
+    check("point build_ms", cloud.build_ms > 0.0, cloud.build_ms)
+    plo, phi = np.array(cloud.bounds["min"]), np.array(cloud.bounds["max"])
+    check("point bounds", np.allclose(plo, pts.min(axis=0), atol=1e-6)
+          and np.allclose(phi, pts.max(axis=0), atol=1e-6))
+
+    q = (lo + (hi - lo) * rng.random((nq, 3))).astype(np.float32)
+    diff = pts[None, :, :] - q[:, None, :]
+    # float32 逐点平方距离：和 GPU 的 dot(d,d) 同顺序，可以要求位模式一致。
+    d2 = (diff * diff).sum(axis=-1, dtype=np.float32)
+    rows = np.arange(nq)
+
+    ref_best = d2.argmin(axis=1)
+    ref_d2 = d2[rows, ref_best]
+    cdist2, cidx = cloud.closest(q)
+    check("point closest dist2 bitwise",
+          np.array_equal(cdist2.view(np.uint32), ref_d2.view(np.uint32)),
+          f"{(cdist2.view(np.uint32) != ref_d2.view(np.uint32)).sum()} differ")
+    check("point closest ids", np.array_equal(cidx, ref_best.astype(np.int32)),
+          f"{(cidx != ref_best).sum()} mismatches")
+    check("point last_query_ms", cloud.last_query_ms > 0.0, cloud.last_query_ms)
+
+    ck = 4
+    ckd, ckid = cloud.knn(q, ck)
+    kd_ok = True
+    for i in range(nq):
+        # stable sort：距离并列时保持原始索引升序，正是 (dist2, index) 字典序。
+        order = np.argsort(d2[i], kind="stable")[:ck]
+        kd_ok &= np.array_equal(ckid[i], order.astype(np.int32))
+        kd_ok &= np.array_equal(ckd[i].view(np.uint32), d2[i][order].view(np.uint32))
+    check("point knn bitwise", kd_ok)
+
+    cradius = 0.08 * float(np.linalg.norm(phi - plo))
+    coff, crd2, crid = cloud.radius(q, cradius)
+    check("point radius offsets", coff.shape == (nq + 1,) and coff[0] == 0
+          and coff[-1] == len(crid))
+    cr_ok = True
+    for i in range(nq):
+        want = np.nonzero(d2[i] <= cradius * cradius)[0]
+        want = want[np.argsort(d2[i][want], kind="stable")]
+        got = crid[coff[i]:coff[i + 1]]
+        cr_ok &= np.array_equal(got, want.astype(np.int32))
+        cr_ok &= np.array_equal(crd2[coff[i]:coff[i + 1]].view(np.uint32),
+                                d2[i][want].view(np.uint32))
+    check("point radius bitwise", cr_ok)
+
+    # 增量更新：先整体平移，再只改一个子集
+    moved = pts.copy()
+    moved[:, 1] += np.float32(0.1)
+    cloud.update_points(moved)
+    check("point update validate", cloud.validate() == "", cloud.validate())
+    check("point update refit_ms", cloud.refit_ms > 0.0, cloud.refit_ms)
+    check("point update uploaded everything", cloud.refit_stats["updated"] == npts,
+          cloud.refit_stats["updated"])
+    move_diff = moved[None, :, :] - q[:, None, :]
+    d2_moved = (move_diff * move_diff).sum(axis=-1, dtype=np.float32)
+    best_moved = d2_moved.argmin(axis=1)
+    mdist2, midx = cloud.closest(q)
+    check("point update closest bitwise",
+          np.array_equal(midx, best_moved.astype(np.int32))
+          and np.array_equal(mdist2.view(np.uint32),
+                             d2_moved[rows, best_moved].view(np.uint32)))
+
+    partial_pts = moved.copy()
+    dirty_pts = np.array([0, 3, 17, npts - 1], dtype=np.int32)
+    partial_pts[dirty_pts] += np.array([0.0, 0.5, 0.0], dtype=np.float32)
+    cloud.update_points(partial_pts, dirty=dirty_pts)
+    check("point partial validate", cloud.validate() == "", cloud.validate())
+    check("point partial updated count", cloud.refit_stats["updated"] == len(dirty_pts),
+          cloud.refit_stats["updated"])
+    p_diff = partial_pts[None, :, :] - q[:, None, :]
+    d2_partial = (p_diff * p_diff).sum(axis=-1, dtype=np.float32)
+    best_partial = d2_partial.argmin(axis=1)
+    pdist2, pidx = cloud.closest(q)
+    check("point partial closest bitwise",
+          np.array_equal(pidx, best_partial.astype(np.int32))
+          and np.array_equal(pdist2.view(np.uint32),
+                             d2_partial[rows, best_partial].view(np.uint32)))
+
     for bad_call in (lambda: quarry.Scene(np.zeros((5, 3), dtype=np.float32)),
+                     lambda: quarry.PointCloud(np.zeros((1, 3), dtype=np.float32)),
                      lambda: scene.knn(points, 0),
                      lambda: scene.knn(points, 33),
+                     lambda: cloud.knn(q, 33),
                      lambda: scene.raycast(points, dirs[:-1]),
                      lambda: scene.update_triangles(partial[:10]),
+                     lambda: cloud.update_points(pts[:10]),
                      lambda: face_scene.update_vertices(lifted)):
         try:
             bad_call()
