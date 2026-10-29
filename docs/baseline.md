@@ -752,6 +752,45 @@ Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
 6. 默认 `QueryOrder::Input`，阈值不是普适常数；原始日志 `out/query_sort_final.txt`、
    `out/query_sort_gauss.txt`（gitignore）。
 
+## 宽节点（M3 续，2026-10-30）
+
+`--wide` 在建树后把相邻两层二叉节点折叠成 4 宽节点（`GpuBVH4Node`，128 B =
+4 × 32 B 槽；`wideId` 由 CUB 前缀和生成）。拓扑、叶子顺序、图元划分不变，遍历
+结果与二叉逐位相同。折叠成本 131k 0.17 ms、2M 1.93 ms；宽节点显存与二叉持平
+（2M 各约 134 MB，宽节点 1,049,137 个）。
+
+**口径**：纵向对照，同会话、同一 exe、同一批输入，关/开 `--wide` 各 5 轮中位数，
+3 s DVFS 预热（高斯同样跑 5 轮）。宽 BVH 是 Embree / tinybvh 的标准结构
+（Aila & Laine 2009 一脉），本节是**结构对齐**实验，单射线/单查询、Morton 划分，
+未配 SIMD packet / SAH；横向绝对吞吐仍以上文口径为准，本节不改分母。
+
+| 场景 | 工作负载 | 二叉 | 4 宽 | 倍数 |
+|---|---|---|---|---|
+| 地形 2M | 射线 1M，输入序 | 16.00 | 9.31 | 1.72× |
+| 地形 2M | 射线 1M，Morton 序 | 4.27 | 4.23 | 1.01× |
+| 地形 131k | 射线 1M，输入序 | 6.96 | 5.21 | 1.29× |
+| 地形 2M | closest 100k | 27.55 | 16.33 | 1.69× |
+| 地形 2M | closest 100k + 排序 | 16.57 | 14.80 | 1.12×（端到端 1.86×） |
+| 地形 2M | kNN8 100k | 36.49 | 25.72 | 1.42× |
+| 地形 131k | closest 20k | 1.469 | 1.383 | 1.06× |
+| 点云 1M | closest / kNN8 / radius 50k | 9.34 / 19.59 / 69.46 | 6.75 / 14.62 / 68.87 | 1.38× / 1.34× / 1.01× |
+| 高斯 1M | closest / kNN8 / radius 20k | 18.64 / 36.26 / 114.29 | 14.56 / 27.94 / 92.48 | 1.28× / 1.30× / 1.24× |
+
+读法：
+
+1. **省的是取数，不是比较**：2M 射线节点测试 47.2 → 24.4（宽路径按"成功盒子测试"
+   计，与二叉同单位），图元测试不变；点云 1M closest 节点测试 198.0 → 122.6。
+2. **与查询/射线排序省的不是同一笔钱**：射线排序后二叉已 4.27 ms，宽 4.23 ms
+   （≈1.0×）；点查询宽 + 排序仍有 1.12×，叠加后端到端 1.86×，是 2M closest 目前
+   的最好数字。
+3. **radius 分图元**：点云持平（两遍遍历 + CSR 写入占大头），高斯 1.24×（椭球距离
+   算术重，少读节点仍值）。随机方向次生射线遍历太浅，无收益。
+4. **逐位不变**：2M 100 万射线逐条对拍 `hit_mismatch=0 t_mismatch=0`；三角形 131k、
+   点云 131k、高斯 131k 三条查询在二叉/宽下指纹相同，与 CPU 参考三种 `*_mismatch=0`。
+5. **宽节点 + refit 未接**：refit 改的是二叉盒子，宽节点是拷贝，会变旧；基准
+   `--wide --refit` 直接拒绝。接法是 refit 后用保留的 `wideId` 重跑一次折叠。
+6. 默认 `wide=false`；原始日志 `out/wide_*.txt`（gitignore）。
+
 ## 结论
 
 1. **CPU 吞吐随场景大小塌陷一个数量级。** 13 万三角形受缓存保护，32 线程能到 96 Mrays/s；200 万三角形掉到 19.7，属于结构性访存受限，增加线程无用。
@@ -784,6 +823,7 @@ Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
     Warp 是 SAH + 每叶 4 个图元。把 Morton 相邻三角形批量成叶子已实测是负优化
     （射线 2.2× 慢、kNN 1.8× 慢），差距来自构建器的树质量，不是叶子粒度本身；
     要继续追，应该上 GPU 自顶向下 SAH（或 BVH4 宽节点），而不是改叶子大小。
+    宽节点已于 10-30 落地（见「宽节点」一节），SAH 仍未做。
     Warp 的结果是 float32 精度（同位但末位不同），我们是与 CPU 参考逐位相同。
 12. **点云把"延迟受限"推到极端。** closest 每查询只做 110–393 次节点测试，GPU 对
     同进程单线程 kd 是 32× / 27× / 55×——倍数随规模**上升**，因为 kd 每次下潜更贵
@@ -805,6 +845,11 @@ Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
     求根器必须用"有符号保证的括号 + 牛顿/二分兜底"：纯牛顿 12 轮仍差 12%，球近似
     初值在扁椭球上会给出 30% 误差；最终 14 轮、无提前退出，float64 参考误差 1.7e-7，
     CPU/GPU 指纹逐位一致。
+16. **宽节点把"读得少"变成直接收益，但只对非相干访问有效。** 2M 未排序射线
+    1.72×、closest 1.69×、kNN 1.42×；射线一旦按 Morton 排序（二叉已 4.27 ms），
+    宽节点 1.01×。点查询上两者可叠加：宽 + 排序端到端 1.86×。点云 radius 持平、
+    高斯三条查询 1.24–1.38×。结构上对齐 Embree 的 BVH4 传统，但仍是单射线/单查询
+    与 Morton 划分，不能据此宣称追平 Embree。
 
 
 ## 正确性交叉核对
@@ -904,6 +949,16 @@ build\gpu_query_bench.exe --grid 1024 --points 200000 --runs 5 --no-cpu --stats 
 build\gpu_query_bench.exe --grid 1024 --points 100000 --runs 5 --no-cpu --query knn --k 8 --query-sort
 build\gpu_query_bench.exe --grid 1024 --points 100000 --runs 5 --no-cpu --query radius --radius 2.0 --query-sort
 build\gpu_gauss_bench.exe --gaussians 10000000 --queries 100000 --runs 3 --no-cpu --no-verify --query-sort
+
+:: 宽节点（成对跑：同一条命令去掉 --wide 即二叉基线）
+build\gpu_bench.exe --grid 1024 --rays 1000000 --runs 5 --no-cpu --wide
+build\gpu_bench.exe --grid 1024 --rays 1000000 --runs 5 --no-cpu --ray-sort --wide
+build\gpu_query_bench.exe --grid 1024 --points 100000 --runs 5 --no-cpu --wide --query-sort
+build\gpu_query_bench.exe --grid 1024 --points 100000 --query knn --k 8 --runs 5 --no-cpu --wide
+build\gpu_cloud_bench.exe --points 1048576 --queries 50000 --no-cpu --wide
+build\gpu_cloud_bench.exe --points 1048576 --queries 50000 --query radius --no-cpu --wide
+build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --no-cpu --wide
+build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --query knn --k 8 --no-cpu --wide
 ```
 
 ## 已知缺口
@@ -927,8 +982,12 @@ build\gpu_gauss_bench.exe --gaussians 10000000 --queries 100000 --runs 3 --no-cp
   分母是自写单线程椭球 BVH；语义仅"椭球实体"，Mahalanobis 密度与屏幕空间投影未做
 - 高斯每个 40 字节，10M 是 400 MB 载荷 + 640 MB 节点内存；无叶子批量
 - 椭球距离固定 14 轮、无提前退出（CPU/GPU 逐位一致的代价），最差距离误差 1.7e-7
-- Morton 叶子批量（4–8 图元/叶）实测负结果，已回退到每叶 1 个；追 Warp 需要
-  GPU 自顶向下 SAH 或宽节点，不在 M1 范围
+- Morton 叶子批量（4–8 图元/叶）实测负结果，已回退到每叶 1 个；BVH4 宽节点已
+  落地，追 Warp 的树质量仍需 GPU 自顶向下 SAH
 - 查询排序只在 ≥10 万查询的三角形场景证明有效；20k 低占用下的延迟假说未做单独
   实验，radius 没有收益，高斯小批次倒退。分块排序与按深度分桶未做
+- 宽节点暂不支持 refit（宽盒子是二叉盒子的拷贝，refit 后会变旧，基准直接拒绝）；
+  重折叠与"只重发脏祖先"未接。射线已排序时宽节点无收益，次生射线遍历太浅，同样无收益
+- 宽节点未配 SIMD packet（单射线/单查询）、未接 SAH；BVH8 未试。每宽节点读 128 B
+  在本机 L2（24 MB）上的收益随树规模变化，更小场景只有 1.06–1.29×
 - 第一轮结果（不同场景、20 万条射线）已作废，勿引用

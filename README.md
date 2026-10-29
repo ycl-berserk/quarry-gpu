@@ -8,7 +8,8 @@ GPU 原生空间查询引擎：构建加速结构（BVH / 八叉树 / 哈希网�
 并行 LBVH 构建、光线遍历、closest / kNN / radius 三条点查询路径，拓扑冻结的增量更新
 （refit），以及**三种图元**：三角形、点云、高斯。三者共用同一棵 LBVH 与同一套查询，
 只在叶子里换"测什么"——高斯的叶子测试是精确的**点到椭球实体**距离。查询批次可以按
-Morton 序重排（`--query-sort` / Python 的 `order="morton"`），默认关闭。
+Morton 序重排（`--query-sort` / Python 的 `order="morton"`），二叉节点可以折叠成
+4 宽节点（`--wide`），两者默认关闭、可叠加。
 没有 CUDA 工具链时自动降级为纯 CPU 构建，CI 与本文档的 CPU 数字不受影响。
 
 ## 现在能跑什么
@@ -27,6 +28,8 @@ build\gpu_query_bench.exe --grid 256 --points 20000 --query knn --k 16        ::
 build\gpu_query_bench.exe --grid 256 --points 20000 --query radius --radius 2.0  :: GPU 半径查询
 build\gpu_query_bench.exe --grid 256 --points 20000 --refit --refit-dirty 0.01  :: 局部 / 全量 refit + 重建对照
 build\gpu_query_bench.exe --grid 1024 --points 100000 --query-sort           :: 查询点按 Morton 序重排后再遍历
+build\gpu_bench.exe --grid 1024 --rays 1000000 --runs 5 --wide              :: 4 宽节点折叠后再遍历（--ray-sort 叠加）
+build\gpu_query_bench.exe --grid 1024 --points 100000 --wide --query-sort   :: 宽节点 + 查询重排（可叠加）
 
 build\gpu_cloud_bench.exe --points 131072 --queries 20000                   :: 点云 closest，GPU 对 kd-tree
 build\gpu_cloud_bench.exe --points 1048576 --queries 20000 --query knn --k 8
@@ -269,6 +272,43 @@ sheet 点云（x/z ∈ [-50, 50]，y 贴地形面 + 2 cm 抖动），20,000 个�
 hit, t = scene.closest(points, order="morton")   # 默认 order="input"
 ```
 
+## 宽节点（M3 续，2026-10-30）
+
+`--wide` 在建树后把相邻两层二叉节点折叠成 **4 宽节点**（128 B = 4 × 32 B 槽）：
+宽节点根是偶数深度内部节点，槽位装孩子/孙子的盒子或叶子下标，内部孙节点装
+`wideId`（CUB 前缀和生成）。树拓扑、叶子顺序、图元划分完全不动，只是把
+"每个节点读 32 B、几乎每次一个新事务"变成"一次读 128 B、四路比较在寄存器里"。
+折叠成本 131k 0.17 ms、2M 1.93 ms；宽节点显存与二叉基本持平（2M 上各约 134 MB）。
+
+**基线口径**：纵向对照，同一实现、同一会话、同一批输入，关/开 `--wide` 成对跑，
+5 轮中位数，3 s 预热。宽 BVH 本身是 Embree / tinybvh 的标准结构（Aila & Laine 2009
+一脉），这里是**结构对齐**，单射线/单查询、Morton 划分，未配 SIMD packet / SAH，
+绝对吞吐仍按 `docs/baseline.md` 的口径。
+
+| 场景 | 工作负载 | 二叉 | 4 宽 | 倍数 |
+|---|---|---|---|---|
+| 地形 2M | 射线 1M，输入序 | 16.00 ms | **9.31 ms** | **1.72×** |
+| 地形 2M | 射线 1M，Morton 序 | 4.27 ms | 4.23 ms | 1.01× |
+| 地形 131k | 射线 1M，输入序 | 6.96 ms | **5.21 ms** | **1.29×** |
+| 地形 2M | closest，100k | 27.55 ms | **16.33 ms** | **1.69×** |
+| 地形 2M | closest + 排序，100k | 16.57 ms | **14.80 ms** | 1.12×（端到端 1.86×） |
+| 地形 2M | kNN k=8，100k | 36.49 ms | **25.72 ms** | **1.42×** |
+| 点云 1M | closest / kNN8 / radius，50k | 9.34 / 19.59 / 69.46 ms | 6.75 / 14.62 / 68.87 ms | 1.38× / 1.34× / 1.01× |
+| 高斯 1M | closest / kNN8 / radius，20k | 18.64 / 36.26 / 114.29 ms | 14.56 / 27.94 / 92.48 ms | 1.28× / 1.30× / 1.24× |
+
+- **省的是取数，不是比较**：2M 射线节点测试 47.2 → 24.4（宽路径按"成功盒子测试"
+  计，同单位），图元测试不变。
+- **与排序省的不是同一笔钱**：射线排序后二叉已 4.27 ms，宽 4.23 ms（≈1.0×）；
+  点查询宽 + 排序叠加到 **1.86×**，是目前 2M closest 的最好数字。
+- **点云 radius 持平**（遍历不是瓶颈）；**高斯 radius 1.24×**（椭球距离计算重，
+  少读节点仍划算）。随机方向次生射线遍历太浅，无收益。
+- **逐位不变**：2M 射线逐条对拍零失配；三角形/点云/高斯三条查询指纹与二叉路径
+  完全相同，与 CPU 参考 `id/dist/count_mismatch=0`。
+- `--wide --refit` 暂不支持（宽节点盒子是二叉盒子的拷贝，refit 后会变旧），
+  基准直接拒绝；接法是 refit 后用保留的 `wideId` 重跑一次折叠。
+- 库默认 `wide=false`：收益依赖树规模与访问模式，代码不替用户猜。教程见
+  `Quarry-学习路径/11-宽节点.md`。
+
 ## Python 绑定
 
 有 Python 3.8+ 和 `pip install pybind11 numpy` 时，`build.bat` 会顺带把扩展模块建到
@@ -420,5 +460,9 @@ learn/        教程配套的单文件练习
 - refit 拓扑冻结：不增删、不重排三角形；局部路径只合并脏叶子的祖先，但逐层 launch
   的数量不变，小场景里启动开销开始主导
 - BVH 每叶 1 个三角形，2M 场景 419 万节点；Morton 叶子批量（4–8 个/叶）实测
-  遍历更慢（射线 2.2×、kNN 1.8×），已回退。Warp 的叶子 4 个配的是 SAH 建树，
-  要追这 1.2–1.4× 需要 GPU 自顶向下 SAH 或 BVH4 宽节点
+  遍历更慢（射线 2.2×、kNN 1.8×），已回退。BVH4 宽节点已落地（`--wide`），
+  要追 Warp 的树质量还需 GPU 自顶向下 SAH
+- 宽节点暂不支持 refit：宽盒子是二叉盒子的拷贝，refit 后变旧，基准直接拒绝；
+  重折叠与只重发脏祖先未接。射线已 Morton 排序时宽节点无收益（≈1.0×），
+  非相干次生射线遍历太浅，同样无收益
+- 宽节点是单射线/单查询路径，没有 SIMD packet；BVH8 未试
