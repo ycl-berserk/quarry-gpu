@@ -29,6 +29,12 @@ using I32Array = py::array_t<int32_t, py::array::c_style | py::array::forcecast>
 // 三者的区别只在 gpu/prim_ops.h 里的距离函数。
 enum class LeafKind { Triangle, Vertex, Gaussian };
 
+QueryOrder parseQueryOrder(const std::string& s) {
+    if (s == "input") return QueryOrder::Input;
+    if (s == "morton") return QueryOrder::Morton;
+    throw std::invalid_argument("order must be 'input' or 'morton'");
+}
+
 std::vector<Tri> trianglesFromArray(const F32Array& arr) {
     if (arr.ndim() != 3 || arr.shape(1) != 3 || arr.shape(2) != 3) {
         throw std::invalid_argument("triangles must have shape (M, 3, 3)");
@@ -160,7 +166,8 @@ py::dict boundsDict(const AABB& box) {
 // ---- 三条查询的"跑 + 拷回 + 打包"流水线 ----
 // kind 只决定叶子载荷与距离函数；三条路径的输出格式完全一样，
 // 所以打包代码只写一份。
-py::tuple closestRun(GpuBVH& bvh, const F32Array& points, LeafKind kind, double* msOut) {
+py::tuple closestRun(GpuBVH& bvh, const F32Array& points, LeafKind kind, QueryOrder order,
+                     double* msOut) {
     const std::vector<Vec3> pts = pointsFromArray(points, "points");
     std::vector<GpuClosestResult> res;
     double ms = 0.0;
@@ -169,9 +176,9 @@ py::tuple closestRun(GpuBVH& bvh, const F32Array& points, LeafKind kind, double*
         GpuPointBuffer buf = uploadPointsGPU(pts, 1);
         try {
             switch (kind) {
-                case LeafKind::Triangle: ms = closestPointGPU(bvh, buf, false); break;
-                case LeafKind::Vertex: ms = closestVertexGPU(bvh, buf, false); break;
-                case LeafKind::Gaussian: ms = closestGaussianGPU(bvh, buf, false); break;
+                case LeafKind::Triangle: ms = closestPointGPU(bvh, buf, false, order); break;
+                case LeafKind::Vertex: ms = closestVertexGPU(bvh, buf, false, order); break;
+                case LeafKind::Gaussian: ms = closestGaussianGPU(bvh, buf, false, order); break;
             }
             res = readQueryResultsGPU(buf);
         } catch (...) {
@@ -192,7 +199,8 @@ py::tuple closestRun(GpuBVH& bvh, const F32Array& points, LeafKind kind, double*
     return py::make_tuple(floatArray(dist2), intArray(idx));
 }
 
-py::tuple knnRun(GpuBVH& bvh, const F32Array& points, int k, LeafKind kind, double* msOut) {
+py::tuple knnRun(GpuBVH& bvh, const F32Array& points, int k, LeafKind kind, QueryOrder order,
+                 double* msOut) {
     if (k < 1 || k > 32) throw std::invalid_argument("k must be in [1, 32]");
     const std::vector<Vec3> pts = pointsFromArray(points, "points");
     std::vector<GpuClosestResult> res;
@@ -202,9 +210,9 @@ py::tuple knnRun(GpuBVH& bvh, const F32Array& points, int k, LeafKind kind, doub
         GpuPointBuffer buf = uploadPointsGPU(pts, k);
         try {
             switch (kind) {
-                case LeafKind::Triangle: ms = kNearestGPU(bvh, buf, k, false); break;
-                case LeafKind::Vertex: ms = kNearestVertexGPU(bvh, buf, k, false); break;
-                case LeafKind::Gaussian: ms = kNearestGaussianGPU(bvh, buf, k, false); break;
+                case LeafKind::Triangle: ms = kNearestGPU(bvh, buf, k, false, order); break;
+                case LeafKind::Vertex: ms = kNearestVertexGPU(bvh, buf, k, false, order); break;
+                case LeafKind::Gaussian: ms = kNearestGaussianGPU(bvh, buf, k, false, order); break;
             }
             res = readQueryResultsGPU(buf);
         } catch (...) {
@@ -234,7 +242,7 @@ py::tuple knnRun(GpuBVH& bvh, const F32Array& points, int k, LeafKind kind, doub
 }
 
 py::tuple radiusRun(GpuBVH& bvh, const F32Array& points, float radius, LeafKind kind,
-                    double* msOut) {
+                    QueryOrder order, double* msOut) {
     if (!(radius >= 0.0f)) throw std::invalid_argument("radius must be >= 0");
     const std::vector<Vec3> pts = pointsFromArray(points, "points");
     std::vector<std::vector<ClosestHit>> hits;
@@ -246,13 +254,13 @@ py::tuple radiusRun(GpuBVH& bvh, const F32Array& points, float radius, LeafKind 
         try {
             switch (kind) {
                 case LeafKind::Triangle:
-                    ms = radiusQueryGPU(bvh, buf, radius, out, false);
+                    ms = radiusQueryGPU(bvh, buf, radius, out, false, order);
                     break;
                 case LeafKind::Vertex:
-                    ms = radiusQueryVertexGPU(bvh, buf, radius, out, false);
+                    ms = radiusQueryVertexGPU(bvh, buf, radius, out, false, order);
                     break;
                 case LeafKind::Gaussian:
-                    ms = radiusQueryGaussianGPU(bvh, buf, radius, out, false);
+                    ms = radiusQueryGaussianGPU(bvh, buf, radius, out, false, order);
                     break;
             }
             hits = readRadiusResultsGPU(out);
@@ -381,16 +389,18 @@ public:
         return py::make_tuple(hit, t);
     }
 
-    py::tuple closest(const F32Array& points) {
-        return closestRun(bvh_, points, LeafKind::Triangle, &lastQueryMs_);
+    py::tuple closest(const F32Array& points, const std::string& order) {
+        return closestRun(bvh_, points, LeafKind::Triangle, parseQueryOrder(order), &lastQueryMs_);
     }
 
-    py::tuple knn(const F32Array& points, int k) {
-        return knnRun(bvh_, points, k, LeafKind::Triangle, &lastQueryMs_);
+    py::tuple knn(const F32Array& points, int k, const std::string& order) {
+        return knnRun(bvh_, points, k, LeafKind::Triangle, parseQueryOrder(order),
+                      &lastQueryMs_);
     }
 
-    py::tuple radius(const F32Array& points, float radius) {
-        return radiusRun(bvh_, points, radius, LeafKind::Triangle, &lastQueryMs_);
+    py::tuple radius(const F32Array& points, float radius, const std::string& order) {
+        return radiusRun(bvh_, points, radius, LeafKind::Triangle, parseQueryOrder(order),
+                         &lastQueryMs_);
     }
 
 private:
@@ -509,16 +519,18 @@ public:
 
     std::string validate() const { return validatePointBVHGPU(bvh_, cloud_); }
 
-    py::tuple closest(const F32Array& points) {
-        return closestRun(bvh_, points, LeafKind::Vertex, &lastQueryMs_);
+    py::tuple closest(const F32Array& points, const std::string& order) {
+        return closestRun(bvh_, points, LeafKind::Vertex, parseQueryOrder(order), &lastQueryMs_);
     }
 
-    py::tuple knn(const F32Array& points, int k) {
-        return knnRun(bvh_, points, k, LeafKind::Vertex, &lastQueryMs_);
+    py::tuple knn(const F32Array& points, int k, const std::string& order) {
+        return knnRun(bvh_, points, k, LeafKind::Vertex, parseQueryOrder(order),
+                      &lastQueryMs_);
     }
 
-    py::tuple radius(const F32Array& points, float radius) {
-        return radiusRun(bvh_, points, radius, LeafKind::Vertex, &lastQueryMs_);
+    py::tuple radius(const F32Array& points, float radius, const std::string& order) {
+        return radiusRun(bvh_, points, radius, LeafKind::Vertex, parseQueryOrder(order),
+                         &lastQueryMs_);
     }
 
     // 与 Scene.update_triangles 同一份合同：点 i 必须还是建树时那个点，
@@ -612,16 +624,18 @@ public:
 
     std::string validate() const { return validateGaussianBVHGPU(bvh_, cloud_); }
 
-    py::tuple closest(const F32Array& points) {
-        return closestRun(bvh_, points, LeafKind::Gaussian, &lastQueryMs_);
+    py::tuple closest(const F32Array& points, const std::string& order) {
+        return closestRun(bvh_, points, LeafKind::Gaussian, parseQueryOrder(order), &lastQueryMs_);
     }
 
-    py::tuple knn(const F32Array& points, int k) {
-        return knnRun(bvh_, points, k, LeafKind::Gaussian, &lastQueryMs_);
+    py::tuple knn(const F32Array& points, int k, const std::string& order) {
+        return knnRun(bvh_, points, k, LeafKind::Gaussian, parseQueryOrder(order),
+                      &lastQueryMs_);
     }
 
-    py::tuple radius(const F32Array& points, float radius) {
-        return radiusRun(bvh_, points, radius, LeafKind::Gaussian, &lastQueryMs_);
+    py::tuple radius(const F32Array& points, float radius, const std::string& order) {
+        return radiusRun(bvh_, points, radius, LeafKind::Gaussian, parseQueryOrder(order),
+                         &lastQueryMs_);
     }
 
     // 与另外两个 update 同一份合同：第 i 个高斯必须还是建树时那一族（均值可以动，
@@ -774,11 +788,14 @@ PYBIND11_MODULE(quarry, m) {
              py::arg("tmax") = std::numeric_limits<float>::infinity(),
              "Return (hit bool[N], t float32[N]); t is inf on a miss. dirs need not be normalized")
         .def("closest", &PyScene::closest, py::arg("points"),
+             py::arg("order") = "input",
              "Return (dist2 float32[N], triangle int32[N]); triangle is -1 on a miss")
         .def("knn", &PyScene::knn, py::arg("points"), py::arg("k"),
+             py::arg("order") = "input",
              "Return (dist2 float32[N,k], triangle int32[N,k]) sorted by (dist2, index); "
              "missing slots are -1")
         .def("radius", &PyScene::radius, py::arg("points"), py::arg("radius"),
+             py::arg("order") = "input",
              "Return CSR (offsets int64[N+1], dist2 float32[total], triangle int32[total]) "
              "sorted by (dist2, index) inside each segment");
 
@@ -801,11 +818,14 @@ PYBIND11_MODULE(quarry, m) {
              "Refit in place: point i must still be the same sample. dirty is an int32 array "
              "of point indices to upload; omit it to upload everything")
         .def("closest", &PyPointCloud::closest, py::arg("points"),
+             py::arg("order") = "input",
              "Return (dist2 float32[N], index int32[N]); index is -1 on a miss")
         .def("knn", &PyPointCloud::knn, py::arg("points"), py::arg("k"),
+             py::arg("order") = "input",
              "Return (dist2 float32[N,k], index int32[N,k]) sorted by (dist2, index); "
              "missing slots are -1")
         .def("radius", &PyPointCloud::radius, py::arg("points"), py::arg("radius"),
+             py::arg("order") = "input",
              "Return CSR (offsets int64[N+1], dist2 float32[total], index int32[total]) "
              "sorted by (dist2, index) inside each segment");
 
@@ -833,11 +853,14 @@ PYBIND11_MODULE(quarry, m) {
              "Refit in place: gaussian i must still be the same primitive. dirty is an int32 "
              "array of indices to upload; omit it to upload everything")
         .def("closest", &PyGaussianCloud::closest, py::arg("points"),
+             py::arg("order") = "input",
              "Return (dist2 float32[N], index int32[N]); index is -1 on a miss")
         .def("knn", &PyGaussianCloud::knn, py::arg("points"), py::arg("k"),
+             py::arg("order") = "input",
              "Return (dist2 float32[N,k], index int32[N,k]) sorted by (dist2, index); "
              "missing slots are -1")
         .def("radius", &PyGaussianCloud::radius, py::arg("points"), py::arg("radius"),
+             py::arg("order") = "input",
              "Return CSR (offsets int64[N+1], dist2 float32[total], index int32[total]) "
              "sorted by (dist2, index) inside each segment");
 }

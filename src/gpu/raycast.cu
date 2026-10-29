@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "gpu/gpu_node.h"
+#include "gpu/morton.h"
 
 namespace {
 
@@ -27,27 +28,11 @@ void cudaOk(cudaError_t err, const char* what) {
 }
 
 // ---------------------------------------------------------------------------
-// 射线排序：把原点量化到 10 位/轴，交错成 30 位 Morton 码。相邻下标的射线
-// 因此落在同一块空间里，一个 warp 的遍历路径高度重合，节点访问从 HBM 随机
-// 读变成 L1/L2 命中。排序只改变执行顺序，结果按原下标散回。
-// 10 位已经和地形格点同量级，再加位数只多排序轮次；排序开销随键宽线性涨。
+// 射线排序：把原点量化到 10 位/轴，交错成 30 位 Morton 码（编码在 morton.h，
+// 点查询排序共用）。相邻下标的射线因此落在同一块空间里，一个 warp 的遍历
+// 路径高度重合，节点访问从 HBM 随机读变成 L1/L2 命中。排序只改变执行顺序，
+// 结果按原下标散回。
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ uint32_t expandBits10(uint32_t v) {
-    v &= 0x3ffu;
-    v = (v | (v << 16)) & 0x030000ffu;
-    v = (v | (v << 8)) & 0x0300f00fu;
-    v = (v | (v << 4)) & 0x030c30c3u;
-    v = (v | (v << 2)) & 0x09249249u;
-    return v;
-}
-
-__device__ __forceinline__ uint32_t quantize10(float v, float lo, float hi) {
-    if (!(hi > lo)) return 0;
-    float f = (v - lo) / (hi - lo);
-    f = fminf(fmaxf(f, 0.0f), 1.0f);
-    return static_cast<uint32_t>(f * 1023.0f + 0.5f);
-}
-
 __global__ void mortonKeysKernel(const Ray* __restrict__ rays, int count, AABB bounds,
                                  int keyMode, uint32_t* __restrict__ keys,
                                  int* __restrict__ order) {
@@ -57,9 +42,8 @@ __global__ void mortonKeysKernel(const Ray* __restrict__ rays, int count, AABB b
     // keyMode 0：原点（量化域是射线原点包围盒，不能拿场景盒——相机和球面原点
     // 都会落到盒外被 clamp 成一团）；keyMode 1：方向（域固定 [-1,1]）。
     const Vec3 p = keyMode == 0 ? r.origin : r.dir;
-    keys[i] = expandBits10(quantize10(p.x, bounds.mn.x, bounds.mx.x)) |
-              (expandBits10(quantize10(p.y, bounds.mn.y, bounds.mx.y)) << 1) |
-              (expandBits10(quantize10(p.z, bounds.mn.z, bounds.mx.z)) << 2);
+    keys[i] = morton3D10(p.x, p.y, p.z, bounds.mn.x, bounds.mx.x, bounds.mn.y, bounds.mx.y,
+                         bounds.mn.z, bounds.mx.z);
     order[i] = i;
 }
 

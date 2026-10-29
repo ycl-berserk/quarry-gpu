@@ -48,6 +48,7 @@ struct Options {
     bool cpu = true;
     bool stats = false;
     bool refit = false;
+    bool querySort = false;
     double refitShift = 0.002;
     double refitDirty = 0.01;
     std::string motion = "random";
@@ -71,7 +72,8 @@ void printUsage() {
         "  --refit                       额外做增量更新实验（全量 refit → 局部 refit）\n"
         "  --refit-shift F               每次位移幅度（包围盒对角线的比例），default 0.002\n"
         "  --refit-dirty F               局部 refit 改动的高斯比例，default 0.01\n"
-        "  --refit-motion random|coherent 位移方式，default random\n");
+        "  --refit-motion random|coherent 位移方式，default random\n"
+        "  --query-sort                  查询点按 Morton 序重排后再遍历\n");
 }
 
 bool parseArgs(int argc, char** argv, Options& opt) {
@@ -132,6 +134,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             if (!v) return false;
             opt.refitShift = std::atof(v);
             if (opt.refitShift < 0.0) opt.refitShift = 0.0;
+        } else if (arg == "--query-sort") {
+            opt.querySort = true;
         } else if (arg == "--refit-dirty") {
             const char* v = needValue("--refit-dirty");
             if (!v) return false;
@@ -176,15 +180,16 @@ QueryOutput queryGpu(GpuBVH& bvh, GpuPointBuffer& buf, const Options& opt, float
                      bool collectStats) {
     QueryOutput out;
     out.perPoint.resize(static_cast<size_t>(buf.count));
+    const QueryOrder order = opt.querySort ? QueryOrder::Morton : QueryOrder::Input;
     if (opt.query == "radius") {
         GpuRadiusBuffer rb;
-        out.ms = radiusQueryGaussianGPU(bvh, buf, radius, rb, collectStats);
+        out.ms = radiusQueryGaussianGPU(bvh, buf, radius, rb, collectStats, order);
         out.perPoint = readRadiusResultsGPU(rb);
         destroyRadiusBufferGPU(rb);
     } else {
         const bool knn = opt.query == "knn";
-        out.ms = knn ? kNearestGaussianGPU(bvh, buf, opt.k, collectStats)
-                     : closestGaussianGPU(bvh, buf, collectStats);
+        out.ms = knn ? kNearestGaussianGPU(bvh, buf, opt.k, collectStats, order)
+                     : closestGaussianGPU(bvh, buf, collectStats, order);
         const int stride = knn ? opt.k : 1;
         const std::vector<GpuClosestResult> flat = readQueryResultsGPU(buf);
         for (size_t i = 0; i < out.perPoint.size(); ++i) {
@@ -411,6 +416,7 @@ int main(int argc, char** argv) {
         std::printf("gpu runs=%d median_ms=%.2f min_ms=%.2f max_ms=%.2f Mqueries_s=%.2f\n",
                     opt.runs, g.median, g.min, g.max,
                     g.median > 0.0 ? queries.size() / (g.median * 1e3) : 0.0);
+        if (opt.querySort) std::printf("gpu sort_ms=%.3f\n", lastQueryStatsGPU().sortMs);
         std::printf("fingerprint gpu %s\n",
                     fingerprint(gpuOut, opt.query != "closest").summary().c_str());
         if (opt.stats) {

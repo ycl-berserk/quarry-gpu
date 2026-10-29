@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include "gpu/gpu_node.h"
+#include "gpu/morton.h"
 #include "gpu/prim_ops.h"
 
 namespace {
@@ -386,11 +388,157 @@ __global__ __launch_bounds__(kBlock) void radiusSortWarpKernel(const int* __rest
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// 查询调度：Morton 序重排查询点。每条查询相互独立，重排只改变执行顺序——
+// 相邻下标的查询点落在同一块空间，同一 warp 的遍历路径重合，节点/叶子从
+// HBM 随机读变成 L1/L2 命中。结果按原下标散回，逐点输出与顺序无关。
+// ---------------------------------------------------------------------------
+namespace {
+
+struct QuerySortScratch {
+    uint32_t* keysIn = nullptr;
+    uint32_t* keysOut = nullptr;
+    int* orderIn = nullptr;
+    int* orderOut = nullptr;
+    Vec3* sortedPoints = nullptr;
+    GpuClosestResult* sortedResults = nullptr;
+    unsigned char* temp = nullptr;
+    size_t tempBytes = 0;
+};
+
+void destroyQuerySortScratch(void* p) {
+    if (!p) return;
+    auto* s = static_cast<QuerySortScratch*>(p);
+    if (s->keysIn) cudaFree(s->keysIn);
+    if (s->keysOut) cudaFree(s->keysOut);
+    if (s->orderIn) cudaFree(s->orderIn);
+    if (s->orderOut) cudaFree(s->orderOut);
+    if (s->sortedPoints) cudaFree(s->sortedPoints);
+    if (s->sortedResults) cudaFree(s->sortedResults);
+    if (s->temp) cudaFree(s->temp);
+    delete s;
+}
+
+// 容量跟查询点数绑定，首次请求 Morton 序时才分配。
+QuerySortScratch* ensureQuerySortScratch(GpuPointBuffer& buf) {
+    if (buf.d_sortScratch) return static_cast<QuerySortScratch*>(buf.d_sortScratch);
+
+    auto* s = new QuerySortScratch{};
+    try {
+        auto alloc = [](auto*& p, size_t n) {
+            cudaOk(cudaMalloc(reinterpret_cast<void**>(&p), n * sizeof(*p)), "query sort scratch");
+        };
+        const size_t n = static_cast<size_t>(buf.count);
+        alloc(s->keysIn, n);
+        alloc(s->keysOut, n);
+        alloc(s->orderIn, n);
+        alloc(s->orderOut, n);
+        alloc(s->sortedPoints, n);
+        cub::DeviceRadixSort::SortPairs(nullptr, s->tempBytes, s->keysIn, s->keysOut, s->orderIn,
+                                        s->orderOut, buf.count, 0, 30);
+        alloc(s->temp, s->tempBytes > 0 ? s->tempBytes : 1);
+    } catch (...) {
+        destroyQuerySortScratch(s);
+        throw;
+    }
+    buf.d_sortScratch = s;
+    return s;
+}
+
+// 半径查询用不到排序后的结果缓冲（CSR 有自己的散射路径），按需分配。
+GpuClosestResult* ensureSortedResults(GpuPointBuffer& buf, QuerySortScratch* s) {
+    if (!s->sortedResults) {
+        cudaOk(cudaMalloc(reinterpret_cast<void**>(&s->sortedResults),
+                          static_cast<size_t>(buf.count) * static_cast<size_t>(buf.stride) *
+                              sizeof(GpuClosestResult)),
+               "query sort results");
+    }
+    return s->sortedResults;
+}
+
+__global__ void mortonPointKeysKernel(const Vec3* __restrict__ points, int count, AABB bounds,
+                                      uint32_t* __restrict__ keys, int* __restrict__ order) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= count) return;
+    const Vec3 p = points[i];
+    // 量化域是查询点自己的包围盒：查询点可能整片落在场景盒外或只覆盖一小块，
+    // 拿场景盒做域会把这些点钳到同一格里，排序就失去意义。
+    keys[i] = morton3D10(p.x, p.y, p.z, bounds.mn.x, bounds.mx.x, bounds.mn.y, bounds.mx.y,
+                         bounds.mn.z, bounds.mx.z);
+    order[i] = i;
+}
+
+__global__ void gatherPointsKernel(const Vec3* __restrict__ points, const int* __restrict__ order,
+                                   int count, Vec3* __restrict__ out) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i < count) out[i] = points[order[i]];
+}
+
+__global__ void scatterQueryResultsKernel(const GpuClosestResult* __restrict__ sortedOut,
+                                          const int* __restrict__ order, int count, int stride,
+                                          GpuClosestResult* __restrict__ out) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= count) return;
+    const GpuClosestResult* src = sortedOut + static_cast<size_t>(i) * stride;
+    GpuClosestResult* dst = out + static_cast<size_t>(order[i]) * stride;
+    for (int j = 0; j < stride; ++j) dst[j] = src[j];
+}
+
+// 半径的 CSR 是变长段：先把每段长度散回原下标，再做一次前缀和，最后逐段把
+// 已排好序的键拷进原序的偏移。
+__global__ void scatterCountsKernel(const int* __restrict__ counts, const int* __restrict__ order,
+                                    int count, int* __restrict__ out) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i < count) out[order[i]] = counts[i];
+}
+
+__global__ void scatterRadiusSegmentsKernel(const uint64_t* __restrict__ keysSorted,
+                                            const int* __restrict__ offsetsSorted,
+                                            const int* __restrict__ offsets,
+                                            const int* __restrict__ order, int count,
+                                            uint64_t* __restrict__ out) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= count) return;
+    const int begin = offsetsSorted[i];
+    const int len = offsetsSorted[i + 1] - begin;
+    uint64_t* dst = out + offsets[order[i]];
+    for (int j = 0; j < len; ++j) dst[j] = keysSorted[begin + j];
+}
+
+// 建码 → 排序 → 收集查询点。返回排序后的点数组；计时由调用方的 event 覆盖。
+const Vec3* reorderQueryPoints(GpuPointBuffer& buf, QuerySortScratch* s, int blocks) {
+    const auto* points = static_cast<const Vec3*>(buf.d_points);
+    mortonPointKeysKernel<<<blocks, kBlock>>>(points, buf.count, buf.bounds, s->keysIn,
+                                              s->orderIn);
+    cudaOk(cudaGetLastError(), "morton points");
+
+    cub::DeviceRadixSort::SortPairs(s->temp, s->tempBytes, s->keysIn, s->keysOut, s->orderIn,
+                                    s->orderOut, buf.count, 0, 30);
+    cudaOk(cudaGetLastError(), "sort points");
+
+    gatherPointsKernel<<<blocks, kBlock>>>(points, s->orderOut, buf.count, s->sortedPoints);
+    cudaOk(cudaGetLastError(), "gather points");
+    return s->sortedPoints;
+}
+
+}  // namespace
+
 GpuPointBuffer uploadPointsGPU(const std::vector<Vec3>& points, int resultsPerPoint) {
     GpuPointBuffer buf;
     buf.count = static_cast<int>(points.size());
     buf.stride = resultsPerPoint > 0 ? resultsPerPoint : 1;
     if (buf.count == 0) return buf;
+
+    buf.bounds.mn = points[0];
+    buf.bounds.mx = points[0];
+    for (const Vec3& p : points) {
+        buf.bounds.mn.x = std::min(buf.bounds.mn.x, p.x);
+        buf.bounds.mn.y = std::min(buf.bounds.mn.y, p.y);
+        buf.bounds.mn.z = std::min(buf.bounds.mn.z, p.z);
+        buf.bounds.mx.x = std::max(buf.bounds.mx.x, p.x);
+        buf.bounds.mx.y = std::max(buf.bounds.mx.y, p.y);
+        buf.bounds.mx.z = std::max(buf.bounds.mx.z, p.z);
+    }
 
     cudaOk(cudaMalloc(&buf.d_points, static_cast<size_t>(buf.count) * sizeof(Vec3)), "points");
     cudaOk(cudaMalloc(&buf.d_results,
@@ -405,11 +553,12 @@ GpuPointBuffer uploadPointsGPU(const std::vector<Vec3>& points, int resultsPerPo
 void destroyPointBufferGPU(GpuPointBuffer& buf) {
     if (buf.d_points) cudaFree(buf.d_points);
     if (buf.d_results) cudaFree(buf.d_results);
+    destroyQuerySortScratch(buf.d_sortScratch);
     buf = GpuPointBuffer{};
 }
 
 template <typename Ops>
-double closestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
+double closestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats, QueryOrder order) {
     if (buf.count <= 0 || bvh.nodeCount <= 0) return 0.0;
 
     gLastStats = GpuQueryStats{};
@@ -418,8 +567,10 @@ double closestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
         cudaOk(cudaGetLastError(), "reset query stats");
     }
 
-    cudaEvent_t start, stop;
+    cudaEvent_t start, mark, mark2, stop;
     cudaOk(cudaEventCreate(&start), "event");
+    cudaOk(cudaEventCreate(&mark), "event");
+    cudaOk(cudaEventCreate(&mark2), "event");
     cudaOk(cudaEventCreate(&stop), "event");
     cudaOk(cudaEventRecord(start), "record start");
 
@@ -427,23 +578,46 @@ double closestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
     const auto* nodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
     const auto* prims = static_cast<const typename Ops::Item*>(bvh.d_tris);
     const auto* primIds = static_cast<const int*>(bvh.d_primIds);
-    const auto* points = static_cast<const Vec3*>(buf.d_points);
     auto* out = static_cast<GpuClosestResult*>(buf.d_results);
+
+    QuerySortScratch* sort = nullptr;
+    const Vec3* points = static_cast<const Vec3*>(buf.d_points);
+    GpuClosestResult* sortedOut = out;
+    if (order == QueryOrder::Morton) {
+        sort = ensureQuerySortScratch(buf);
+        points = reorderQueryPoints(buf, sort, blocks);
+        sortedOut = ensureSortedResults(buf, sort);
+        cudaOk(cudaEventRecord(mark), "record mark");
+    }
 
     if (collectStats) {
         closestPointKernel<Ops, true><<<blocks, kBlock>>>(nodes, prims, primIds, points, buf.count,
-                                                          out);
+                                                          sortedOut);
     } else {
         closestPointKernel<Ops, false><<<blocks, kBlock>>>(nodes, prims, primIds, points, buf.count,
-                                                           out);
+                                                           sortedOut);
+    }
+    cudaOk(cudaGetLastError(), "closest point");
+    cudaOk(cudaEventRecord(mark2), "record mark2");
+
+    if (sort) {
+        scatterQueryResultsKernel<<<blocks, kBlock>>>(sortedOut, sort->orderOut, buf.count,
+                                                      buf.stride, out);
+        cudaOk(cudaGetLastError(), "scatter query results");
     }
 
-    cudaOk(cudaGetLastError(), "closest point");
     cudaOk(cudaEventRecord(stop), "record stop");
     cudaOk(cudaEventSynchronize(stop), "sync");
-    float ms = 0.0f;
+    float ms = 0.0f, sortMs = 0.0f, scatterMs = 0.0f;
     cudaOk(cudaEventElapsedTime(&ms, start, stop), "elapsed");
+    if (sort) {
+        cudaOk(cudaEventElapsedTime(&sortMs, start, mark), "sort elapsed");
+        cudaOk(cudaEventElapsedTime(&scatterMs, mark2, stop), "scatter elapsed");
+        gLastStats.sortMs = static_cast<double>(sortMs + scatterMs);
+    }
     cudaEventDestroy(start);
+    cudaEventDestroy(mark);
+    cudaEventDestroy(mark2);
     cudaEventDestroy(stop);
 
     if (collectStats) {
@@ -457,23 +631,27 @@ double closestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
     return static_cast<double>(ms);
 }
 
-double closestPointGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
-    return closestImpl<TriOps>(bvh, buf, collectStats);
+double closestPointGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats,
+                       QueryOrder order) {
+    return closestImpl<TriOps>(bvh, buf, collectStats, order);
 }
 
 // 点云最近点：同一条遍历，只是叶子载荷换成 Vec3、距离换成点距。
 // 输出的 triangle 字段装的是点索引。
-double closestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
-    return closestImpl<PointOps>(bvh, buf, collectStats);
+double closestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats,
+                        QueryOrder order) {
+    return closestImpl<PointOps>(bvh, buf, collectStats, order);
 }
 
 // 高斯最近点：载荷换成 Gaussian，叶子距离是到椭球实体的平方距离。
-double closestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats) {
-    return closestImpl<GaussianOps>(bvh, buf, collectStats);
+double closestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, bool collectStats,
+                          QueryOrder order) {
+    return closestImpl<GaussianOps>(bvh, buf, collectStats, order);
 }
 
 template <typename Ops>
-double kNearestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats) {
+double kNearestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats,
+                    QueryOrder order) {
     if (buf.count <= 0 || bvh.nodeCount <= 0) return 0.0;
     if (k < 1 || k > kMaxKnn) {
         throw std::runtime_error("kNearestGPU: k must be in [1, 32]");
@@ -488,8 +666,10 @@ double kNearestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectS
         cudaOk(cudaGetLastError(), "reset query stats");
     }
 
-    cudaEvent_t start, stop;
+    cudaEvent_t start, mark, mark2, stop;
     cudaOk(cudaEventCreate(&start), "event");
+    cudaOk(cudaEventCreate(&mark), "event");
+    cudaOk(cudaEventCreate(&mark2), "event");
     cudaOk(cudaEventCreate(&stop), "event");
     cudaOk(cudaEventRecord(start), "record start");
 
@@ -497,23 +677,46 @@ double kNearestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectS
     const auto* nodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
     const auto* prims = static_cast<const typename Ops::Item*>(bvh.d_tris);
     const auto* primIds = static_cast<const int*>(bvh.d_primIds);
-    const auto* points = static_cast<const Vec3*>(buf.d_points);
     auto* out = static_cast<GpuClosestResult*>(buf.d_results);
+
+    QuerySortScratch* sort = nullptr;
+    const Vec3* points = static_cast<const Vec3*>(buf.d_points);
+    GpuClosestResult* sortedOut = out;
+    if (order == QueryOrder::Morton) {
+        sort = ensureQuerySortScratch(buf);
+        points = reorderQueryPoints(buf, sort, blocks);
+        sortedOut = ensureSortedResults(buf, sort);
+        cudaOk(cudaEventRecord(mark), "record mark");
+    }
 
     if (collectStats) {
         kNearestKernel<Ops, true><<<blocks, kBlock>>>(nodes, prims, primIds, points, buf.count, k,
-                                                      out);
+                                                      sortedOut);
     } else {
         kNearestKernel<Ops, false><<<blocks, kBlock>>>(nodes, prims, primIds, points, buf.count, k,
-                                                       out);
+                                                       sortedOut);
+    }
+    cudaOk(cudaGetLastError(), "k nearest");
+    cudaOk(cudaEventRecord(mark2), "record mark2");
+
+    if (sort) {
+        scatterQueryResultsKernel<<<blocks, kBlock>>>(sortedOut, sort->orderOut, buf.count,
+                                                      buf.stride, out);
+        cudaOk(cudaGetLastError(), "scatter query results");
     }
 
-    cudaOk(cudaGetLastError(), "k nearest");
     cudaOk(cudaEventRecord(stop), "record stop");
     cudaOk(cudaEventSynchronize(stop), "sync");
-    float ms = 0.0f;
+    float ms = 0.0f, sortMs = 0.0f, scatterMs = 0.0f;
     cudaOk(cudaEventElapsedTime(&ms, start, stop), "elapsed");
+    if (sort) {
+        cudaOk(cudaEventElapsedTime(&sortMs, start, mark), "sort elapsed");
+        cudaOk(cudaEventElapsedTime(&scatterMs, mark2, stop), "scatter elapsed");
+        gLastStats.sortMs = static_cast<double>(sortMs + scatterMs);
+    }
     cudaEventDestroy(start);
+    cudaEventDestroy(mark);
+    cudaEventDestroy(mark2);
     cudaEventDestroy(stop);
 
     if (collectStats) {
@@ -527,21 +730,24 @@ double kNearestImpl(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectS
     return static_cast<double>(ms);
 }
 
-double kNearestGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats) {
-    return kNearestImpl<TriOps>(bvh, buf, k, collectStats);
+double kNearestGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats,
+                   QueryOrder order) {
+    return kNearestImpl<TriOps>(bvh, buf, k, collectStats, order);
 }
 
-double kNearestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats) {
-    return kNearestImpl<PointOps>(bvh, buf, k, collectStats);
+double kNearestVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats,
+                         QueryOrder order) {
+    return kNearestImpl<PointOps>(bvh, buf, k, collectStats, order);
 }
 
-double kNearestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats) {
-    return kNearestImpl<GaussianOps>(bvh, buf, k, collectStats);
+double kNearestGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, int k, bool collectStats,
+                           QueryOrder order) {
+    return kNearestImpl<GaussianOps>(bvh, buf, k, collectStats, order);
 }
 
 template <typename Ops>
 double radiusQueryImpl(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuRadiusBuffer& out,
-                       bool collectStats) {
+                       bool collectStats, QueryOrder order) {
     out = GpuRadiusBuffer{};
     if (buf.count <= 0 || bvh.nodeCount <= 0) return 0.0;
 
@@ -565,8 +771,10 @@ double radiusQueryImpl(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, Gpu
         cudaOk(cudaGetLastError(), "reset query stats");
     }
 
-    cudaEvent_t start, stop;
+    cudaEvent_t start, mark, mark2, stop;
     cudaOk(cudaEventCreate(&start), "event");
+    cudaOk(cudaEventCreate(&mark), "event");
+    cudaOk(cudaEventCreate(&mark2), "event");
     cudaOk(cudaEventCreate(&stop), "event");
     cudaOk(cudaEventRecord(start), "record start");
 
@@ -574,7 +782,14 @@ double radiusQueryImpl(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, Gpu
     const auto* nodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
     const auto* prims = static_cast<const typename Ops::Item*>(bvh.d_tris);
     const auto* primIds = static_cast<const int*>(bvh.d_primIds);
-    const auto* points = static_cast<const Vec3*>(buf.d_points);
+
+    QuerySortScratch* sort = nullptr;
+    const Vec3* points = static_cast<const Vec3*>(buf.d_points);
+    if (order == QueryOrder::Morton) {
+        sort = ensureQuerySortScratch(buf);
+        points = reorderQueryPoints(buf, sort, blocks);
+        cudaOk(cudaEventRecord(mark), "record mark");
+    }
 
     if (collectStats) {
         radiusCountKernel<Ops, true><<<blocks, kBlock>>>(nodes, prims, points, n, r2, dCounts);
@@ -641,11 +856,50 @@ double radiusQueryImpl(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, Gpu
         }
     }
 
+    if (sort) {
+        // 段长散回原序 → 前缀和 → 逐段拷键。CSR 是变长的，这一步没法像
+        // closest/kNN 那样按固定 stride 一次散射。
+        int* dCountsOrig = nullptr;
+        int* dOffsetsOrig = nullptr;
+        cudaOk(cudaMalloc(&dCountsOrig, static_cast<size_t>(n) * sizeof(int)),
+               "radius counts orig");
+        cudaOk(cudaMalloc(&dOffsetsOrig, static_cast<size_t>(n + 1) * sizeof(int)),
+               "radius offsets orig");
+        scatterCountsKernel<<<blocks, kBlock>>>(dCounts, sort->orderOut, n, dCountsOrig);
+        cudaOk(cudaGetLastError(), "scatter radius counts");
+        cudaOk(cub::DeviceScan::ExclusiveSum(dScanTemp, scanBytes, dCountsOrig, dOffsetsOrig, n),
+               "scan orig");
+        cudaOk(cudaMemcpy(dOffsetsOrig + n, &total, sizeof(int), cudaMemcpyHostToDevice),
+               "tail total orig");
+
+        uint64_t* dKeysOrig = nullptr;
+        if (total > 0) {
+            cudaOk(cudaMalloc(&dKeysOrig, static_cast<size_t>(total) * sizeof(uint64_t)),
+                   "radius keys orig");
+            scatterRadiusSegmentsKernel<<<blocks, kBlock>>>(dKeys, dOffsets, dOffsetsOrig,
+                                                            sort->orderOut, n, dKeysOrig);
+            cudaOk(cudaGetLastError(), "scatter radius segments");
+        }
+        cudaFree(dKeys);
+        cudaFree(dOffsets);
+        cudaFree(dCountsOrig);
+        dKeys = dKeysOrig;
+        dOffsets = dOffsetsOrig;
+    }
+
+    cudaOk(cudaEventRecord(mark2), "record mark2");
     cudaOk(cudaEventRecord(stop), "record stop");
     cudaOk(cudaEventSynchronize(stop), "sync");
-    float ms = 0.0f;
+    float ms = 0.0f, sortMs = 0.0f, scatterMs = 0.0f;
     cudaOk(cudaEventElapsedTime(&ms, start, stop), "elapsed");
+    if (sort) {
+        cudaOk(cudaEventElapsedTime(&sortMs, start, mark), "sort elapsed");
+        cudaOk(cudaEventElapsedTime(&scatterMs, mark2, stop), "scatter elapsed");
+        gLastStats.sortMs = static_cast<double>(sortMs + scatterMs);
+    }
     cudaEventDestroy(start);
+    cudaEventDestroy(mark);
+    cudaEventDestroy(mark2);
     cudaEventDestroy(stop);
 
     if (collectStats) {
@@ -668,20 +922,20 @@ double radiusQueryImpl(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, Gpu
 }
 
 double radiusQueryGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius, GpuRadiusBuffer& out,
-                      bool collectStats) {
-    return radiusQueryImpl<TriOps>(bvh, buf, radius, out, collectStats);
+                      bool collectStats, QueryOrder order) {
+    return radiusQueryImpl<TriOps>(bvh, buf, radius, out, collectStats, order);
 }
 
 // 点云的半径查询：CSR 的键里装点索引，短段的 warp 双调排序和长段的 CUB
 // 分段排序都与三角形路径共用。
 double radiusQueryVertexGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
-                            GpuRadiusBuffer& out, bool collectStats) {
-    return radiusQueryImpl<PointOps>(bvh, buf, radius, out, collectStats);
+                            GpuRadiusBuffer& out, bool collectStats, QueryOrder order) {
+    return radiusQueryImpl<PointOps>(bvh, buf, radius, out, collectStats, order);
 }
 
 double radiusQueryGaussianGPU(const GpuBVH& bvh, GpuPointBuffer& buf, float radius,
-                              GpuRadiusBuffer& out, bool collectStats) {
-    return radiusQueryImpl<GaussianOps>(bvh, buf, radius, out, collectStats);
+                              GpuRadiusBuffer& out, bool collectStats, QueryOrder order) {
+    return radiusQueryImpl<GaussianOps>(bvh, buf, radius, out, collectStats, order);
 }
 
 void destroyRadiusBufferGPU(GpuRadiusBuffer& buf) {

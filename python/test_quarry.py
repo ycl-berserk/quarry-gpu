@@ -223,6 +223,21 @@ def main():
             bad += 1
     check("radius sets", bad == 0, f"{bad} points differ at the boundary")
 
+    # 查询调度：Morton 序重排查询点只改执行顺序，三条查询的结果必须逐位不变
+    m_dist2, m_tri = scene.closest(points, order="morton")
+    check("closest morton bitwise",
+          np.array_equal(m_tri, tri)
+          and np.array_equal(m_dist2.view(np.uint32), dist2.view(np.uint32)),
+          f"{(m_tri != tri).sum()} ids differ")
+    m_kd, m_kid = scene.knn(points, k, order="morton")
+    check("knn morton bitwise",
+          np.array_equal(m_kid, kid)
+          and np.array_equal(m_kd.view(np.uint32), kd.view(np.uint32)))
+    m_off, m_rd2, m_rid = scene.radius(points, radius, order="morton")
+    check("radius morton bitwise",
+          np.array_equal(m_off, offsets) and np.array_equal(m_rid, rid)
+          and np.array_equal(m_rd2.view(np.uint32), rd2.view(np.uint32)))
+
     origins = (lo + (hi - lo) * rng.random((200, 3))).astype(np.float32)
     origins[:, 1] = hi[1] + 1.0
     dirs = np.tile(np.array([0.0, -1.0, 0.0], dtype=np.float32), (200, 1))
@@ -322,6 +337,11 @@ def main():
                                 d2[i][want].view(np.uint32))
     check("point radius bitwise", cr_ok)
 
+    m_cdist2, m_cidx = cloud.closest(q, order="morton")
+    check("point closest morton bitwise",
+          np.array_equal(m_cidx, cidx)
+          and np.array_equal(m_cdist2.view(np.uint32), cdist2.view(np.uint32)))
+
     # 增量更新：先整体平移，再只改一个子集
     moved = pts.copy()
     moved[:, 1] += np.float32(0.1)
@@ -379,6 +399,11 @@ def main():
     check("gaussian closest ids (ties allowed)", np.all(tie_ok),
           f"{np.sum(tie_ok == False)} points pick a strictly farther gaussian")
     check("gaussian last_query_ms", gcloud.last_query_ms > 0.0, gcloud.last_query_ms)
+
+    m_gdist2, m_gidx = gcloud.closest(gq, order="morton")
+    check("gaussian closest morton bitwise",
+          np.array_equal(m_gidx, gidx)
+          and np.array_equal(m_gdist2.view(np.uint32), gdist2.view(np.uint32)))
 
     gk = 4
     gkd, gkid = gcloud.knn(gq, gk)

@@ -49,6 +49,7 @@ struct Options {
     double refitShift = 0.005;
     double refitDirty = 0.01;
     std::string refitMotion = "random";
+    bool querySort = false;
 };
 
 void printUsage() {
@@ -72,7 +73,8 @@ void printUsage() {
         "  --refit                        额外做一轮增量更新实验（少量改动 → 全量 refit → 重建）\n"
         "  --refit-shift F                每个三角形随机平移的幅度（场景对角线的比例），default 0.005\n"
         "  --refit-dirty F                第一步改动的三角形比例，default 0.01\n"
-        "  --refit-motion random|coherent 位移方式：逐三角形独立 / 平滑场，default random\n");
+        "  --refit-motion random|coherent 位移方式：逐三角形独立 / 平滑场，default random\n"
+        "  --query-sort                   查询点按 Morton 序重排后再遍历（不能与 --refit 同用）\n");
 }
 
 bool parseArgs(int argc, char** argv, Options& opt) {
@@ -158,6 +160,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
                 std::fprintf(stderr, "unknown --refit-motion: %s\n", v);
                 return false;
             }
+        } else if (arg == "--query-sort") {
+            opt.querySort = true;
         } else if (arg == "-h" || arg == "--help") {
             printUsage();
             return false;
@@ -217,18 +221,18 @@ struct QueryOutput {
 };
 
 QueryOutput queryGpu(GpuBVH& bvh, GpuPointBuffer& buf, int stride, const std::string& query, int k,
-                     float radius, bool collectStats) {
+                     float radius, bool collectStats, QueryOrder order) {
     QueryOutput out;
     out.perPoint.resize(static_cast<size_t>(buf.count));
     if (query == "radius") {
         GpuRadiusBuffer rb;
-        out.ms = radiusQueryGPU(bvh, buf, radius, rb, collectStats);
+        out.ms = radiusQueryGPU(bvh, buf, radius, rb, collectStats, order);
         std::vector<std::vector<ClosestHit>> lists = readRadiusResultsGPU(rb);
         destroyRadiusBufferGPU(rb);
         out.perPoint = std::move(lists);
     } else {
-        out.ms = (query == "knn") ? kNearestGPU(bvh, buf, k, collectStats)
-                                  : closestPointGPU(bvh, buf, collectStats);
+        out.ms = (query == "knn") ? kNearestGPU(bvh, buf, k, collectStats, order)
+                                  : closestPointGPU(bvh, buf, collectStats, order);
         const std::vector<GpuClosestResult> flat = readQueryResultsGPU(buf);
         for (size_t i = 0; i < out.perPoint.size(); ++i) {
             const GpuClosestResult* row = flat.data() + i * stride;
@@ -357,12 +361,18 @@ int main(int argc, char** argv) {
     const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed};
     const Scene scene = buildScene(spec);
     const std::vector<Vec3> points = makeQueryPoints(scene.bounds, opt.points, opt.seed);
+    const QueryOrder order = opt.querySort ? QueryOrder::Morton : QueryOrder::Input;
 
     std::printf("scene=%s tris=%zu points=%zu type=%s", opt.scene.c_str(), scene.tris.size(),
                 points.size(), opt.query.c_str());
     if (knnMode) std::printf(" k=%d", opt.k);
     if (radiusMode) std::printf(" radius=%g", static_cast<double>(opt.radius));
+    if (opt.querySort) std::printf(" order=morton");
     std::printf(" seed=%llu\n", static_cast<unsigned long long>(opt.seed));
+    if (opt.querySort && opt.refit) {
+        std::printf("--query-sort does not support --refit yet\n");
+        return 1;
+    }
 
     if (!opt.dump.empty()) {
         if (!dumpQueryInput(opt.dump, scene, points)) return 1;
@@ -454,11 +464,11 @@ int main(int argc, char** argv) {
         while (nowMs() - warmStart < opt.warmupMs) {
             if (radiusMode) {
                 destroyRadiusBufferGPU(radiusBuf);
-                radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, false);
+                radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, false, order);
             } else if (knnMode) {
-                kNearestGPU(gpu, buf, opt.k, false);
+                kNearestGPU(gpu, buf, opt.k, false, order);
             } else {
-                closestPointGPU(gpu, buf, false);
+                closestPointGPU(gpu, buf, false, order);
             }
             ++warmRuns;
         }
@@ -467,10 +477,10 @@ int main(int argc, char** argv) {
         for (int run = 0; run < opt.runs; ++run) {
             if (radiusMode) {
                 destroyRadiusBufferGPU(radiusBuf);  // 每轮重新分配，分配时间不计入 event
-                gpuTimes.push_back(radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, false));
+                gpuTimes.push_back(radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, false, order));
             } else {
-                gpuTimes.push_back(knnMode ? kNearestGPU(gpu, buf, opt.k, false)
-                                           : closestPointGPU(gpu, buf, false));
+                gpuTimes.push_back(knnMode ? kNearestGPU(gpu, buf, opt.k, false, order)
+                                           : closestPointGPU(gpu, buf, false, order));
             }
         }
     } catch (const std::exception& e) {
@@ -482,6 +492,7 @@ int main(int argc, char** argv) {
     std::printf("gpu runs=%d median_ms=%.3f min_ms=%.3f max_ms=%.3f Mqueries_s=%.2f\n", opt.runs,
                 gpuMedian, gpuTimes.front(), gpuTimes.back(),
                 gpuMedian > 0.0 ? points.size() / (gpuMedian * 1e3) : 0.0);
+    if (opt.querySort) std::printf("gpu sort_ms=%.3f\n", lastQueryStatsGPU().sortMs);
 
     int exitCode = 0;
     if (opt.verify) {
@@ -559,11 +570,11 @@ int main(int argc, char** argv) {
     if (opt.stats) {
         if (radiusMode) {
             destroyRadiusBufferGPU(radiusBuf);
-            radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, true);
+            radiusQueryGPU(gpu, buf, opt.radius, radiusBuf, true, order);
         } else if (knnMode) {
-            kNearestGPU(gpu, buf, opt.k, true);
+            kNearestGPU(gpu, buf, opt.k, true, order);
         } else {
-            closestPointGPU(gpu, buf, true);
+            closestPointGPU(gpu, buf, true, order);
         }
         const GpuQueryStats st = lastQueryStatsGPU();
         const double n = static_cast<double>(points.size());
@@ -583,7 +594,11 @@ int main(int argc, char** argv) {
         // 每一步都拿 CPU 参考对拍：refit 不改拓扑，结果必须逐位正确。第 2、3 步
         // 用的是同一份几何，查询快慢才只反映树的质量（第 1 步的几何不同，不参与比较）。
         const double nPoints = static_cast<double>(points.size());
-        const QueryOutput base = queryGpu(gpu, buf, stride, opt.query, opt.k, opt.radius, true);
+        auto runQuery = [&](GpuBVH& b, GpuPointBuffer& pb, bool st) {
+            return queryGpu(b, pb, stride, opt.query, opt.k, opt.radius, st,
+                            QueryOrder::Input);
+        };
+        const QueryOutput base = runQuery(gpu, buf, true);
         std::printf("refit baseline avg_node_tests=%.1f avg_tri_tests=%.1f\n",
                     base.stats.nodeTests / nPoints, base.stats.triTests / nPoints);
 
@@ -601,7 +616,7 @@ int main(int argc, char** argv) {
         auto medianQuery = [&](GpuBVH& b) {
             std::vector<double> t;
             for (int i = 0; i < opt.runs; ++i) {
-                t.push_back(queryGpu(b, buf, stride, opt.query, opt.k, opt.radius, false).ms);
+                t.push_back(runQuery(b, buf, false).ms);
             }
             std::sort(t.begin(), t.end());
             return t[t.size() / 2];
@@ -651,7 +666,7 @@ int main(int argc, char** argv) {
         if (!partialTree.empty()) return 4;
 
         const double partialQuery = medianQuery(gpu);
-        const QueryOutput partialRes = queryGpu(gpu, buf, stride, opt.query, opt.k, opt.radius, true);
+        const QueryOutput partialRes = runQuery(gpu, buf, true);
         std::printf("partial query median_ms=%.3f avg_node_tests=%.1f avg_tri_tests=%.1f\n",
                     partialQuery, partialRes.stats.nodeTests / nPoints,
                     partialRes.stats.triTests / nPoints);
@@ -680,7 +695,7 @@ int main(int argc, char** argv) {
 
         const QueryOutput refCpu = opt.cpu ? cpuFor(moved) : QueryOutput{};
         const double refitQuery = medianQuery(gpu);
-        const QueryOutput refitRes = queryGpu(gpu, buf, stride, opt.query, opt.k, opt.radius, true);
+        const QueryOutput refitRes = runQuery(gpu, buf, true);
         std::printf("refit query median_ms=%.3f Mqueries_s=%.2f avg_node_tests=%.1f "
                     "avg_tri_tests=%.1f\n",
                     refitQuery, refitQuery > 0.0 ? nPoints / (refitQuery * 1e3) : 0.0,
@@ -707,7 +722,7 @@ int main(int argc, char** argv) {
         }
         const double rebuildQuery = medianQuery(rebuilt);
         const QueryOutput rebuiltRes =
-            queryGpu(rebuilt, buf, stride, opt.query, opt.k, opt.radius, true);
+            runQuery(rebuilt, buf, true);
         std::printf("rebuild total=%.3f ms query median_ms=%.3f avg_node_tests=%.1f "
                     "avg_tri_tests=%.1f\n",
                     rebuildMs, rebuildQuery, rebuiltRes.stats.nodeTests / nPoints,
