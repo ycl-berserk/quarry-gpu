@@ -708,6 +708,50 @@ H2D 延迟随电源状态变化明显，**配对倍数报 3.6–6.8×**，绝对
 `selftest` 9 项高斯检查（含 float64 参考 1.7e-7、AABB 下界 200 组、BVH vs 暴力 4096
 高斯）；`python/test_quarry.py` 17 项高斯检查（numpy float64 二分见证）。
 
+## 查询调度（M3 前半，2026-10-29）
+
+`--query-sort` 把查询点按 Morton 序重排后交给同一个内核，排序开销计入总时间。
+这是**纵向对照**：同会话、同一 exe、同一批查询点，关/开各 5 轮取中位数。
+点查询没有外部 kNN/半径基线（Embree / Warp 都没有），横向绝对吞吐仍按上文
+Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
+
+地形 2M（419 万节点 = 134 MB，5× L2），3 s DVFS 预热：
+
+| 查询 | 输入序 | Morton 序 | 倍数 | sort_ms |
+|---|---|---|---|---|
+| closest 20k | 5.226 | 5.232 | 1.00× | 0.27 |
+| closest 100k | 19.21 | 11.53 | 1.67× | 0.18 |
+| closest 200k | 36.14 | 19.16 | 1.89× | 0.42 |
+| kNN8 100k | 30.35 | 20.74 | 1.46× | 0.31 |
+| radius 2.0 100k | 219.8 | 223.7 | 0.98× | 0.47 |
+| 随机汤 2M closest 100k | 27.62 | 15.38 | 1.80× | 0.22 |
+| 地形 131k closest 20k | 0.884 | 1.11 | 0.80× | 0.25 |
+
+高斯 10M（`gpu_gauss_bench`，3 轮热身、±10% 噪声；closest 20k 给了两次独立测量）：
+
+| 查询 | 输入序 | Morton 序 | 倍数 | sort_ms |
+|---|---|---|---|---|
+| closest 20k | 40.7 / 42.2 | 47.0 / 49.1 | 0.86× | 0.13 |
+| closest 100k | 149.3 | 136.9 | 1.09× | 0.16 |
+| kNN8 100k | 252.2 | 220.8 | 1.14× | 0.33 |
+
+读法：
+
+1. **测试数完全相同**（地形 2M：closest 474.8 节点 / 123.0 叶子，kNN 577.3 / 171.8，
+   radius 1182.9 / 545.1），差异全部来自访存：相邻 warp 的路径重合，上层节点
+   一次 DRAM 事务喂更多线程。收益在 10 万查询（占满 SM）后出现，20k 查询
+   （40% 占用）是净亏。
+2. **20k 的亏损有一个未验证的假设**：低占用时内核延迟受限，需要"多样的 miss"
+   互相掩盖；相干性合并 miss 的同时也减少了在飞 miss。标记为假设，不作结论。
+3. **radius 不变**：两遍遍历 + 变长 CSR 写入 + 段内排序占大头，遍历只占一小半。
+4. **高斯在 20k 倒退、100k 转正**：每查询 1775 节点 + 348 次 14 轮牛顿的椭球距离，
+   存储不是主成本，重排收益小；20k 的倒退幅度与第 2 条的假设一致。
+5. 逐位不变：地形 2M 10 万查询两种顺序指纹都是 closest `0x0ecd1029bdb758b4`、
+   kNN8 `0x169e1b986f7ca4b3`；radius 131k 两万查询都是 `0xba0f794cf680d9a3`，
+   三种 `*_mismatch` 全 0；Python 新增 5 项 `order="morton"` 逐位检查，共 77 项。
+6. 默认 `QueryOrder::Input`，阈值不是普适常数；原始日志 `out/query_sort_final.txt`、
+   `out/query_sort_gauss.txt`（gitignore）。
+
 ## 结论
 
 1. **CPU 吞吐随场景大小塌陷一个数量级。** 13 万三角形受缓存保护，32 线程能到 96 Mrays/s；200 万三角形掉到 19.7，属于结构性访存受限，增加线程无用。
@@ -852,6 +896,14 @@ build\gpu_gauss_bench.exe --kind volume --gaussians 131072 --queries 20000 --que
 build\gpu_gauss_bench.exe --kind volume --gaussians 131072 --queries 20000 --query radius --stats
 build\gpu_gauss_bench.exe --kind volume --gaussians 1048576 --queries 20000 --stats
 build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --runs 3 --refit --refit-dirty 0.01 --refit-motion coherent
+
+build\gpu_query_bench.exe --grid 1024 --points 100000 --runs 5 --no-cpu --stats
+build\gpu_query_bench.exe --grid 1024 --points 100000 --runs 5 --no-cpu --stats --query-sort
+build\gpu_query_bench.exe --grid 1024 --points 200000 --runs 5 --no-cpu --stats
+build\gpu_query_bench.exe --grid 1024 --points 200000 --runs 5 --no-cpu --stats --query-sort
+build\gpu_query_bench.exe --grid 1024 --points 100000 --runs 5 --no-cpu --query knn --k 8 --query-sort
+build\gpu_query_bench.exe --grid 1024 --points 100000 --runs 5 --no-cpu --query radius --radius 2.0 --query-sort
+build\gpu_gauss_bench.exe --gaussians 10000000 --queries 100000 --runs 3 --no-cpu --no-verify --query-sort
 ```
 
 ## 已知缺口
@@ -877,4 +929,6 @@ build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --runs 3 --refit -
 - 椭球距离固定 14 轮、无提前退出（CPU/GPU 逐位一致的代价），最差距离误差 1.7e-7
 - Morton 叶子批量（4–8 图元/叶）实测负结果，已回退到每叶 1 个；追 Warp 需要
   GPU 自顶向下 SAH 或宽节点，不在 M1 范围
+- 查询排序只在 ≥10 万查询的三角形场景证明有效；20k 低占用下的延迟假说未做单独
+  实验，radius 没有收益，高斯小批次倒退。分块排序与按深度分桶未做
 - 第一轮结果（不同场景、20 万条射线）已作废，勿引用

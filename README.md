@@ -7,7 +7,8 @@ GPU 原生空间查询引擎：构建加速结构（BVH / 八叉树 / 哈希网�
 许可证 Apache-2.0（见 `LICENSE`）。CPU 参考实现已完整；GPU 侧（CUDA 12.4，sm_89）已有
 并行 LBVH 构建、光线遍历、closest / kNN / radius 三条点查询路径，拓扑冻结的增量更新
 （refit），以及**三种图元**：三角形、点云、高斯。三者共用同一棵 LBVH 与同一套查询，
-只在叶子里换"测什么"——高斯的叶子测试是精确的**点到椭球实体**距离。
+只在叶子里换"测什么"——高斯的叶子测试是精确的**点到椭球实体**距离。查询批次可以按
+Morton 序重排（`--query-sort` / Python 的 `order="morton"`），默认关闭。
 没有 CUDA 工具链时自动降级为纯 CPU 构建，CI 与本文档的 CPU 数字不受影响。
 
 ## 现在能跑什么
@@ -25,6 +26,7 @@ build\gpu_query_bench.exe --grid 256 --points 20000 --runs 5 --stats          ::
 build\gpu_query_bench.exe --grid 256 --points 20000 --query knn --k 16        :: GPU kNN
 build\gpu_query_bench.exe --grid 256 --points 20000 --query radius --radius 2.0  :: GPU 半径查询
 build\gpu_query_bench.exe --grid 256 --points 20000 --refit --refit-dirty 0.01  :: 局部 / 全量 refit + 重建对照
+build\gpu_query_bench.exe --grid 1024 --points 100000 --query-sort           :: 查询点按 Morton 序重排后再遍历
 
 build\gpu_cloud_bench.exe --points 131072 --queries 20000                   :: 点云 closest，GPU 对 kd-tree
 build\gpu_cloud_bench.exe --points 1048576 --queries 20000 --query knn --k 8
@@ -218,6 +220,54 @@ sheet 点云（x/z ∈ [-50, 50]，y 贴地形面 + 2 cm 抖动），20,000 个�
   上一会话同一配置测到 0.93 ms，H2D 延迟随电源状态变化，配对倍数是 3.6–6.8×。
 - 每个高斯 40 字节（mean 12 + 四元数 16 + 半轴 12），10M 高斯的载荷是 400 MB，
   节点内存 640 MB。这是"每叶 1 个图元"在 8 GB 卡上的实际上限。
+
+## 查询调度（M3 前半，2026-10-29）
+
+`--query-sort` 把一批查询点按 Morton 序重排后交给**同一个内核**，结果散回原下标。
+三条查询的内核一行没改；排序（30 位/点、CUB `SortPairs`）、gather、scatter 全部计入
+返回时间，`sort_ms` 单独报一行。
+
+**基线口径**：这是纵向对照——同一实现、同一场景、同一批查询点、同一会话成对跑，
+关/开 `--query-sort` 各 5 轮取中位数。点查询没有可引用的外部 kNN/半径实现
+（Embree `rtcPointQuery` 只对三角网格找最近点、Warp 只有 `mesh_query_point`），
+横向绝对吞吐仍以 `docs/baseline.md` 里的 Warp 1.6.2 / Embree 数字为准，本章未改内核，
+横向关系不变。
+
+地形 2M 三角形（419 万节点 = 134 MB，5× L2），3 s 预热后成对测量：
+
+| 查询 | 输入序 | Morton 序 | 倍数 | 排序开销 |
+|---|---|---|---|---|
+| closest，20k | 5.226 ms | 5.232 ms | 1.00× | 0.27 ms |
+| closest，100k | 19.21 ms | **11.53 ms** | **1.67×** | 0.18 ms |
+| closest，200k | 36.14 ms | **19.16 ms** | **1.89×** | 0.42 ms |
+| kNN k=8，100k | 30.35 ms | **20.74 ms** | **1.46×** | 0.31 ms |
+| radius 2.0，100k | 219.8 ms | 223.7 ms | 0.98× | 0.47 ms |
+| 随机汤 2M，closest 100k | 27.62 ms | **15.38 ms** | **1.80×** | 0.22 ms |
+| 地形 131k，closest 20k | 0.884 ms | 1.11 ms | 0.80× | 0.25 ms |
+
+- **收益来自带宽，不是少做工作**：两种顺序的节点/图元测试数完全相同
+  （closest 474.8 / 123.0，kNN 577.3 / 171.8，radius 1182.9 / 545.1），
+  Morton 序只把相邻 warp 的随机 DRAM 读换成共享的上层节点。
+- **要 10 万查询起步**：20k 查询只占 40% 占用率，内核是延迟受限的；相干性合并了
+  miss，同时在飞的 miss 也变少，收益被抵消，再扣排序钱就是净亏（131k 上 0.80×）。
+  这是**未验证的假设**，写在这里是为了标出推论边界，不当结论引用。
+- **半径查询不受益**：它遍历两遍，第二遍还要做变长 CSR 写入与段内排序，遍历只占
+  一小半，重排改不动大头。
+- **高斯**是另一种情况（`gpu_gauss_bench --query-sort`，只有 3 轮热身、±10% 噪声）：
+  10M 上 closest 20k 从 40.7 慢到 47.0 ms（0.86×），100k 从 149.3 到 136.9 ms
+  （1.09×），kNN 100k 从 252.2 到 220.8 ms（1.14×）。每查询 1775 次节点测试 +
+  348 次 14 轮牛顿的椭球距离，存储已不是主成本。
+- **逐位不变**：重排不改变任何一条查询，地形 2M 10 万查询两种顺序的指纹都是
+  `closest 0x0ecd1029bdb758b4`、`kNN8 0x169e1b986f7ca4b3`；radius 131k 两万查询
+  都是 `0xba0f794cf680d9a3`，且 `count/tri/dist2_mismatch` 全 0。Python 新增 5 项
+  逐位检查（`Scene.closest/knn/radius`、`PointCloud.closest`、`GaussianCloud.closest`
+  传 `order="morton"`），整套 **77 项**全过。
+- 库的默认值保持 `QueryOrder::Input`：阈值不是普适常数，代码不替用户猜。
+  教程见 `Quarry-学习路径/10-查询调度.md`。
+
+```python
+hit, t = scene.closest(points, order="morton")   # 默认 order="input"
+```
 
 ## Python 绑定
 
