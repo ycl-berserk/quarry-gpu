@@ -790,7 +790,27 @@ __global__ void sahSplitKernel(int taskCount, const int* __restrict__ taskBegin,
         const float ohi = floatFromOrdered(cenHi[t * 3 + a]);
         if (!(ohi > olo)) continue;
 
-        // 左半盒：从第 0 箱一路并过来；右半盒按需再扫一遍（只有 16 箱，够便宜）。
+        // 后缀盒只依赖"从第 b 箱到第 15 箱"的并集，先倒序算一遍（16 项），
+        // 再从左往右累加左半盒，切分扫描就从 O(箱²) 降成 O(箱)。
+        float slo[kSahBins][3], shi[kSahBins][3];
+        {
+            float rlo[3] = {CUDART_INF_F, CUDART_INF_F, CUDART_INF_F};
+            float rhi[3] = {-CUDART_INF_F, -CUDART_INF_F, -CUDART_INF_F};
+            for (int b = kSahBins - 1; b >= 0; --b) {
+                const uint32_t* f = B + (a * kSahBins + b) * kSahBinStride;
+                if (f[0] > 0) {
+                    for (int k = 0; k < 3; ++k) {
+                        rlo[k] = fminf(rlo[k], floatFromOrdered(f[1 + k]));
+                        rhi[k] = fmaxf(rhi[k], floatFromOrdered(f[4 + k]));
+                    }
+                }
+                for (int k = 0; k < 3; ++k) {
+                    slo[b][k] = rlo[k];
+                    shi[b][k] = rhi[k];
+                }
+            }
+        }
+
         float llo[3] = {CUDART_INF_F, CUDART_INF_F, CUDART_INF_F};
         float lhi[3] = {-CUDART_INF_F, -CUDART_INF_F, -CUDART_INF_F};
         int lc = 0;
@@ -806,17 +826,8 @@ __global__ void sahSplitKernel(int taskCount, const int* __restrict__ taskBegin,
             }
             if (lc == 0 || lc < minSide || count - lc < minSide) continue;
 
-            float rlo[3] = {CUDART_INF_F, CUDART_INF_F, CUDART_INF_F};
-            float rhi[3] = {-CUDART_INF_F, -CUDART_INF_F, -CUDART_INF_F};
-            for (int q = b + 1; q < kSahBins; ++q) {
-                const uint32_t* f = B + (a * kSahBins + q) * kSahBinStride;
-                if (f[0] == 0) continue;
-                for (int k = 0; k < 3; ++k) {
-                    rlo[k] = fminf(rlo[k], floatFromOrdered(f[1 + k]));
-                    rhi[k] = fmaxf(rhi[k], floatFromOrdered(f[4 + k]));
-                }
-            }
-            const float cost = sahArea(llo, lhi) * lc + sahArea(rlo, rhi) * (count - lc);
+            const float rArea = sahArea(slo[b + 1], shi[b + 1]);
+            const float cost = sahArea(llo, lhi) * lc + rArea * (count - lc);
             if (cost < bestCost) {
                 bestCost = cost;
                 bestInfo = 1 | (a << 2) | ((b + 1) << 4);
@@ -861,16 +872,14 @@ __global__ void sahSideKernel(const typename Ops::Item* __restrict__ items,
 }
 
 // 稳定分区：左半在前、右半在后，两侧都保持原相对顺序。目的下标只依赖同一个
-// 区间内的左计数前缀，所以每个写地址唯一、结果逐位可复现。
-template <typename Ops>
-__global__ void sahScatterKernel(const typename Ops::Item* __restrict__ items,
-                                 const int* __restrict__ order, const int* __restrict__ slotTask,
-                                 const int* __restrict__ splitInfo,
+// 区间内的左计数前缀，所以每个写地址唯一、结果逐位可复现。左/右的判定直接读
+// 上一趟的 leftFlag，不再重算重心与分箱。
+__global__ void sahScatterKernel(const int* __restrict__ order,
+                                 const int* __restrict__ slotTask,
+                                 const int* __restrict__ leftFlag,
                                  const int* __restrict__ leftCount,
                                  const int* __restrict__ taskBegin,
                                  const int* __restrict__ taskEnd,
-                                 const uint32_t* __restrict__ cenLo,
-                                 const uint32_t* __restrict__ cenHi,
                                  const int* __restrict__ childBase,
                                  const int* __restrict__ leftPrefix, int n,
                                  int* __restrict__ orderOut, int* __restrict__ slotTaskOut) {
@@ -885,14 +894,7 @@ __global__ void sahScatterKernel(const typename Ops::Item* __restrict__ items,
     const int begin = taskBegin[t];
     const int lc = leftCount[t];
     const int rc = taskEnd[t] - begin - lc;
-    const Vec3 cen = Ops::centroid(items[order[i]]);
-    const float c[3] = {cen.x, cen.y, cen.z};
-    float lo[3], hi[3];
-    for (int a = 0; a < 3; ++a) {
-        lo[a] = floatFromOrdered(cenLo[t * 3 + a]);
-        hi[a] = floatFromOrdered(cenHi[t * 3 + a]);
-    }
-    const bool left = sahIsLeft(splitInfo[t], i, begin, lc, c, lo, hi);
+    const bool left = leftFlag[i] != 0;
     const int localLeft = leftPrefix[i] - leftPrefix[begin];
     const int dest = left ? begin + localLeft : begin + lc + (i - begin - localLeft);
     orderOut[dest] = order[i];
@@ -1315,9 +1317,9 @@ GpuBVH buildSAH(const typename Ops::Item* hostItems, int n, GpuBuildTimings* tim
                    "left scan");
             qc.mark(2);
 
-            sahScatterKernel<Ops><<<blocksFor(n), kBlock>>>(
-                dSrc.p, order, slot, dSplitInfo.p, dLeftCount.p, begin, end, dCenLo.p, dCenHi.p,
-                dChildBase.p, dLeftPrefix.p, n, orderOther, slotOther);
+            sahScatterKernel<<<blocksFor(n), kBlock>>>(order, slot, dLeftFlag.p, dLeftCount.p,
+                                                       begin, end, dChildBase.p, dLeftPrefix.p, n,
+                                                       orderOther, slotOther);
             sahAssignKernel<<<blocksFor(taskCount), kBlock>>>(
                 taskCount, begin, end, nodeId, dLeftCount.p, dChildBase.p, internalBase, n, nodes,
                 dParent.p, beginOther, endOther, nodeIdOther);
