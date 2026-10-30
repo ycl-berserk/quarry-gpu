@@ -431,6 +431,9 @@ __global__ void checkNodesKernel(const GpuBVHNode* __restrict__ nodes,
             atomicAdd(&errors[0], 1);
             return;
         }
+        // 叶子必须正好占 n-1+slot 且装一个图元：拓扑变更后的重编号要靠它，
+        // 查询/refit 的叶子寻址也都默认这条。
+        if (i != n - 1 + slot || nd.right != 1) atomicAdd(&errors[3], 1);
         const AABB mine = nodeBox(nd);
         const AABB prim = Ops::bounds(sortedItems[slot]);
         if (mine.mn.x != prim.mn.x || mine.mn.y != prim.mn.y || mine.mn.z != prim.mn.z ||
@@ -446,6 +449,26 @@ __global__ void checkRefsKernel(const int* __restrict__ visited, int nodeCount,
     if (i >= nodeCount) return;
     const int want = (i == 0) ? 0 : 1;
     if (visited[i] != want) atomicAdd(&errors[2], 1);
+}
+
+// 叶子槽 -> 场景索引必须是一个排列：拓扑更新后这条比任何盒子检查都先崩。
+__global__ void checkPermKernel(const int* __restrict__ primIds, int n,
+                                int* __restrict__ hist, int* __restrict__ errors) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= n) return;
+    const int id = primIds[i];
+    if (id < 0 || id >= n) {
+        atomicAdd(&errors[4], 1);
+        return;
+    }
+    atomicAdd(&hist[id], 1);
+}
+
+__global__ void checkPermCountKernel(const int* __restrict__ hist, int n,
+                                     int* __restrict__ errors) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= n) return;
+    if (hist[i] != 1) atomicAdd(&errors[4], 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,6 +1143,7 @@ GpuBVH buildLBVH(const typename Ops::Item* hostItems, int n, GpuBuildTimings* ti
     GpuBVH bvh;
     bvh.primCount = n;
     bvh.nodeCount = nodeCount;
+    bvh.sah = false;
     cudaOk(cudaMalloc(&bvh.d_nodes, static_cast<size_t>(nodeCount) * sizeof(GpuBVHNode)), "nodes");
     cudaOk(cudaMalloc(&bvh.d_tris, static_cast<size_t>(n) * sizeof(Item)), "tris");
     cudaOk(cudaMalloc(&bvh.d_primIds, static_cast<size_t>(n) * sizeof(int)), "primIds");
@@ -1210,6 +1234,7 @@ GpuBVH buildSAH(const typename Ops::Item* hostItems, int n, GpuBuildTimings* tim
     GpuBVH bvh;
     bvh.primCount = n;
     bvh.nodeCount = nodeCount;
+    bvh.sah = true;
     cudaOk(cudaMalloc(&bvh.d_nodes, static_cast<size_t>(nodeCount) * sizeof(GpuBVHNode)), "nodes");
     cudaOk(cudaMalloc(&bvh.d_tris, static_cast<size_t>(n) * sizeof(Item)), "tris");
     cudaOk(cudaMalloc(&bvh.d_primIds, static_cast<size_t>(n) * sizeof(int)), "primIds");
@@ -1780,6 +1805,93 @@ double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
     return refitImpl<GaussianOps>(bvh, cloud.gaussians, &dirty, timings);
 }
 
+// 拓扑更新。编辑脚本的语义写在 gpu_bvh.h 的 GpuTopoEdit 上：newScene 是幸存者
+// （保序）+ 末尾追加，所以幸存者的新下标 = 旧下标 - 它前面删掉的数量。
+template <typename Ops>
+static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>& items,
+                             const GpuTopoEdit& edit, GpuTopoUpdateTimings* timings) {
+    const int nOld = bvh.primCount;
+    if (bvh.d_nodes == nullptr || nOld < 2) throw std::invalid_argument("updateBVHGPU: BVH not built");
+    if (edit.appended < 0) throw std::invalid_argument("updateBVHGPU: appended must be >= 0");
+    for (size_t i = 0; i < edit.deleted.size(); ++i) {
+        const int id = edit.deleted[i];
+        if (id < 0 || id >= nOld) throw std::invalid_argument("updateBVHGPU: deleted out of range");
+        if (i > 0 && id <= edit.deleted[i - 1]) {
+            throw std::invalid_argument("updateBVHGPU: deleted must be ascending and unique");
+        }
+    }
+    const long long nNew = static_cast<long long>(nOld) - static_cast<long long>(edit.deleted.size()) +
+                           edit.appended;
+    if (nNew < 2) throw std::invalid_argument("updateBVHGPU: at least 2 primitives required");
+    if (static_cast<long long>(items.size()) != nNew) {
+        throw std::invalid_argument("updateBVHGPU: scene size does not match the edit");
+    }
+    for (int id : edit.moved) {
+        if (id < 0 || id >= static_cast<int>(nNew)) {
+            throw std::invalid_argument("updateBVHGPU: moved index out of range");
+        }
+    }
+
+    GpuTopoUpdateTimings local;
+    GpuTopoUpdateTimings* t = timings ? timings : &local;
+    *t = GpuTopoUpdateTimings{};
+    t->deleted = static_cast<int>(edit.deleted.size());
+    t->appended = edit.appended;
+    t->newDepth = bvh.depth;
+
+    if (edit.deleted.empty() && edit.appended == 0) {
+        // 纯移动：树形没变，走原来的增量 refit 快路径（上传只含改动的图元）。
+        GpuRefitTimings rt;
+        t->refitMs = refitImpl<Ops>(bvh, items, &edit.moved, &rt);
+        t->moved = rt.updated;
+        t->totalMs = t->refitMs;
+        return t->totalMs;
+    }
+
+    // 局部重建（切分 → 森林 SAH → 重编号）还没接上；这一版先把编辑脚本、非法输入
+    // 检查与回退语义定下来：整棵按同一套建树器重建，接口与 timings 不变。
+    const bool wide = bvh.d_wideNodes != nullptr;
+    const bool sah = bvh.sah;
+
+    StageClock clock;
+    clock.mark();                                // 0
+    destroyBVHGPU(bvh);
+    GpuBuildTimings bt;
+    bvh = sah ? buildSAH<Ops>(items.data(), static_cast<int>(nNew), &bt)
+              : buildLBVH<Ops>(items.data(), static_cast<int>(nNew), &bt);
+    clock.mark();                                // 1
+    double wideMs = 0.0;
+    if (wide) {
+        wideMs = buildWideNodesGPU(bvh);
+        clock.mark();                                // 2
+    }
+    cudaOk(cudaEventSynchronize(clock.ev[clock.marks - 1]), "topo sync");
+
+    t->surgeryRoots = 1;
+    t->rebuiltLeaves = static_cast<int>(nNew);
+    t->newDepth = bvh.depth;
+    t->fullRebuild = true;
+    t->wideMs = wideMs;
+    t->totalMs = clock.ms(0, clock.marks - 1);
+    t->surgeryMs = t->totalMs - wideMs;
+    return t->totalMs;
+}
+
+double updateBVHGPU(GpuBVH& bvh, const Scene& scene, const GpuTopoEdit& edit,
+                    GpuTopoUpdateTimings* timings) {
+    return updateTopology<TriOps>(bvh, scene.tris, edit, timings);
+}
+
+double updatePointBVHGPU(GpuBVH& bvh, const PointCloud& cloud, const GpuTopoEdit& edit,
+                         GpuTopoUpdateTimings* timings) {
+    return updateTopology<PointOps>(bvh, cloud.pts, edit, timings);
+}
+
+double updateGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud, const GpuTopoEdit& edit,
+                            GpuTopoUpdateTimings* timings) {
+    return updateTopology<GaussianOps>(bvh, cloud.gaussians, edit, timings);
+}
+
 template <typename Ops>
 std::string validateImpl(const GpuBVH& bvh, const std::vector<typename Ops::Item>& items,
                          const AABB& bounds) {
@@ -1792,15 +1904,20 @@ std::string validateImpl(const GpuBVH& bvh, const std::vector<typename Ops::Item
     const auto* sortedTris = static_cast<const typename Ops::Item*>(bvh.d_tris);
 
     DevBuf<int> dVisited(nodeCount);
-    DevBuf<int> dErrors(4);
+    DevBuf<int> dErrors(5);
+    DevBuf<int> dHist(static_cast<size_t>(n));
     cudaOk(cudaMemset(dVisited.p, 0, static_cast<size_t>(nodeCount) * sizeof(int)), "visited");
-    cudaOk(cudaMemset(dErrors.p, 0, 4 * sizeof(int)), "errors");
+    cudaOk(cudaMemset(dErrors.p, 0, 5 * sizeof(int)), "errors");
+    cudaOk(cudaMemset(dHist.p, 0, static_cast<size_t>(n) * sizeof(int)), "prim hist");
 
     checkNodesKernel<Ops><<<blocksFor(nodeCount), kBlock>>>(nodes, sortedTris, n, nodeCount,
                                                             dVisited.p, dErrors.p);
     checkRefsKernel<<<blocksFor(nodeCount), kBlock>>>(dVisited.p, nodeCount, dErrors.p);
+    checkPermKernel<<<blocksFor(n), kBlock>>>(static_cast<const int*>(bvh.d_primIds), n, dHist.p,
+                                              dErrors.p);
+    checkPermCountKernel<<<blocksFor(n), kBlock>>>(dHist.p, n, dErrors.p);
 
-    int errors[4] = {};
+    int errors[5] = {};
     cudaOk(cudaMemcpy(errors, dErrors.p, sizeof(errors), cudaMemcpyDeviceToHost), "D2H errors");
 
     GpuBVHNode root{};
@@ -1819,6 +1936,8 @@ std::string validateImpl(const GpuBVH& bvh, const std::vector<typename Ops::Item
     if (errors[0]) add("bad_children_or_box", errors[0]);
     if (errors[1]) add("bad_leaf_box", errors[1]);
     if (errors[2]) add("bad_refcount", errors[2]);
+    if (errors[3]) add("bad_leaf_id", errors[3]);
+    if (errors[4]) add("bad_prim_map", errors[4]);
     if (badRoot) add("root_box_mismatch", 1);
     return why;
 }

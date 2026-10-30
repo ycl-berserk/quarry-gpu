@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/fingerprint.h"
@@ -49,6 +50,11 @@ struct Options {
     double refitShift = 0.005;
     double refitDirty = 0.01;
     std::string refitMotion = "random";
+    bool topo = false;
+    std::string topoKind = "cluster";
+    std::string topoMix = "mixed";
+    double topoFrac = 0.01;
+    int topoRounds = 5;
     bool querySort = false;
     bool wide = false;
     bool sah = false;
@@ -76,6 +82,11 @@ void printUsage() {
         "  --refit-shift F                每个三角形随机平移的幅度（场景对角线的比例），default 0.005\n"
         "  --refit-dirty F                第一步改动的三角形比例，default 0.01\n"
         "  --refit-motion random|coherent 位移方式：逐三角形独立 / 平滑场，default random\n"
+        "  --topo                         拓扑更新实验：每轮增/删/移动，与整棵重建对拍\n"
+        "  --topo-kind cluster|scatter    编辑落在局部簇内 / 全场景均匀，default cluster\n"
+        "  --topo-mix insert|delete|move|mixed  每轮的编辑种类，default mixed\n"
+        "  --topo-frac F                  每轮改动的三角形比例，default 0.01\n"
+        "  --topo-rounds N                连续更新的轮数，default 5\n"
         "  --query-sort                   查询点按 Morton 序重排后再遍历（不能与 --refit 同用）\n"
         "  --sah                          用自顶向下分箱 SAH 建树（默认 LBVH）\n");
 }
@@ -163,6 +174,37 @@ bool parseArgs(int argc, char** argv, Options& opt) {
                 std::fprintf(stderr, "unknown --refit-motion: %s\n", v);
                 return false;
             }
+        } else if (arg == "--topo") {
+            opt.topo = true;
+        } else if (arg == "--topo-kind") {
+            const char* v = needValue("--topo-kind");
+            if (!v) return false;
+            opt.topoKind = v;
+            if (opt.topoKind != "cluster" && opt.topoKind != "scatter") {
+                std::fprintf(stderr, "unknown --topo-kind: %s\n", v);
+                return false;
+            }
+        } else if (arg == "--topo-mix") {
+            const char* v = needValue("--topo-mix");
+            if (!v) return false;
+            opt.topoMix = v;
+            if (opt.topoMix != "insert" && opt.topoMix != "delete" && opt.topoMix != "move" &&
+                opt.topoMix != "mixed") {
+                std::fprintf(stderr, "unknown --topo-mix: %s\n", v);
+                return false;
+            }
+        } else if (arg == "--topo-frac") {
+            const char* v = needValue("--topo-frac");
+            if (!v) return false;
+            opt.topoFrac = std::atof(v);
+            if (opt.topoFrac <= 0.0 || opt.topoFrac > 1.0) {
+                std::fprintf(stderr, "--topo-frac must be in (0, 1]\n");
+                return false;
+            }
+        } else if (arg == "--topo-rounds") {
+            const char* v = needValue("--topo-rounds");
+            if (!v) return false;
+            opt.topoRounds = std::max(1, std::atoi(v));
         } else if (arg == "--wide") {
             opt.wide = true;
         } else if (arg == "--sah") {
@@ -330,6 +372,149 @@ void displaceTriangles(Scene& scene, float amplitude, const std::vector<int>* wh
     scene.updateBounds();
 }
 
+// ---- 拓扑更新实验的编辑脚本 ----
+// cluster 取"绕一个随机锚点最近的一批三角形"，scatter 均匀抽样；新增三角形用
+// 场景自身的三角形做模板，规模与位置都和原场景同量级。
+struct SplitMix {
+    uint64_t s = 0;
+    uint64_t next() {
+        uint64_t z = (s += 0x9e3779b97f4a7c15ull);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        return z ^ (z >> 31);
+    }
+    float unit() { return static_cast<float>((next() >> 40) * (1.0 / 16777216.0)); }
+    int below(int n) { return static_cast<int>(next() % static_cast<uint64_t>(n)); }
+};
+
+struct TopoScript {
+    GpuTopoEdit edit;
+    Scene next;
+};
+
+struct TopoPick {
+    std::vector<int> ids;  // 升序
+    int anchor = 0;
+};
+
+TopoPick topoPick(const Scene& s, const std::string& kind, int count, SplitMix& rng) {
+    const int n = static_cast<int>(s.tris.size());
+    TopoPick out;
+    out.anchor = rng.below(n);
+    count = std::min(count, n);
+    if (count <= 0) return out;
+    if (kind == "scatter") {
+        std::vector<int> ids(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) ids[static_cast<size_t>(i)] = i;
+        for (int i = 0; i < count; ++i) {
+            const int j = i + rng.below(n - i);
+            std::swap(ids[static_cast<size_t>(i)], ids[static_cast<size_t>(j)]);
+        }
+        ids.resize(static_cast<size_t>(count));
+        std::sort(ids.begin(), ids.end());
+        out.ids = std::move(ids);
+        return out;
+    }
+    const Tri& t = s.tris[static_cast<size_t>(out.anchor)];
+    const Vec3 c0 = (t.a + t.b + t.c) * (1.0f / 3.0f);
+    std::vector<std::pair<float, int>> d(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const Tri& u = s.tris[static_cast<size_t>(i)];
+        const Vec3 c = (u.a + u.b + u.c) * (1.0f / 3.0f);
+        const Vec3 e = c - c0;
+        d[static_cast<size_t>(i)] = {dot(e, e), i};
+    }
+    std::nth_element(d.begin(), d.begin() + (count - 1), d.end());
+    out.ids.resize(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) out.ids[static_cast<size_t>(i)] = d[static_cast<size_t>(i)].second;
+    std::sort(out.ids.begin(), out.ids.end());
+    return out;
+}
+
+TopoScript makeTopoScript(const Scene& s, const std::string& kind, const std::string& mix,
+                          double frac, uint64_t seed) {
+    const int n = static_cast<int>(s.tris.size());
+    SplitMix rng{seed};
+    int count = std::max(1, static_cast<int>(std::lround(frac * n)));
+    count = std::min(count, std::max(0, n - 2));  // 至少留两个图元
+
+    int nDel = 0, nAdd = 0, nMov = 0;
+    if (mix == "insert") {
+        nAdd = count;
+    } else if (mix == "delete") {
+        nDel = count;
+    } else if (mix == "move") {
+        nMov = count;
+    } else {
+        nDel = count / 3;
+        nAdd = count / 3;
+        nMov = count - nDel - nAdd;
+    }
+
+    const TopoPick pick = topoPick(s, kind, std::max(nDel, 1), rng);
+
+    Vec3 ext = s.bounds.mx - s.bounds.mn;
+    const Vec3 mid = (s.bounds.mx + s.bounds.mn) * 0.5f;
+    const double diag = std::sqrt(static_cast<double>(dot(ext, ext)));
+
+    std::vector<char> dead(static_cast<size_t>(n), 0);
+    TopoScript sc;
+    for (int i = 0; i < nDel; ++i) {
+        dead[static_cast<size_t>(pick.ids[static_cast<size_t>(i)])] = 1;
+        sc.edit.deleted.push_back(pick.ids[static_cast<size_t>(i)]);
+    }
+
+    sc.next.tris.reserve(static_cast<size_t>(n - nDel + nAdd));
+    for (int i = 0; i < n; ++i) {
+        if (!dead[static_cast<size_t>(i)]) sc.next.tris.push_back(s.tris[static_cast<size_t>(i)]);
+    }
+
+    for (int i = 0; i < nAdd; ++i) {
+        const int tpl = kind == "cluster" ? pick.anchor : rng.below(n);
+        const Tri& t = s.tris[static_cast<size_t>(tpl)];
+        Vec3 d;
+        if (kind == "cluster") {
+            const float r = static_cast<float>(0.02 * diag);
+            d = {(rng.unit() * 2.0f - 1.0f) * r, (rng.unit() * 2.0f - 1.0f) * r,
+                 (rng.unit() * 2.0f - 1.0f) * r};
+        } else {
+            const Vec3 c = (t.a + t.b + t.c) * (1.0f / 3.0f);
+            const Vec3 target = {mid.x + (rng.unit() - 0.5f) * ext.x,
+                                 mid.y + (rng.unit() - 0.5f) * ext.y,
+                                 mid.z + (rng.unit() - 0.5f) * ext.z};
+            d = target - c;
+        }
+        sc.next.tris.push_back({t.a + d, t.b + d, t.c + d});
+    }
+
+    // moved 用新场景下标：挑一部分幸存者小幅位移（拓扑不变）。
+    const int survivors = static_cast<int>(sc.next.tris.size());
+    nMov = std::min(nMov, survivors);
+    if (nMov > 0) {
+        std::vector<int> ids(static_cast<size_t>(survivors));
+        for (int i = 0; i < survivors; ++i) ids[static_cast<size_t>(i)] = i;
+        for (int i = 0; i < nMov; ++i) {
+            const int j = i + rng.below(survivors - i);
+            std::swap(ids[static_cast<size_t>(i)], ids[static_cast<size_t>(j)]);
+        }
+        ids.resize(static_cast<size_t>(nMov));
+        std::sort(ids.begin(), ids.end());
+        const float amp = static_cast<float>(0.005 * diag);
+        for (const int id : ids) {
+            Tri& t = sc.next.tris[static_cast<size_t>(id)];
+            const Vec3 d = {(rng.unit() * 2.0f - 1.0f) * amp, (rng.unit() * 2.0f - 1.0f) * amp,
+                            (rng.unit() * 2.0f - 1.0f) * amp};
+            t.a = t.a + d;
+            t.b = t.b + d;
+            t.c = t.c + d;
+        }
+        sc.edit.moved = std::move(ids);
+    }
+    sc.edit.appended = nAdd;
+    sc.next.updateBounds();
+    return sc;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -379,6 +564,10 @@ int main(int argc, char** argv) {
     std::printf(" seed=%llu\n", static_cast<unsigned long long>(opt.seed));
     if (opt.querySort && opt.refit) {
         std::printf("--query-sort does not support --refit yet\n");
+        return 1;
+    }
+    if (opt.topo && opt.refit) {
+        std::printf("--topo and --refit are separate experiments; run them one at a time\n");
         return 1;
     }
 
@@ -759,6 +948,80 @@ int main(int argc, char** argv) {
         std::printf("cost_vs_rebuild partial=%.2fx refit=%.2fx query refit/rebuild=%.2fx\n",
                     rebuildMs / partialMs, rebuildMs / fullMs, refitQuery / rebuildQuery);
         destroyBVHGPU(rebuilt);
+    }
+
+    if (opt.topo) {
+        // ---- 拓扑更新：每轮增/删/移动，与"对同一份新场景全新构建"对拍 ----
+        // 门禁是查询输出逐位相同：树形不同不影响结果，所以这比比树本身更强。
+        const double nPoints = static_cast<double>(points.size());
+        auto runQuery = [&](GpuBVH& b, bool st) {
+            return queryGpu(b, buf, stride, opt.query, opt.k, opt.radius, st, QueryOrder::Input,
+                            opt.wide);
+        };
+        std::printf("topo kind=%s frac=%.4f mix=%s rounds=%d tris=%zu query=%s%s\n",
+                    opt.topoKind.c_str(), opt.topoFrac, opt.topoMix.c_str(), opt.topoRounds,
+                    scene.tris.size(), opt.query.c_str(), opt.sah ? " sah" : " lbvh");
+        Scene cur = scene;
+        std::vector<double> updTimes;
+        std::vector<double> rebuildTimes;
+        int fallbacks = 0;
+        for (int r = 0; r < opt.topoRounds; ++r) {
+            TopoScript sc = makeTopoScript(cur, opt.topoKind, opt.topoMix, opt.topoFrac,
+                                                 opt.seed * 7919ull + static_cast<uint64_t>(r));
+            GpuTopoUpdateTimings tt{};
+            double upd = 0.0;
+            try {
+                upd = updateBVHGPU(gpu, sc.next, sc.edit, &tt);
+            } catch (const std::exception& e) {
+                std::printf("topo update failed: %s\n", e.what());
+                return 3;
+            }
+            updTimes.push_back(upd);
+            if (tt.fullRebuild) ++fallbacks;
+
+            const std::string treeErr = validateBVHGPU(gpu, sc.next);
+            if (!treeErr.empty()) {
+                std::printf("topo round=%d tree FAIL: %s\n", r, treeErr.c_str());
+                return 4;
+            }
+
+            GpuBVH fresh;
+            GpuBuildTimings fb{};
+            try {
+                fresh = opt.sah ? buildBVHSahGPU(sc.next, &fb) : buildBVHGPU(sc.next, &fb);
+                if (opt.wide) buildWideNodesGPU(fresh);
+            } catch (const std::exception& e) {
+                std::printf("topo rebuild failed: %s\n", e.what());
+                destroyBVHGPU(fresh);
+                return 3;
+            }
+            rebuildTimes.push_back(fb.totalMs);
+
+            const QueryOutput got = runQuery(gpu, true);
+            const QueryOutput want = runQuery(fresh, false);
+            const Mismatch m = compareQueryOutput(want, got);
+            destroyBVHGPU(fresh);
+
+            std::printf(
+                "topo round=%d del=%zu add=%d move=%zu update=%.3f ms rebuild=%.3f ms x=%.2f "
+                "full=%d roots=%d leaves=%d depth=%d node_tests=%.1f mismatch=%llu/%llu/%llu\n",
+                r, sc.edit.deleted.size(), sc.edit.appended, sc.edit.moved.size(), upd,
+                fb.totalMs, fb.totalMs > 0.0 ? upd / fb.totalMs : 0.0,
+                tt.fullRebuild ? 1 : 0, tt.surgeryRoots, tt.rebuiltLeaves, gpu.depth,
+                got.stats.nodeTests / nPoints, static_cast<unsigned long long>(m.count),
+                static_cast<unsigned long long>(m.tri), static_cast<unsigned long long>(m.dist));
+            if (m.count || m.tri || m.dist) exitCode = 6;
+            cur = std::move(sc.next);
+        }
+
+        std::sort(updTimes.begin(), updTimes.end());
+        std::sort(rebuildTimes.begin(), rebuildTimes.end());
+        const double medUpd = updTimes[updTimes.size() / 2];
+        const double medReb = rebuildTimes[rebuildTimes.size() / 2];
+        std::printf("topo median_update=%.3f ms median_rebuild=%.3f ms x=%.2f fallbacks=%d/%d "
+                    "final_depth=%d tris=%zu\n",
+                    medUpd, medReb, medReb > 0.0 ? medUpd / medReb : 0.0, fallbacks,
+                    opt.topoRounds, gpu.depth, cur.tris.size());
     }
 
     destroyRadiusBufferGPU(radiusBuf);

@@ -303,6 +303,53 @@ def main():
     check("second partial update validate", scene.validate() == "", scene.validate())
     check_closest(scene, points, again, "second partial update closest")
 
+    # ---- 拓扑更新：删掉 3 个、尾部追加 150 个 ----
+    deleted = np.array([3, 100, 700], dtype=np.int32)
+    keep = np.ones(len(again), dtype=bool)
+    keep[deleted] = False
+    extra = (lo + 0.2 * (hi - lo) * rng.random((150, 3, 3))).astype(np.float32)
+    new_tris = np.concatenate([again[keep], extra], axis=0)
+    topo = scene.update_topology(new_tris, deleted=deleted)
+    check("topo triangle count", scene.triangle_count == len(new_tris), scene.triangle_count)
+    check("topo validate", scene.validate() == "", scene.validate())
+    check("topo edit counts", topo["deleted"] == 3 and topo["appended"] == 150
+          and topo["moved"] == 0, topo)
+    freshness = quarry.Scene(new_tris)
+    td2, tid = scene.closest(points)
+    fd2, fid = freshness.closest(points)
+    check("topo closest bitwise", np.array_equal(tid, fid)
+          and np.array_equal(td2.view(np.uint32), fd2.view(np.uint32)))
+    tkd, tkid = scene.knn(points, 8)
+    fkd, fkid = freshness.knn(points, 8)
+    check("topo knn bitwise", np.array_equal(tkid, fkid)
+          and np.array_equal(tkd.view(np.uint32), fkd.view(np.uint32)))
+    thit, tt = scene.raycast(origins, dirs)
+    fhit, ft = freshness.raycast(origins, dirs)
+    check("topo raycast bitwise", np.array_equal(thit, fhit)
+          and np.array_equal(tt.view(np.uint32), ft.view(np.uint32)))
+
+    # 纯移动：数量不变，走原来的增量 refit 快路径
+    shifted = new_tris.copy()
+    moved_ids = np.array([0, 5, 11], dtype=np.int32)
+    shifted[moved_ids] += np.array([0.0, 0.5, 0.0], dtype=np.float32)
+    mtopo = scene.update_topology(shifted, moved=moved_ids)
+    check("topo move-only uses refit", not mtopo["full_rebuild"] and mtopo["refit_ms"] > 0.0,
+          mtopo)
+    check("topo move validate", scene.validate() == "", scene.validate())
+    mfresh = quarry.Scene(shifted)
+    md2, mid = scene.closest(points)
+    rd2, rid = mfresh.closest(points)
+    check("topo move closest bitwise", np.array_equal(mid, rid)
+          and np.array_equal(md2.view(np.uint32), rd2.view(np.uint32)))
+
+    # 网格绑定在拓扑变化后失效：update_vertices 必须拒绝
+    try:
+        scene.update_vertices(lifted)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("update_vertices accepted a stale mesh binding after topology edit")
+
     # ---- 点云：与 numpy 暴力法逐位对拍 ----
     npts = 20000
     nq = 200
@@ -394,6 +441,22 @@ def main():
           and np.array_equal(pdist2.view(np.uint32),
                              d2_partial[rows, best_partial].view(np.uint32)))
 
+    # 拓扑更新：删 4 个、追加 500 个，结果与全新构建逐位相同
+    pdel = np.array([0, 7, 10, 555], dtype=np.int32)
+    pkeep = np.ones(npts, dtype=bool)
+    pkeep[pdel] = False
+    new_pts = np.concatenate(
+        [partial_pts[pkeep], (lo + (hi - lo) * rng.random((500, 3))).astype(np.float32)])
+    ptopo = cloud.update_topology(new_pts, deleted=pdel)
+    check("point topo count", cloud.point_count == len(new_pts), cloud.point_count)
+    check("point topo validate", cloud.validate() == "", cloud.validate())
+    check("point topo edit counts", ptopo["deleted"] == 4 and ptopo["appended"] == 500, ptopo)
+    pfresh = quarry.PointCloud(new_pts)
+    t_d2, t_id = cloud.closest(q)
+    f_d2, f_id = pfresh.closest(q)
+    check("point topo closest bitwise", np.array_equal(t_id, f_id)
+          and np.array_equal(t_d2.view(np.uint32), f_d2.view(np.uint32)))
+
     # ---- 高斯：椭球实体距离，与 numpy 暴力法对拍 ----
     ngs, ngq = 2000, 200
     gmeans, grot, gscale = quarry.demo_gaussians("sheet", ngs, seed=3)
@@ -475,6 +538,33 @@ def main():
           np.allclose(pdist2, gd2_part[grows, best_part], rtol=1e-4, atol=1e-6)
           and np.all(gd2_part[grows, pidx] <= gd2_part[grows, best_part] * (1 + 1e-4) + 1e-6))
 
+    # 拓扑更新：删 3 个、追加 300 个，距离与全新构建一致（并列允许不同下标）
+    gdel = np.array([1, 2, 100], dtype=np.int32)
+    gkeep = np.ones(ngs, dtype=bool)
+    gkeep[gdel] = False
+    add_m = (gmeans[gkeep].min(axis=0)
+             + (gmeans[gkeep].max(axis=0) - gmeans[gkeep].min(axis=0))
+             * rng.random((300, 3))).astype(np.float32)
+    add_r = grot[rng.integers(0, 10, 300)]
+    add_s = gscale[rng.integers(0, 10, 300)] * np.float32(0.5)
+    new_m = np.concatenate([gpartial[gkeep], add_m])
+    new_r = np.concatenate([grot[gkeep], add_r])
+    new_s = np.concatenate([gscale[gkeep], add_s])
+    gtopo = gcloud.update_topology(new_m, new_r, new_s, deleted=gdel)
+    check("gaussian topo count", gcloud.gaussian_count == len(new_m), gcloud.gaussian_count)
+    check("gaussian topo validate", gcloud.validate() == "", gcloud.validate())
+    check("gaussian topo edit counts",
+          gtopo["deleted"] == 3 and gtopo["appended"] == 300, gtopo)
+    gfresh = quarry.GaussianCloud(new_m, new_r, new_s)
+    t_d2, t_id = gcloud.closest(gq)
+    f_d2, f_id = gfresh.closest(gq)
+    check("gaussian topo closest dist2 bitwise",
+          np.array_equal(t_d2.view(np.uint32), f_d2.view(np.uint32)))
+    gnew_d2 = ellipsoid_dist2(gq, new_m, new_r, new_s)
+    check("gaussian topo ids are minimizers",
+          np.all(gnew_d2[grows, t_id] <= t_d2 * (1 + 1e-4) + 1e-6),
+          f"{(gnew_d2[grows, t_id] > t_d2 * (1 + 1e-4) + 1e-6).sum()} strays")
+
     for bad_call in (lambda: quarry.Scene(np.zeros((5, 3), dtype=np.float32)),
                      lambda: quarry.PointCloud(np.zeros((1, 3), dtype=np.float32)),
                      lambda: scene.knn(points, 0),
@@ -484,6 +574,12 @@ def main():
                      lambda: scene.update_triangles(partial[:10]),
                      lambda: cloud.update_points(pts[:10]),
                      lambda: gcloud.update(gmoved[:10], grot, gscale),
+                     lambda: scene.update_topology(new_tris[:-1]),
+                     lambda: scene.update_topology(new_tris,
+                                                   deleted=np.array([5, 3], dtype=np.int32)),
+                     lambda: scene.update_topology(new_tris,
+                                                   deleted=np.array([0, 10 ** 6], dtype=np.int32)),
+                     lambda: cloud.update_topology(pts[:10]),
                      lambda: quarry.GaussianCloud(gmeans, grot, gscale[:10]),
                      lambda: quarry.GaussianCloud(gmeans, grot, -gscale),
                      lambda: face_scene.update_vertices(lifted)):

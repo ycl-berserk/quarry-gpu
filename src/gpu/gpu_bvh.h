@@ -49,6 +49,9 @@ struct GpuBVH {
     void* d_wideNodes = nullptr;    // GpuBVH4Node[]
     void* d_wideId = nullptr;       // int[]，nodeCount
     int wideCount = 0;
+
+    // 建树器。拓扑变更超出增量预算时要按同一套重建，调用方不必再记一遍。
+    bool sah = false;
 };
 
 struct GpuBuildTimings {
@@ -128,6 +131,48 @@ double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
                            GpuRefitTimings* timings = nullptr);
 double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
                            const std::vector<int>& dirty, GpuRefitTimings* timings = nullptr);
+
+// ---- 拓扑变更（M3 收尾）----
+// 编辑脚本：newScene = 旧场景删掉 deleted 之后的幸存者（保持原有相对顺序）+ 末尾
+// 追加 appended 个图元。deleted 是旧场景下标（升序、不含重复），moved 是新场景下标
+// （几何变了、拓扑不变）。不变量：newScene.size() == bvh.primCount - deleted + appended。
+//
+// 只有删除/追加才改变树形；改动落在少数几棵子树里时只重建那几棵，其余子树原样复用，
+// 最后整块重编号（叶子恒为 n-1+slot）。改动太散、太深或占比过大时回退成整棵重建，
+// timings->fullRebuild 会置 true。查询结果与"对 newScene 全新构建"逐位相同。
+//
+// 当前阶段：纯移动走 refit 快路径，增删一律回退成整棵重建（fullRebuild 恒为 true）；
+// 切分选择、森林 SAH 与规范重编号还没接上。
+struct GpuTopoEdit {
+    std::vector<int> deleted;
+    std::vector<int> moved;
+    int appended = 0;
+};
+
+struct GpuTopoUpdateTimings {
+    double uploadMs = 0.0;
+    double planMs = 0.0;      // 切分选择 + 预算判定
+    double surgeryMs = 0.0;   // 受影响的子树重建
+    double relayoutMs = 0.0;  // 整块重编号 + 叶子重发
+    double mergeMs = 0.0;     // 新节点与祖先的盒子合并
+    double wideMs = 0.0;      // 宽节点层重建
+    double totalMs = 0.0;
+    int deleted = 0;
+    int moved = 0;            // 实际参与合并的移动图元数
+    int appended = 0;
+    int surgeryRoots = 0;     // 被重建的子树数
+    int rebuiltLeaves = 0;    // 这些子树覆盖的叶子总数
+    int newDepth = 0;
+    bool fullRebuild = false; // 走了回退（整棵重建）
+    double refitMs = 0.0;     // 纯移动编辑走 refit 快路径时的耗时
+};
+
+double updateBVHGPU(GpuBVH& bvh, const Scene& scene, const GpuTopoEdit& edit,
+                    GpuTopoUpdateTimings* timings = nullptr);
+double updatePointBVHGPU(GpuBVH& bvh, const PointCloud& cloud, const GpuTopoEdit& edit,
+                         GpuTopoUpdateTimings* timings = nullptr);
+double updateGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud, const GpuTopoEdit& edit,
+                            GpuTopoUpdateTimings* timings = nullptr);
 
 void destroyBVHGPU(GpuBVH& bvh);
 
