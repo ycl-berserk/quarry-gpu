@@ -876,6 +876,81 @@ Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
 6. 默认 `buildLBVH`；`--sah` 显式开启，Python 是 `builder="sah"`。原始日志
    `out/sah_*.txt`（gitignore）。
 
+## 拓扑可变更新（M3 收尾，2026-10-30）
+
+`updateBVHGPU` / `updatePointBVHGPU` / `updateGaussianBVHGPU` 接受一份编辑脚本
+（删 `deleted`、尾部追加 `appended`、几何改动 `moved`），只重建受影响的子树，
+其余复用，最后做规范化重编号。门禁与 refit 同一套、但更强：**更新后树的查询输出
+必须与"对同一份新场景全新构建"的树逐位相同**，而不只是与 CPU 参考一致。
+纯 move 走原 refit 快路径（`deleted` 空且 `appended == 0`）。
+
+**口径**：纵向对照，同会话、同一 exe、同一批输入，每轮与"对 `newScene` 全新构建"
+成对测量，各 5 轮中位数，3 s DVFS 预热，20k 查询点，`--no-cpu`。
+编辑量 `--topo-frac` 是每轮删除/追加/移动各占当前场景的比例；
+`cluster` 把编辑集中在一小块空间，`scatter` 在全场景均匀抽取。
+倍数是 update / 重建，**小于 1 表示更新比重建快**。
+
+| 规模 | 建树器 | 编辑 | update | 重建 | 倍数 | 回退 | 深度 | 树校验 |
+|---|---|---|---|---|---|---|---|---|
+| 131k | LBVH | cluster 混合 1% | 6.930 | 2.673 | 2.59× | 0/5 | 25 | PASS |
+| 131k | LBVH | cluster 只增 1% | 7.546 | 2.316 | 3.26× | 0/5 | 25 | PASS |
+| 131k | LBVH | cluster 只删 1% | 5.148 | 2.198 | 2.34× | 0/5 | 25 | PASS |
+| 131k | LBVH | cluster 只移动 1% | **0.486** | 1.656 | **0.29×** | 0/5 | 25 | PASS |
+| 131k | LBVH | scatter 混合 1% | 5.959 | 2.069 | 2.88× | 5/5 | 26 | PASS |
+| 131k | SAH | cluster 混合 1% | 6.167 | 5.638 | 1.09× | 0/5 | 24 | PASS |
+| 131k | SAH | scatter 混合 1% | 14.947 | 6.799 | 2.20× | 5/5 | 20 | PASS |
+| 2M | LBVH | cluster 混合 1% | 31.871 | 20.836 | 1.53× | 0/5 | 31 | PASS |
+| 2M | LBVH | scatter 混合 1% | 55.961 | 21.238 | 2.63× | 5/5 | 32 | PASS |
+| 2M | SAH | cluster 混合 1% | **31.191** | 64.740 | **0.48×** | 0/5 | 28 | PASS |
+| 2M | SAH | scatter 混合 1% | 115.434 | 67.073 | 1.72× | 5/5 | 25 | PASS |
+
+2M LBVH cluster 的比例扫描：
+
+| 比例 | update | 重建 | 倍数 | 重建叶子 | 深度 |
+|---|---|---|---|---|---|
+| 0.1% | 30.735 | 20.526 | 1.50× | 3.7–6.4k | 31 |
+| 0.5% | 31.699 | 21.013 | 1.51× | 11–35k | 31 |
+| 1% | 31.871 | 20.836 | 1.53× | 16.5–38k | 31 |
+| 5% | 39.705 | 20.949 | 1.90× | 54–98k | 35 |
+
+分阶段（2M cluster 1% 五轮中位数）：plan 6.2 / surgery 10.6 / relayout 14.3 /
+merge 0.6 ms，总 31.9；131k 同配置是 1.5 / 3.0 / 1.5 / 0.5，总 6.9。
+
+宽节点（2M cluster 1%，`--wide`）：总 53.674 vs 重建 20.931（2.56×）。
+其中 `buildWideNodesGPU` 报告的 emit kernel 只有 1.7–2.5 ms，其余约 19 ms 是
+每轮 `cudaFree`/`cudaMalloc` 128 MB 宽数组、CUB 前缀和与两次 D2H 同步——
+**成本在分配与同步，不在重发**。131k 宽节点 9.114 vs 2.574（3.54×，宽数组 33 MB）。
+
+读法：
+
+1. **纯 move 是 refit，不是本章的成本**：0.29×（131k），2M 同量级但受 H2D 限制。
+   移动量小时，`update_topology` 和 `update_vertices` 是同一条路。
+2. **2M SAH 更新比重建快一倍（0.48×）**，因为 SAH 重建要 62–65 ms，而更新 31 ms
+   与建树器无关。LBVH 重建只要 21 ms，所以同样是 1.5×。**拓扑更新是否划算，
+   先看建树器**：SAH 几乎总是划算，LBVH 只有 move 或大比例（>25%）重建时才值。
+3. **1/5 的目标未达成**：31.9 ms 里 plan + relayout 两个 O(n) 阶段占 65%
+   （前缀和、切分选择、规范化重编号、整片重发叶子）。131k 上固定开销占比更高，
+   倍数 2.3–3.3×。稳定槽位、节点池、缓冲复用（R5 清单）是下一版的事。
+4. **scatter 必须直接重建**：切分根覆盖的旧叶子超过 `n/4` 即回退；回退时规划
+   与暂存的钱已经花了，总耗时是直接重建的 1.7–2.9×。判据是"编辑是否成簇"，
+   不是比例本身。
+5. **深度受控**：cluster 1% 五轮深度不动（2M 31、131k 25），5% 到 35；超过
+   构造深度 + 6 层强制整树重建。会话 3 的 300 轮压力：回退 18/300，深度 22–29
+   振荡，节点测试 ≤133/查询，closest/kNN/radius 全程零失配。
+6. **正确性门禁**：19 个配置 × 5 轮 = 95 次更新，每轮 `validateBVHGPU(newScene)`
+   空串、closest / kNN(k=1,8,16) / radius / 射线 `t` 与全新构建逐位相同
+   （`count/tri/dist_mismatch=0/0/0`）；同一输入两次更新的节点数组 FNV 哈希一致
+   （日志中的 `tree=`）。全量矩阵原始日志 `out/topo_matrix.txt`（gitignore）。
+
+复现：
+
+```bat
+build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.01 --topo-mix mixed --topo-rounds 5
+build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind scatter --topo-frac 0.01 --topo-mix mixed --topo-rounds 5
+build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.01 --topo-mix mixed --topo-rounds 5 --sah
+build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.01 --topo-mix move --topo-rounds 5
+```
+
 ## 结论
 
 1. **CPU 吞吐随场景大小塌陷一个数量级。** 13 万三角形受缓存保护，32 线程能到 96 Mrays/s；200 万三角形掉到 19.7，属于结构性访存受限，增加线程无用。

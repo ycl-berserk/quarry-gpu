@@ -388,6 +388,7 @@ py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（84 项检查）
 | `scene.update_triangles(triangles, dirty=None)` | 同上，直接给 `(M,3,3)`；`refit_ms` / `refit_stats` 读上一次的耗时 |
 | `cloud.update_points(points, dirty=None)` | 点云 refit：点数不变；`dirty` 是改动的点索引 |
 | `gcloud.update(means, rot, scale, dirty=None)` | 高斯 refit：数量不变，中心/朝向/半轴可一起换；半轴必须 > 0 |
+| `scene.update_topology(triangles, deleted=None, moved=None)` / `cloud.update_topology(points)` / `gcloud.update_topology(means, rot, scale, ...)` | 增删图元：数组 = 幸存者（原序去掉 `deleted`）+ 尾部追加；`moved` 是新场景里几何变了的下标；返回 timings 字典 |
 
 - 入参统一按 `float32` / C 连续处理（`forcecast`），传 float64 或非连续数组会先拷贝。
   返回数组在重新拿到 GIL 之后才分配，构建与查询期间 GIL 是释放的。
@@ -447,7 +448,92 @@ scene.refit_ms, scene.refit_stats       # {upload_ms, scatter_ms, mark_ms, merge
   场景包围盒；closest / kNN(k=8) / radius(r=2.0) 的结果与 CPU 参考逐位一致
   （`count/tri/dist2_mismatch` 全 0），连续两次局部 refit 共享叶子/祖先时同样成立。
 - 语义限制：**不增删三角形、不重排**。改了面数请重建；`update_vertices` 只对
-  `Scene(vertices, indices)` 构造的场景有效。
+  `Scene(vertices, indices)` 构造的场景有效。数量变化走下面的拓扑更新。
+
+## 拓扑更新（增删，M3 收尾，2026-10-30）
+
+`updateBVHGPU` 接受一份编辑脚本：删掉 `deleted` 里的旧图元、几何改了的 `moved`、
+在尾部追加 `appended` 个新图元。它只重建被这些编辑碰到的子树，其余原样复用，
+再做一次规范化重编号；查询结果与"对同一份新场景全新构建"**逐位相同**。
+
+```cpp
+// newScene = 旧场景删掉 deleted 后的幸存者（保持原顺序）+ 末尾追加 appended 个图元
+GpuTopoEdit edit;
+edit.deleted  = {12, 40, 41};   // 旧场景下标，升序、不重复
+edit.appended = 2;              // 新图元已经接在 newScene 尾部
+edit.moved    = {3, 9};         // 新场景下标：几何变了、拓扑没变
+GpuTopoUpdateTimings ts;
+double ms = updateBVHGPU(bvh, newScene, edit, &ts);
+// ts: planMs / surgeryMs / relayoutMs / mergeMs / wideMs，以及
+//     surgeryRoots / rebuiltLeaves / newDepth / fullRebuild
+```
+
+```python
+scene.update_topology(tris2, deleted=None, moved=None)
+cloud.update_topology(pts2);  gcloud.update_topology(means2, rot2, scale2)
+```
+
+只 move（`deleted` 为空且 `appended == 0`）会直接转给原来的 refit 快路径；
+`update_vertices` / `update_points` / `update` 仍然拒绝数量变化。删/增之后新叶子槽位
+是旧槽序的**压缩下标**，所以 `primIds` 一般不再等于 `iota`；查询内核只读
+`slot = -left-1`，不关心 `n` 与节点 id 布局，所以结果不受影响。
+
+地形 131k / 2M，每轮改 1%（cluster：局部簇内；scatter：全场景均匀），
+20k 查询点，同会话成对、5 轮中位数（`--no-cpu`）：
+
+| 规模 | 建树器 | 编辑 | update | 全新重建 | 倍数 | 回退 | 树深 |
+|---|---|---|---|---|---|---|---|
+| 131k | LBVH | cluster 混合 | 6.930 ms | 2.673 ms | 2.59× | 0/5 | 25 |
+| 131k | LBVH | cluster 只增 | 7.546 | 2.316 | 3.26× | 0/5 | 25 |
+| 131k | LBVH | cluster 只删 | 5.148 | 2.198 | 2.34× | 0/5 | 25 |
+| 131k | LBVH | cluster 只移动 | **0.486** | 1.656 | **0.29×** | 0/5 | 25 |
+| 131k | LBVH | scatter 混合 | 5.959 | 2.069 | 2.88× | 5/5 | 26 |
+| 131k | SAH | cluster 混合 | 6.167 | 5.638 | 1.09× | 0/5 | 24 |
+| 131k | SAH | scatter 混合 | 14.947 | 6.799 | 2.20× | 5/5 | 20 |
+| 2M | LBVH | cluster 混合 | 31.871 | 20.836 | 1.53× | 0/5 | 31 |
+| 2M | LBVH | scatter 混合 | 55.961 | 21.238 | 2.63× | 5/5 | 32 |
+| 2M | SAH | cluster 混合 | **31.191** | 64.740 | **0.48×** | 0/5 | 28 |
+| 2M | SAH | scatter 混合 | 115.434 | 67.073 | 1.72× | 5/5 | 25 |
+
+2M LBVH cluster 的比例扫描（同一配置，只改 `--topo-frac`）：
+
+| 比例 | update | 重建 | 倍数 | 重建叶子 | 树深 |
+|---|---|---|---|---|---|
+| 0.1% | 30.735 ms | 20.526 ms | 1.50× | 3.7–6.4k | 31 |
+| 0.5% | 31.699 | 21.013 | 1.51× | 11–35k | 31 |
+| 1% | 31.871 | 20.836 | 1.53× | 16.5–38k | 31 |
+| 5% | 39.705 | 20.949 | 1.90× | 54–98k | 35 |
+
+读法：
+
+- **只 move 是 refit 快路径**：131k 0.29×、2M 同为上传受限的 1.6 ms 量级，
+  和重建完全不是一笔账。增删才是本章的成本。
+- **2M SAH 下更新比重建快一倍（0.48×）**：SAH 重建 62–65 ms，更新 31 ms。
+  LBVH 重建只要 21 ms，所以同样的更新是 1.5×。**选不选拓扑更新，先看你的
+  建树器**：SAH 用户几乎总是划算，LBVH 用户在 1% 编辑上还慢一半。
+- **1/5 的目标还没到**。2M cluster 的 31.9 ms 拆开是 plan 6.2 / surgery 10.6 /
+  relayout 14.3 / merge 0.6；plan（两趟前缀和 + 切分选择）与 relayout（规范化
+  重编号、整片重发叶子）都是 O(n)，合计 65%。131k 是 plan 1.5 / surgery 3.0 /
+  relayout 1.5 / merge 0.5，固定开销占比更高，倍数反而更差（2.3–3.3×）。
+  v1.1 的稳定槽位、节点池、缓冲复用列的正是这几项（§风险 R5）。
+- **编辑越散越该直接重建**：scatter 1% 在 131k/2M 都触发回退（切分根覆盖的
+  旧叶子超过 `n/4`），而回退已经付过规划和暂存的钱，总耗时是直接重建的
+  1.7–2.9×。**均匀散布的编辑请直接 `destroy + build`**；局部簇编辑才走
+  `update_topology`。
+- **深度会漂，但有上限**：cluster 1% 连续 5 轮深度不动（2M 31、131k 25），
+  5% 会涨到 35；超过均衡深度 + 6 层就整树重建（`topoBaseDepth`）。300 轮
+  压力测试（会话 3）里回退 18/300，深度在 22–29 振荡，查询节点测试不超过 133。
+- **宽节点每轮整层重发**：`wideId` 依赖深度与 `n`，换树后无法保留。2M 上
+  update 31.9 → 53.7 ms，其中 emit kernel 只 2.4 ms，其余约 19 ms 是每次
+  `cudaFree` + `cudaMalloc` 128 MB、CUB 前缀和与两次 D2H——这是**分配器与
+  同步**的成本，不是重发本身，v1.1 缓冲复用后应该能压掉大半。宽节点 + 拓扑
+  更新目前只建议在编辑频率低时用。
+- **正确性门禁**（每轮都跑）：`validateBVHGPU(newScene)` 空串；closest /
+  kNN(k=1,8,16) / radius 全量输出、射线 `t` 位模式与 `buildBVHSahGPU(newScene)`
+  逐位相同。上表 19 个配置、5 轮共 95 次更新全部 `mismatch=0/0/0`；同一输入
+  两次更新的节点数组 FNV 哈希相同（`--topo` 行里的 `tree=`）。
+- **显存**：旧树 + 新树 + 暂存同时在世，2M 峰值约多 380 MB；缓冲按容量增长，
+  跨更新复用。
 
 ## 我们做什么 / 不做什么
 
@@ -502,6 +588,10 @@ learn/        教程配套的单文件练习
 - Python 绑定是同步的：每次调用都上传、同步、回读，没有异步 / 零拷贝接口
 - refit 拓扑冻结：不增删、不重排三角形；局部路径只合并脏叶子的祖先，但逐层 launch
   的数量不变，小场景里启动开销开始主导
+- 拓扑更新只支持**尾部追加**，任意位置插入要调用方先重排；局部簇编辑可用，
+  均匀散布的编辑会回退，而且回退成本是直接重建的 1.7–2.9×。LBVH 上 1% 混合
+  编辑仍是重建的 1.5–2.9×，离 1/5 的目标差一个 v1.1（稳定槽位 / 节点池 /
+  缓冲复用）；宽节点层每轮整层重发，2M 额外约 22 ms
 - BVH 每叶 1 个三角形，2M 场景 419 万节点；Morton 叶子批量（4–8 个/叶）实测
   遍历更慢（射线 2.2×、kNN 1.8×），已回退。BVH4 宽节点（`--wide`）与自顶向下
   分箱 SAH（`--sah`）都已落地，查询侧已追平 Warp，剩余差距在构建速度；
