@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "gpu/gpu_node.h"
 #include "gpu/prim_ops.h"
@@ -30,29 +31,138 @@ void cudaOk(cudaError_t err, const char* what) {
     }
 }
 
+// 拓扑更新期间的设备内存池。更新每轮要几百 MB 临时块，直接 cudaMalloc/cudaFree
+// 在 2M 上一轮就是 15 ms 量级（free 尤其贵）；这里把上一轮归还的块按容量缓存，
+// 下一轮 best-fit 复用。只在 updateTopology 里激活，建树 / 查询不受影响。
+thread_local GpuBVH* gTopoPool = nullptr;
+
+constexpr size_t kTopoPoolCapBytes = size_t(2) << 30;
+
+void* topoPoolAlloc(GpuBVH* bvh, size_t need, size_t* got) {
+    auto& freeBlocks = bvh->topoFree;
+    size_t best = SIZE_MAX;
+    size_t bestIdx = freeBlocks.size();
+    for (size_t i = 0; i < freeBlocks.size(); ++i) {
+        if (freeBlocks[i].bytes >= need && freeBlocks[i].bytes < best) {
+            best = freeBlocks[i].bytes;
+            bestIdx = i;
+        }
+    }
+    if (bestIdx < freeBlocks.size()) {
+        void* p = freeBlocks[bestIdx].p;
+        const size_t bytes = freeBlocks[bestIdx].bytes;
+        freeBlocks[bestIdx] = freeBlocks.back();
+        freeBlocks.pop_back();
+        bvh->topoFreeBytes -= bytes;
+        *got = bytes;
+        return p;
+    }
+    void* p = nullptr;
+    cudaOk(cudaMalloc(&p, need), "cudaMalloc");
+    *got = need;
+    return p;
+}
+
+void topoPoolRelease(GpuBVH* bvh, void* p, size_t bytes) {
+    if (p == nullptr || bytes == 0) return;
+    auto& freeBlocks = bvh->topoFree;
+    freeBlocks.push_back({p, bytes});
+    bvh->topoFreeBytes += bytes;
+    // 容量只涨不降会在大 n 来回振荡时堆住多余的块；超上限先丢最小的。
+    while (bvh->topoFreeBytes > kTopoPoolCapBytes && !freeBlocks.empty()) {
+        size_t bi = 0;
+        for (size_t i = 1; i < freeBlocks.size(); ++i) {
+            if (freeBlocks[i].bytes < freeBlocks[bi].bytes) bi = i;
+        }
+        cudaOk(cudaFree(freeBlocks[bi].p), "pool evict");
+        bvh->topoFreeBytes -= freeBlocks[bi].bytes;
+        freeBlocks[bi] = freeBlocks.back();
+        freeBlocks.pop_back();
+    }
+}
+
+// 换树时旧数组不 cudaFree，而是放回池里给下一轮用。池不活跃（回退重建时的
+// destroyBVHGPU）就走原来的 cudaFree。
+void topoReleasePtr(GpuBVH& bvh, void* p, size_t bytes) {
+    if (p == nullptr) return;
+    // 尺寸未知（0）的块进池也没法再匹配，直接释放，避免泄漏。
+    if (gTopoPool == &bvh && bytes > 0) {
+        topoPoolRelease(&bvh, p, bytes);
+    } else {
+        cudaOk(cudaFree(p), "topo release");
+    }
+}
+
+struct TopoPoolScope {
+    GpuBVH* prev;
+    explicit TopoPoolScope(GpuBVH* bvh) : prev(gTopoPool) { gTopoPool = bvh; }
+    ~TopoPoolScope() { gTopoPool = prev; }
+};
+
+// 建树的持久数组（节点 / 图元 / parent / depth ...）：池活跃时先问池——回退重建
+// 要的正是上一棵树还回来的同尺寸块——否则 cudaMalloc。池块在分配时已从池里摘掉，
+// 之后 destroyBVHGPU 照常 cudaFree，不会重复释放。
+void* topoAwareMalloc(size_t bytes) {
+    if (!gTopoPool) {
+        void* p = nullptr;
+        cudaOk(cudaMalloc(&p, bytes), "cudaMalloc");
+        return p;
+    }
+    size_t got = 0;
+    return topoPoolAlloc(gTopoPool, bytes, &got);
+}
+
 template <typename T>
 struct DevBuf {
     T* p = nullptr;
+    size_t bytes = 0;
+    GpuBVH* pool = nullptr;  // 非空表示归还到该 BVH 的池
     DevBuf() = default;
     explicit DevBuf(size_t count) {
-        cudaOk(cudaMalloc(reinterpret_cast<void**>(&p), count * sizeof(T)), "cudaMalloc");
+        const size_t need = count * sizeof(T);
+        if (need == 0) return;
+        pool = gTopoPool;
+        if (pool) {
+            p = static_cast<T*>(topoPoolAlloc(pool, need, &bytes));
+        } else {
+            cudaOk(cudaMalloc(reinterpret_cast<void**>(&p), need), "cudaMalloc");
+            bytes = need;
+        }
     }
     ~DevBuf() {
-        if (p) cudaFree(p);
+        if (p == nullptr) return;
+        if (pool) {
+            topoPoolRelease(pool, p, bytes);
+        } else {
+            cudaFree(p);
+        }
     }
     T* release() {
         T* q = p;
         p = nullptr;
+        bytes = 0;
+        pool = nullptr;
         return q;
     }
     DevBuf(const DevBuf&) = delete;
     DevBuf& operator=(const DevBuf&) = delete;
-    DevBuf(DevBuf&& o) noexcept : p(o.p) { o.p = nullptr; }
+    DevBuf(DevBuf&& o) noexcept : p(o.p), bytes(o.bytes), pool(o.pool) {
+        o.p = nullptr;
+        o.bytes = 0;
+        o.pool = nullptr;
+    }
     DevBuf& operator=(DevBuf&& o) noexcept {
         if (this != &o) {
-            if (p) cudaFree(p);
+            if (p) {
+                if (pool) topoPoolRelease(pool, p, bytes);
+                else cudaFree(p);
+            }
             p = o.p;
+            bytes = o.bytes;
+            pool = o.pool;
             o.p = nullptr;
+            o.bytes = 0;
+            o.pool = nullptr;
         }
         return *this;
     }
@@ -1605,8 +1715,7 @@ void finalizeTree(GpuBVH& bvh, int n, GpuBVHNode* nodes, const typename Ops::Ite
 
     // 拓扑不变，这个 (深度, 编号) 顺序也不变：留给 refit 逐层重放，
     // 省掉每次更新重算 parent/depth + 一次 7 位基数排序。
-    cudaOk(cudaMalloc(&bvh.d_refitOrder, static_cast<size_t>(internalCount) * sizeof(int)),
-           "refit order");
+    bvh.d_refitOrder = topoAwareMalloc(static_cast<size_t>(internalCount) * sizeof(int));
     cudaOk(cudaMemcpy(bvh.d_refitOrder, dDepthValSorted.p,
                       static_cast<size_t>(internalCount) * sizeof(int), cudaMemcpyDeviceToDevice),
            "D2D refit order");
@@ -1614,21 +1723,18 @@ void finalizeTree(GpuBVH& bvh, int n, GpuBVHNode* nodes, const typename Ops::Ite
 
     // 只合并脏叶子的祖先要用：parent / depth 建树时已经算过，留一份免得重算。
     const size_t ints = static_cast<size_t>(nodeCount) * sizeof(int);
-    cudaOk(cudaMalloc(&bvh.d_parent, ints), "parent keep");
+    bvh.d_parent = topoAwareMalloc(ints);
     cudaOk(cudaMemcpy(bvh.d_parent, dParent.p, ints, cudaMemcpyDeviceToDevice), "parent D2D");
-    cudaOk(cudaMalloc(&bvh.d_depth, ints), "depth keep");
+    bvh.d_depth = topoAwareMalloc(ints);
     cudaOk(cudaMemcpy(bvh.d_depth, dDepth.p, ints, cudaMemcpyDeviceToDevice), "depth D2D");
-    cudaOk(cudaMalloc(&bvh.d_mark, ints), "mark");
+    bvh.d_mark = topoAwareMalloc(ints);
     cudaOk(cudaMemset(bvh.d_mark, 0, ints), "mark clear");
-    cudaOk(cudaMalloc(&bvh.d_dirtyOrder, static_cast<size_t>(internalCount) * sizeof(int)),
-           "dirty order");
-    cudaOk(cudaMalloc(&bvh.d_refitOffsets, static_cast<size_t>(bins + 1) * sizeof(int)),
-           "refit offsets");
+    bvh.d_dirtyOrder = topoAwareMalloc(static_cast<size_t>(internalCount) * sizeof(int));
+    bvh.d_refitOffsets = topoAwareMalloc(static_cast<size_t>(bins + 1) * sizeof(int));
     cudaOk(cudaMemcpy(bvh.d_refitOffsets, offsets, static_cast<size_t>(bins + 1) * sizeof(int),
                       cudaMemcpyHostToDevice),
            "refit offsets H2D");
-    cudaOk(cudaMalloc(&bvh.d_levelCounts, static_cast<size_t>(bins) * sizeof(int)),
-           "level counts");
+    bvh.d_levelCounts = topoAwareMalloc(static_cast<size_t>(bins) * sizeof(int));
     clock.mark();  // 1
 
     // 从最深层往上：第 d 层的节点只读第 d+1 层，天然无竞争。
@@ -1835,9 +1941,9 @@ GpuBVH buildLBVH(const typename Ops::Item* hostItems, int n, GpuBuildTimings* ti
     bvh.primCount = n;
     bvh.nodeCount = nodeCount;
     bvh.sah = false;
-    cudaOk(cudaMalloc(&bvh.d_nodes, static_cast<size_t>(nodeCount) * sizeof(GpuBVHNode)), "nodes");
-    cudaOk(cudaMalloc(&bvh.d_tris, static_cast<size_t>(n) * sizeof(Item)), "tris");
-    cudaOk(cudaMalloc(&bvh.d_primIds, static_cast<size_t>(n) * sizeof(int)), "primIds");
+    bvh.d_nodes = topoAwareMalloc(static_cast<size_t>(nodeCount) * sizeof(GpuBVHNode));
+    bvh.d_tris = topoAwareMalloc(static_cast<size_t>(n) * sizeof(Item));
+    bvh.d_primIds = topoAwareMalloc(static_cast<size_t>(n) * sizeof(int));
 
     auto* nodes = static_cast<GpuBVHNode*>(bvh.d_nodes);
     auto* sortedTris = static_cast<Item*>(bvh.d_tris);
@@ -1926,9 +2032,9 @@ GpuBVH buildSAH(const typename Ops::Item* hostItems, int n, GpuBuildTimings* tim
     bvh.primCount = n;
     bvh.nodeCount = nodeCount;
     bvh.sah = true;
-    cudaOk(cudaMalloc(&bvh.d_nodes, static_cast<size_t>(nodeCount) * sizeof(GpuBVHNode)), "nodes");
-    cudaOk(cudaMalloc(&bvh.d_tris, static_cast<size_t>(n) * sizeof(Item)), "tris");
-    cudaOk(cudaMalloc(&bvh.d_primIds, static_cast<size_t>(n) * sizeof(int)), "primIds");
+    bvh.d_nodes = topoAwareMalloc(static_cast<size_t>(nodeCount) * sizeof(GpuBVHNode));
+    bvh.d_tris = topoAwareMalloc(static_cast<size_t>(n) * sizeof(Item));
+    bvh.d_primIds = topoAwareMalloc(static_cast<size_t>(n) * sizeof(int));
 
     auto* nodes = static_cast<GpuBVHNode*>(bvh.d_nodes);
     auto* sortedTris = static_cast<Item*>(bvh.d_tris);
@@ -2023,14 +2129,6 @@ double buildWideNodesGPU(GpuBVH& bvh) {
     if (bvh.nodeCount <= 0 || bvh.d_depth == nullptr) {
         throw std::runtime_error("buildWideNodesGPU: tree has no depth table");
     }
-    if (bvh.d_wideNodes) {
-        cudaFree(bvh.d_wideNodes);
-        bvh.d_wideNodes = nullptr;
-    }
-    if (bvh.d_wideId) {
-        cudaFree(bvh.d_wideId);
-        bvh.d_wideId = nullptr;
-    }
     bvh.wideCount = 0;
 
     const int n = bvh.primCount;
@@ -2039,31 +2137,43 @@ double buildWideNodesGPU(GpuBVH& bvh) {
     const int* depth = static_cast<const int*>(bvh.d_depth);
     const auto* nodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
 
+    // 两个数组按容量复用；拓扑更新每次 n 都变，但容量只会增长。
+    if (bvh.wideIdCapacity < nodeCount) {
+        if (bvh.d_wideId) cudaFree(bvh.d_wideId);
+        const int cap = nodeCount + nodeCount / 8 + 1024;
+        cudaOk(cudaMalloc(&bvh.d_wideId, static_cast<size_t>(cap) * sizeof(int)), "wide id");
+        bvh.wideIdCapacity = cap;
+    }
+    int* wideId = static_cast<int*>(bvh.d_wideId);
+
     DevBuf<int> dFlags(internal);
-    DevBuf<int> dWideId(nodeCount);
     wideCountKernel<<<blocksFor(internal), kBlock>>>(depth, internal, dFlags.p);
     cudaOk(cudaGetLastError(), "wide flags");
 
     size_t scanBytes = 0;
-    cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, dFlags.p, dWideId.p, internal),
+    cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, dFlags.p, wideId, internal),
            "wide scan(probe)");
     DevBuf<unsigned char> dScanTemp(scanBytes > 0 ? scanBytes : 1);
-    cudaOk(cub::DeviceScan::ExclusiveSum(dScanTemp.p, scanBytes, dFlags.p, dWideId.p, internal),
+    cudaOk(cub::DeviceScan::ExclusiveSum(dScanTemp.p, scanBytes, dFlags.p, wideId, internal),
            "wide scan");
 
     // 前缀和只到 internal-1，总数要单独加最后一项的 flag。
     int tail[2] = {0, 0};
-    cudaOk(cudaMemcpy(&tail[0], dWideId.p + (internal - 1), sizeof(int), cudaMemcpyDeviceToHost),
+    cudaOk(cudaMemcpy(&tail[0], wideId + (internal - 1), sizeof(int), cudaMemcpyDeviceToHost),
            "D2H prefix");
     cudaOk(cudaMemcpy(&tail[1], dFlags.p + (internal - 1), sizeof(int), cudaMemcpyDeviceToHost),
            "D2H flag");
     const int wideCount = tail[0] + tail[1];
     if (wideCount <= 0) throw std::runtime_error("buildWideNodesGPU: no wide nodes");
 
-    cudaOk(cudaMalloc(&bvh.d_wideNodes, static_cast<size_t>(wideCount) * sizeof(GpuBVH4Node)),
-           "wide nodes");
+    if (bvh.wideCapacity < wideCount) {
+        if (bvh.d_wideNodes) cudaFree(bvh.d_wideNodes);
+        const int cap = wideCount + wideCount / 8 + 1024;
+        cudaOk(cudaMalloc(&bvh.d_wideNodes, static_cast<size_t>(cap) * sizeof(GpuBVH4Node)),
+               "wide nodes");
+        bvh.wideCapacity = cap;
+    }
     bvh.wideCount = wideCount;
-    bvh.d_wideId = dWideId.release();
 
     StageClock clock;
     clock.mark();  // 0
@@ -2077,22 +2187,67 @@ double buildWideNodesGPU(GpuBVH& bvh) {
 }
 
 void destroyBVHGPU(GpuBVH& bvh) {
-    if (bvh.d_nodes) cudaFree(bvh.d_nodes);
-    if (bvh.d_tris) cudaFree(bvh.d_tris);
-    if (bvh.d_primIds) cudaFree(bvh.d_primIds);
-    if (bvh.d_refitOrder) cudaFree(bvh.d_refitOrder);
-    if (bvh.d_stage) cudaFree(bvh.d_stage);
-    if (bvh.d_dirtySlots) cudaFree(bvh.d_dirtySlots);
-    if (bvh.d_dirtyTris) cudaFree(bvh.d_dirtyTris);
-    if (bvh.d_parent) cudaFree(bvh.d_parent);
-    if (bvh.d_depth) cudaFree(bvh.d_depth);
-    if (bvh.d_mark) cudaFree(bvh.d_mark);
-    if (bvh.d_dirtyOrder) cudaFree(bvh.d_dirtyOrder);
-    if (bvh.d_refitOffsets) cudaFree(bvh.d_refitOffsets);
-    if (bvh.d_levelCounts) cudaFree(bvh.d_levelCounts);
-    if (bvh.d_wideNodes) cudaFree(bvh.d_wideNodes);
-    if (bvh.d_wideId) cudaFree(bvh.d_wideId);
+    auto free1 = [](void* p) {
+        if (p) cudaOk(cudaFree(p), "destroy free");
+    };
+    free1(bvh.d_nodes);
+    free1(bvh.d_tris);
+    free1(bvh.d_primIds);
+    free1(bvh.d_refitOrder);
+    free1(bvh.d_stage);
+    free1(bvh.d_dirtySlots);
+    free1(bvh.d_dirtyTris);
+    free1(bvh.d_parent);
+    free1(bvh.d_depth);
+    free1(bvh.d_mark);
+    free1(bvh.d_dirtyOrder);
+    free1(bvh.d_refitOffsets);
+    free1(bvh.d_levelCounts);
+    free1(bvh.d_wideNodes);
+    free1(bvh.d_wideId);
+    if (gTopoPool == &bvh) {
+        // 回退重建正在这棵树上进行：池里的块还被本轮的 DevBuf 指着，不能释放，
+        // 只清树字段，把池原样留给后续归还。
+        auto keepFree = std::move(bvh.topoFree);
+        const size_t keepBytes = bvh.topoFreeBytes;
+        bvh = GpuBVH{};
+        bvh.topoFree = std::move(keepFree);
+        bvh.topoFreeBytes = keepBytes;
+        return;
+    }
+    for (const GpuDevBlock& blk : bvh.topoFree) {
+        if (blk.p) cudaOk(cudaFree(blk.p), "destroy pool");
+    }
     bvh = GpuBVH{};
+}
+
+// 把旧树的换树数组全部还进池（尺寸按旧树算）并置空字段。调用方随后要么换成
+// 新数组（install），要么整棵重建。d_stage / 脏区 / 宽节点不在这里处理。
+template <typename Item>
+void releaseTreeArrays(GpuBVH& bvh, int nOld) {
+    const int nodeCount = bvh.nodeCount;
+    const int internalOld = nOld - 1;
+    const int binsOld = static_cast<int>(bvh.refitOffsets.size()) - 1;
+    topoReleasePtr(bvh, bvh.d_nodes, static_cast<size_t>(nodeCount) * sizeof(GpuBVHNode));
+    topoReleasePtr(bvh, bvh.d_tris, static_cast<size_t>(nOld) * sizeof(Item));
+    topoReleasePtr(bvh, bvh.d_primIds, static_cast<size_t>(nOld) * sizeof(int));
+    topoReleasePtr(bvh, bvh.d_refitOrder, static_cast<size_t>(internalOld) * sizeof(int));
+    topoReleasePtr(bvh, bvh.d_parent, static_cast<size_t>(nodeCount) * sizeof(int));
+    topoReleasePtr(bvh, bvh.d_depth, static_cast<size_t>(nodeCount) * sizeof(int));
+    topoReleasePtr(bvh, bvh.d_mark, static_cast<size_t>(nodeCount) * sizeof(int));
+    topoReleasePtr(bvh, bvh.d_dirtyOrder, static_cast<size_t>(internalOld) * sizeof(int));
+    topoReleasePtr(bvh, bvh.d_refitOffsets, static_cast<size_t>(binsOld + 1) * sizeof(int));
+    topoReleasePtr(bvh, bvh.d_levelCounts, static_cast<size_t>(binsOld) * sizeof(int));
+    bvh.d_nodes = nullptr;
+    bvh.d_tris = nullptr;
+    bvh.d_primIds = nullptr;
+    bvh.d_refitOrder = nullptr;
+    bvh.d_parent = nullptr;
+    bvh.d_depth = nullptr;
+    bvh.d_mark = nullptr;
+    bvh.d_dirtyOrder = nullptr;
+    bvh.d_refitOffsets = nullptr;
+    bvh.d_levelCounts = nullptr;
 }
 
 // 只上传改动的图元：主机侧已经按 dirty 顺序打包好，slot 是它的叶子槽。
@@ -2412,6 +2567,10 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
         return t->totalMs;
     }
 
+    // 从这里开始，本函数里所有 DevBuf 都从 bvh 的内存池取还，跨更新复用。
+    // 纯移动在上面已经走 refit 快路径，不经过池。
+    TopoPoolScope poolScope(&bvh);
+
     const bool wide = bvh.d_wideNodes != nullptr;
     const bool sah = bvh.sah;
     const int nNewI = static_cast<int>(nNew);
@@ -2419,12 +2578,42 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     const int nSurv = nOld - delCount;
 
     // 回退：整棵按同一套建树器重建。拓扑缓存的形状全变了，没有可复用的部分。
+    // 旧树不 cudaFree 而是整棵还进池——重建要的正是同一批同尺寸的块，
+    // 2M 上省掉一次 free + malloc（合计 15 ms 量级）。宽节点数组跨重建保留，
+    // buildWideNodesGPU 按容量直接覆写；其余字段由 destroy 清空。
     auto rebuildAll = [&]() -> double {
         StageClock clock;
         clock.mark();  // 0
-        destroyBVHGPU(bvh);
+        void* wideNodes = bvh.d_wideNodes;
+        void* wideIdArr = bvh.d_wideId;
+        const int wideCap = bvh.wideCapacity;
+        const int wideIdCap = bvh.wideIdCapacity;
+        if (bvh.d_nodes || bvh.d_tris || bvh.d_parent) releaseTreeArrays<Item>(bvh, nOld);
+        topoReleasePtr(bvh, bvh.d_stage, static_cast<size_t>(bvh.stageCount) * sizeof(Item));
+        topoReleasePtr(bvh, bvh.d_dirtySlots,
+                       static_cast<size_t>(bvh.dirtyCapacity) * sizeof(int));
+        topoReleasePtr(bvh, bvh.d_dirtyTris,
+                       static_cast<size_t>(bvh.dirtyCapacity) * sizeof(Item));
+        bvh.d_stage = nullptr;
+        bvh.d_dirtySlots = nullptr;
+        bvh.d_dirtyTris = nullptr;
+        // 宽节点数组由调用方保留复用，destroy 不能把它们释放掉。
+        bvh.d_wideNodes = nullptr;
+        bvh.d_wideId = nullptr;
+        destroyBVHGPU(bvh);  // 池活跃：只清字段，池原样留住
+
         GpuBuildTimings bt;
-        bvh = sah ? buildSAH<Ops>(items.data(), nNewI, &bt) : buildLBVH<Ops>(items.data(), nNewI, &bt);
+        GpuBVH fresh =
+            sah ? buildSAH<Ops>(items.data(), nNewI, &bt) : buildLBVH<Ops>(items.data(), nNewI, &bt);
+        std::swap(bvh, fresh);
+        // 换进来的新树自带空池；把旧池拿回来，fresh 留空析构。
+        bvh.topoFree = std::move(fresh.topoFree);
+        bvh.topoFreeBytes = fresh.topoFreeBytes;
+        fresh.topoFreeBytes = 0;
+        bvh.d_wideNodes = wideNodes;
+        bvh.d_wideId = wideIdArr;
+        bvh.wideCapacity = wideCap;
+        bvh.wideIdCapacity = wideIdCap;
         clock.mark();  // 1
         double wideMs = 0.0;
         if (wide) {
@@ -2789,25 +2978,17 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
            "refit offsets H2D");
 
     // ---- 整体换树：到这里以前旧树一个字节都没动过，失败可以直接原地回退 ----
-    if (bvh.d_nodes) cudaFree(bvh.d_nodes);
+    // 旧数组不 cudaFree，放回内存池给下一轮复用（大小按旧树的计数算）。
+    releaseTreeArrays<Item>(bvh, nOld);
     bvh.d_nodes = dNewNodes.release();
-    if (bvh.d_tris) cudaFree(bvh.d_tris);
     bvh.d_tris = dNewTris.release();
-    if (bvh.d_primIds) cudaFree(bvh.d_primIds);
     bvh.d_primIds = dNewPrimIds.release();
-    if (bvh.d_refitOrder) cudaFree(bvh.d_refitOrder);
     bvh.d_refitOrder = dRefitOrderNew.release();
-    if (bvh.d_parent) cudaFree(bvh.d_parent);
     bvh.d_parent = dNewParent.release();
-    if (bvh.d_depth) cudaFree(bvh.d_depth);
     bvh.d_depth = dNewDepth.release();
-    if (bvh.d_mark) cudaFree(bvh.d_mark);
     bvh.d_mark = dMarkNew.release();
-    if (bvh.d_dirtyOrder) cudaFree(bvh.d_dirtyOrder);
     bvh.d_dirtyOrder = dDirtyOrderNew.release();
-    if (bvh.d_refitOffsets) cudaFree(bvh.d_refitOffsets);
     bvh.d_refitOffsets = dRefitOffsetsNew.release();
-    if (bvh.d_levelCounts) cudaFree(bvh.d_levelCounts);
     bvh.d_levelCounts = dLevelCountsNew.release();
     bvh.refitOffsets.assign(offsets, offsets + binsNew + 1);
     bvh.primSlot.clear();  // 反向映射变了，局部 refit 下次用到时按新 primIds 重建

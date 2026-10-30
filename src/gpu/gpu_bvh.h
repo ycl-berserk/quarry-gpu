@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -15,6 +16,13 @@
 //
 // 树是 LBVH（Morton + 基数排序 + Karras 建树），节点布局与 learn/03 一致：
 //   内部节点 0 .. n-2，叶子 n-1 .. 2n-2。
+
+// 拓扑更新内存池里的一个空闲块。缓存的是 cudaMalloc 的原始指针与容量。
+struct GpuDevBlock {
+    void* p = nullptr;
+    size_t bytes = 0;
+};
+
 struct GpuBVH {
     void* d_nodes = nullptr;    // GpuBVHNode[]，共 2n-1 个
     void* d_tris = nullptr;     // Tri[] 或 Vec3[]（点云），按叶子顺序重排
@@ -46,9 +54,18 @@ struct GpuBVH {
 
     // 可选的 4 宽折叠（buildWideNodesGPU 生成）。d_wideId 把二叉内部节点映射到
     // wide 下标，只对偶数深度的内部节点有效；refit 后重新折叠要复用它。
+    // 两个数组按容量增长、跨调用复用：2M 上每次重新 cudaMalloc/free 128 MB
+    // 要 15 ms 量级，而宽节点本身的重发只有 2 ms。
     void* d_wideNodes = nullptr;    // GpuBVH4Node[]
     void* d_wideId = nullptr;       // int[]，nodeCount
     int wideCount = 0;
+    int wideCapacity = 0;           // d_wideNodes 的容量（节点数）
+    int wideIdCapacity = 0;         // d_wideId 的容量
+
+    // 拓扑更新的设备内存池：本轮归还的临时块按容量缓存，下一轮直接复用。
+    // 不跨 BVH 共享；destroyBVHGPU 在池不活跃时统一释放。
+    std::vector<GpuDevBlock> topoFree;
+    size_t topoFreeBytes = 0;
 
     // 建树器。拓扑变更超出增量预算时要按同一套重建，调用方不必再记一遍。
     bool sah = false;

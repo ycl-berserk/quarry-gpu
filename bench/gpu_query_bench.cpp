@@ -624,18 +624,21 @@ int main(int argc, char** argv) {
     // ---- GPU 构建 ----
     GpuBuildTimings build{};
     GpuBVH gpu;
+    double buildWall = 0.0;
     try {
         warmupBuildGPU();
+        const double bw0 = nowMs();
         gpu = opt.sah ? buildBVHSahGPU(scene, &build) : buildBVHGPU(scene, &build);
+        buildWall = nowMs() - bw0;
     } catch (const std::exception& e) {
         std::printf("gpu build failed: %s\n", e.what());
         return 3;
     }
     std::printf(
         "gpu build morton=%.2f sort=%.2f scatter=%.2f tree=%.2f refit=%.2f total=%.2f ms "
-        "nodes=%d depth=%d\n",
+        "wall=%.2f nodes=%d depth=%d\n",
         build.mortonMs, build.sortMs, build.scatterMs, build.treeMs, build.refitMs, build.totalMs,
-        gpu.nodeCount, gpu.depth);
+        buildWall, gpu.nodeCount, gpu.depth);
     if (opt.sah) {
         std::printf("gpu sah bin=%.2f split=%.2f partition=%.2f ms\n", build.sahBinMs,
                     build.sahSplitMs, build.sahPartMs);
@@ -963,20 +966,26 @@ int main(int argc, char** argv) {
                     scene.tris.size(), opt.query.c_str(), opt.sah ? " sah" : " lbvh");
         Scene cur = scene;
         std::vector<double> updTimes;
+        std::vector<double> wallTimes;
         std::vector<double> rebuildTimes;
+        std::vector<double> rebuildWalls;
         int fallbacks = 0;
         for (int r = 0; r < opt.topoRounds; ++r) {
             TopoScript sc = makeTopoScript(cur, opt.topoKind, opt.topoMix, opt.topoFrac,
                                                  opt.seed * 7919ull + static_cast<uint64_t>(r));
             GpuTopoUpdateTimings tt{};
             double upd = 0.0;
+            double wall = 0.0;
             try {
+                const double w0 = nowMs();
                 upd = updateBVHGPU(gpu, sc.next, sc.edit, &tt);
+                wall = nowMs() - w0;
             } catch (const std::exception& e) {
                 std::printf("topo update failed: %s\n", e.what());
                 return 3;
             }
             updTimes.push_back(upd);
+            wallTimes.push_back(wall);
             if (tt.fullRebuild) ++fallbacks;
 
             const std::string treeErr = validateBVHGPU(gpu, sc.next);
@@ -987,15 +996,19 @@ int main(int argc, char** argv) {
 
             GpuBVH fresh;
             GpuBuildTimings fb{};
+            double rebuildWall = 0.0;
             try {
+                const double rw0 = nowMs();
                 fresh = opt.sah ? buildBVHSahGPU(sc.next, &fb) : buildBVHGPU(sc.next, &fb);
                 if (opt.wide) buildWideNodesGPU(fresh);
+                rebuildWall = nowMs() - rw0;
             } catch (const std::exception& e) {
                 std::printf("topo rebuild failed: %s\n", e.what());
                 destroyBVHGPU(fresh);
                 return 3;
             }
             rebuildTimes.push_back(fb.totalMs);
+            rebuildWalls.push_back(rebuildWall);
 
             const QueryOutput got = runQuery(gpu, true);
             const QueryOutput want = runQuery(fresh, false);
@@ -1003,12 +1016,13 @@ int main(int argc, char** argv) {
             destroyBVHGPU(fresh);
 
             std::printf(
-                "topo round=%d del=%zu add=%d move=%zu update=%.3f ms rebuild=%.3f ms x=%.2f "
+                "topo round=%d del=%zu add=%d move=%zu update=%.3f wall=%.3f ms rebuild=%.3f "
+                "rebuild_wall=%.3f ms x=%.2f "
                 "full=%d roots=%d leaves=%d depth=%d node_tests=%.1f mismatch=%llu/%llu/%llu"
                 " tree=0x%016llx"
                 " [plan=%.2f surgery=%.2f relayout=%.2f merge=%.2f wide=%.2f]\n",
-                r, sc.edit.deleted.size(), sc.edit.appended, sc.edit.moved.size(), upd,
-                fb.totalMs, fb.totalMs > 0.0 ? upd / fb.totalMs : 0.0,
+                r, sc.edit.deleted.size(), sc.edit.appended, sc.edit.moved.size(), upd, wall,
+                fb.totalMs, rebuildWall, fb.totalMs > 0.0 ? upd / fb.totalMs : 0.0,
                 tt.fullRebuild ? 1 : 0, tt.surgeryRoots, tt.rebuiltLeaves, gpu.depth,
                 got.stats.nodeTests / nPoints, static_cast<unsigned long long>(m.count),
                 static_cast<unsigned long long>(m.tri), static_cast<unsigned long long>(m.dist),
@@ -1019,12 +1033,19 @@ int main(int argc, char** argv) {
         }
 
         std::sort(updTimes.begin(), updTimes.end());
+        std::sort(wallTimes.begin(), wallTimes.end());
         std::sort(rebuildTimes.begin(), rebuildTimes.end());
+        std::sort(rebuildWalls.begin(), rebuildWalls.end());
         const double medUpd = updTimes[updTimes.size() / 2];
+        const double medWall = wallTimes[wallTimes.size() / 2];
         const double medReb = rebuildTimes[rebuildTimes.size() / 2];
-        std::printf("topo median_update=%.3f ms median_rebuild=%.3f ms x=%.2f fallbacks=%d/%d "
+        const double medRebWall = rebuildWalls[rebuildWalls.size() / 2];
+        std::printf("topo median_update=%.3f ms median_wall=%.3f ms median_rebuild=%.3f ms "
+                    "median_rebuild_wall=%.3f ms x=%.2f wall_x=%.2f fallbacks=%d/%d "
                     "final_depth=%d tris=%zu\n",
-                    medUpd, medReb, medReb > 0.0 ? medUpd / medReb : 0.0, fallbacks,
+                    medUpd, medWall, medReb, medRebWall,
+                    medReb > 0.0 ? medUpd / medReb : 0.0,
+                    medRebWall > 0.0 ? medWall / medRebWall : 0.0, fallbacks,
                     opt.topoRounds, gpu.depth, cur.tris.size());
     }
 
