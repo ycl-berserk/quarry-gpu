@@ -888,7 +888,50 @@ Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
 成对测量，各 5 轮中位数，3 s DVFS 预热，20k 查询点，`--no-cpu`。
 编辑量 `--topo-frac` 是每轮删除/追加/移动各占当前场景的比例；
 `cluster` 把编辑集中在一小块空间，`scatter` 在全场景均匀抽取。
+两列时间分开记：`update` 是 `updateBVHGPU` 内部的多阶段 CUDA event 计时，
+`wall` 是调用前后的 steady_clock 端到端；`重建 wall` 是同一份场景
+`destroy + build` 的端到端（含 72 MB 场景上传与全部 cudaMalloc）。
 倍数是 update / 重建，**小于 1 表示更新比重建快**。
+
+### v1.1：设备内存池 + 宽节点缓冲复用（2026-10-30 晚）
+
+更新期间的所有临时块、换树后释放的旧树数组、以及建树的持久数组（节点 / 图元 /
+parent / depth / refit 缓存）现在都从一个按 BVH 计的线程局部设备内存池取还
+（best-fit、2 GiB 上限、跨更新保留）；`wideId` / `wideNodes` 按容量增长、跨轮
+复用。2M 稳态下每轮不再出现 cudaMalloc / cudaFree。
+
+| 规模 | 建树器 | 编辑 | update | wall | 重建 wall | wall 倍数 | 回退 | 深度 |
+|---|---|---|---|---|---|---|---|---|
+| 131k | LBVH | cluster 混合 1% | 2.718 | 2.877 | 3.521 | 0.82× | 0/5 | 25 |
+| 131k | LBVH | cluster 只移动 1% | **0.386** | **0.501** | 3.962 | **0.13×** | 0/5 | 25 |
+| 131k | LBVH | cluster 只增 1% | 4.514 | 4.714 | 4.357 | 1.08× | 0/5 | 25 |
+| 131k | LBVH | scatter 混合 1% | 1.730 | 2.559 | 3.483 | 0.73× | 5/5 | 26 |
+| 131k | SAH | cluster 混合 1% | 4.544 | 4.702 | 17.802 | 0.26× | 0/5 | 24 |
+| 131k | SAH | scatter 混合 1% | 9.488 | 11.786 | 13.404 | 0.88× | 5/5 | 20 |
+| 2M | LBVH | cluster 混合 1% | 11.620 | 11.833 | 44.494 | **0.27×** | 0/5 | 31 |
+| 2M | LBVH | cluster + 宽节点 | 14.693 | 14.790 | 54.879 | 0.27× | 0/5 | 31 |
+| 2M | SAH | cluster 混合 1% | 11.612 | 11.807 | 98.092 | **0.12×** | 0/5 | 28 |
+| 2M | LBVH | scatter 混合 1% | 21.398 | 24.245 | 44.023 | 0.55× | 5/5 | 32 |
+| 2M | LBVH | scatter + 宽节点 | 23.551 | 26.502 | 55.104 | 0.48× | 5/5 | 32 |
+| 2M | SAH | scatter 混合 1% | 68.206 | 70.461 | 102.426 | 0.69× | 5/5 | 25 |
+
+冷启动的整树重建（新进程、池为空）：2M LBVH `total=20.6` / wall 45.1 ms，
+2M SAH `total=63.6` / wall 99.0 ms。可见内部 event 的总计漏掉了 24–35 ms 的
+场景上传与分配，用它当增量更新的分母会显著低估后者的优势。
+
+分阶段（2M cluster 1%，稳态五轮中位数）：plan 1.7–2.9 / surgery 5.3–7.3 /
+relayout 3.6–5.0 / merge 0.6–0.75，总 11.6；首轮是冷的（37.0 ms，池为空）。
+131k 同配置稳态 2.7 ms。宽层重发本身 2.4 ms（不再有 19 ms 的分配器成本）。
+
+稳定性：131k 5% cluster 连续 100 轮，中位 update 4.29 / wall 4.44，
+回退 6/100，深度 25→26（峰值 32），节点测试 90–163；2M 1% 连续 30 轮，
+中位 11.72 / wall 11.88，回退 1/30，深度 31→36（上限 37），全程
+`mismatch=0/0/0`。
+
+### v1（无池，2026-10-30 下午，留档）
+
+下面是池化之前的同一组测量，时间口径为内部 event 计时（不含重建侧的
+上传与分配），保留作为对照：
 
 | 规模 | 建树器 | 编辑 | update | 重建 | 倍数 | 回退 | 深度 | 树校验 |
 |---|---|---|---|---|---|---|---|---|
@@ -920,27 +963,33 @@ merge 0.6 ms，总 31.9；131k 同配置是 1.5 / 3.0 / 1.5 / 0.5，总 6.9。
 其中 `buildWideNodesGPU` 报告的 emit kernel 只有 1.7–2.5 ms，其余约 19 ms 是
 每轮 `cudaFree`/`cudaMalloc` 128 MB 宽数组、CUB 前缀和与两次 D2H 同步——
 **成本在分配与同步，不在重发**。131k 宽节点 9.114 vs 2.574（3.54×，宽数组 33 MB）。
+这两项在 v1.1 里都已消失（宽层 2.4 ms）。
 
 读法：
 
-1. **纯 move 是 refit，不是本章的成本**：0.29×（131k），2M 同量级但受 H2D 限制。
-   移动量小时，`update_topology` 和 `update_vertices` 是同一条路。
-2. **2M SAH 更新比重建快一倍（0.48×）**，因为 SAH 重建要 62–65 ms，而更新 31 ms
-   与建树器无关。LBVH 重建只要 21 ms，所以同样是 1.5×。**拓扑更新是否划算，
-   先看建树器**：SAH 几乎总是划算，LBVH 只有 move 或大比例（>25%）重建时才值。
-3. **1/5 的目标未达成**：31.9 ms 里 plan + relayout 两个 O(n) 阶段占 65%
-   （前缀和、切分选择、规范化重编号、整片重发叶子）。131k 上固定开销占比更高，
-   倍数 2.3–3.3×。稳定槽位、节点池、缓冲复用（R5 清单）是下一版的事。
-4. **scatter 必须直接重建**：切分根覆盖的旧叶子超过 `n/4` 即回退；回退时规划
-   与暂存的钱已经花了，总耗时是直接重建的 1.7–2.9×。判据是"编辑是否成簇"，
-   不是比例本身。
-5. **深度受控**：cluster 1% 五轮深度不动（2M 31、131k 25），5% 到 35；超过
-   构造深度 + 6 层强制整树重建。会话 3 的 300 轮压力：回退 18/300，深度 22–29
-   振荡，节点测试 ≤133/查询，closest/kNN/radius 全程零失配。
-6. **正确性门禁**：19 个配置 × 5 轮 = 95 次更新，每轮 `validateBVHGPU(newScene)`
+1. **纯 move 是 refit，不是本章的成本**：0.501 ms（131k，0.13×），2M 同量级但受
+   H2D 限制。移动量小时，`update_topology` 和 `update_vertices` 是同一条路。
+2. **端到端意义上 1/5 的目标在 2M 上已经过了**：LBVH 0.27×、SAH 0.12×。
+   之前那份 0.48× / 1.53× 的分母是"重建的内部 event 总计"，不含 72 MB 上传
+   与 cudaMalloc（2M 上合计 24–35 ms），所以偏低；现在两边都用墙钟，读者可以
+   自己挑口径。
+3. **剩下的成本是两段 O(n)**：2M cluster 稳态 11.6 ms 里 plan 与 relayout 合计约
+   一半（前缀和、切分选择、规范化重编号、整片重发叶子）。v1.1 消掉的是分配与
+   释放（原来每轮 15 ms 量级）；再往下压要稳定槽位或稀疏叶子重发。
+4. **scatter 不再需要绕开 `update_topology`**：切分根覆盖的旧叶子超过 `n/4` 仍
+   回退整树重建，但回退把旧树整棵还进池、重建直接复用这批同尺寸的块，2M
+   wall 21–24 ms，比 `destroy + build`（44 ms）快一倍。131k 上整树重建只要 4 ms，
+   增量基本持平（0.73–1.08×）——小场景里省下的分配比省下的合并还值钱。
+5. **深度受控**：131k 5% 连续 100 轮深度 25→26（峰值 32），回退 6/100，
+   节点测试 90–163；2M 1% 连续 30 轮深度 31→36，回退 1/30。超过构造深度
+   + 6 层强制整树重建（`topoBaseDepth`）。
+6. **正确性门禁**：12 个配置 × 5 轮 = 60 次更新，每轮 `validateBVHGPU(newScene)`
    空串、closest / kNN(k=1,8,16) / radius / 射线 `t` 与全新构建逐位相同
    （`count/tri/dist_mismatch=0/0/0`）；同一输入两次更新的节点数组 FNV 哈希一致
-   （日志中的 `tree=`）。全量矩阵原始日志 `out/topo_matrix.txt`（gitignore）。
+   （日志中的 `tree=`）。另有 100 轮 / 30 轮连续更新压力，全程零失配。
+7. **显存**：池上限 2 GiB；2M LBVH 稳态驻留约 230 MB（旧树 + 建树临时块），
+   宽节点另占 128 + 16 MB 且跨轮复用。回退期间旧树进池而不是释放，峰值仍是
+   旧树 + 新树 + 暂存同时在世。
 
 复现：
 
@@ -949,6 +998,8 @@ build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind
 build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind scatter --topo-frac 0.01 --topo-mix mixed --topo-rounds 5
 build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.01 --topo-mix mixed --topo-rounds 5 --sah
 build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.01 --topo-mix move --topo-rounds 5
+build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.01 --topo-mix mixed --topo-rounds 5 --wide
+build\gpu_query_bench.exe --grid 256 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.05 --topo-mix mixed --topo-rounds 100
 ```
 
 ## 结论
