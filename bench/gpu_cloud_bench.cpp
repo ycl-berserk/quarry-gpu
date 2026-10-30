@@ -49,6 +49,7 @@ struct Options {
     bool stats = false;
     bool refit = false;
     bool wide = false;
+    bool sah = false;
     double refitShift = 0.002;
     double refitDirty = 0.01;
     std::string motion = "random";
@@ -75,6 +76,7 @@ void printUsage() {
         "  --refit-dirty F               局部 refit 改动的点比例，default 0.01\n"
         "  --refit-motion random|coherent 位移方式，default random\n"
         "  --wide                        遍历用 4 宽折叠节点（需先构建 wide 层）\n"
+        "  --sah                         用自顶向下分箱 SAH 建树（默认 LBVH）\n"
         "  --dump FILE                   把点云与查询点写成 QRCD 二进制，供外部 kd-tree 对照\n");
 }
 
@@ -133,6 +135,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             opt.refit = true;
         } else if (arg == "--wide") {
             opt.wide = true;
+        } else if (arg == "--sah") {
+            opt.sah = true;
         } else if (arg == "--refit-shift") {
             const char* v = needValue("--refit-shift");
             if (!v) return false;
@@ -419,7 +423,7 @@ int main(int argc, char** argv) {
     GpuBVH gpu;
     try {
         warmupBuildGPU();
-        gpu = buildPointBVHGPU(cloud, &build);
+        gpu = opt.sah ? buildPointBVHSahGPU(cloud, &build) : buildPointBVHGPU(cloud, &build);
     } catch (const std::exception& e) {
         std::printf("gpu build failed: %s\n", e.what());
         return 3;
@@ -429,6 +433,10 @@ int main(int argc, char** argv) {
         "nodes=%d depth=%d\n",
         build.mortonMs, build.sortMs, build.scatterMs, build.treeMs, build.refitMs, build.totalMs,
         gpu.nodeCount, gpu.depth);
+    if (opt.sah) {
+        std::printf("gpu sah bin=%.2f split=%.2f partition=%.2f ms\n", build.sahBinMs,
+                    build.sahSplitMs, build.sahPartMs);
+    }
     const std::string treeError = validatePointBVHGPU(gpu, cloud);
     std::printf("gpu tree %s%s\n", treeError.empty() ? "PASS" : "FAIL: ", treeError.c_str());
     if (!treeError.empty()) return 4;

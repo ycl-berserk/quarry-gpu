@@ -42,6 +42,7 @@ struct Options {
     int diagRay = -1;
     int warmupMs = 3000;
     bool wide = false;
+    bool sah = false;
 };
 
 void printUsage() {
@@ -61,6 +62,7 @@ void printUsage() {
         "  --ray-sort-dir                 GPU 内按方向 Morton 序重排（次生射线用）\n"
         "  --ray-sort-host                主机排序后上传，只测遍历收益（对照实验）\n"
         "  --wide                         遍历 4 宽折叠节点（先折叠二叉 LBVH）\n"
+        "  --sah                          用自顶向下分箱 SAH 建树（默认 LBVH）\n"
         "  --diag-ray N                   打印第 N 条射线的 CPU/GPU/暴力三方命中\n"
         "  --verify / --no-verify         是否逐条射线对拍（default verify）\n"
         "  --no-cpu                       跳过 CPU 参考遍历（大场景省时间）\n");
@@ -119,6 +121,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             opt.raySort = Options::RaySort::Host;
         } else if (arg == "--wide") {
             opt.wide = true;
+        } else if (arg == "--sah") {
+            opt.sah = true;
         } else if (arg == "--diag-ray") {
             const char* v = needValue("--diag-ray");
             if (!v) return false;
@@ -227,7 +231,7 @@ int main(int argc, char** argv) {
     GpuBVH gpu;
     try {
         warmupBuildGPU();  // 模块懒加载的一次性开销不算进构建
-        gpu = buildBVHGPU(scene, &build);
+        gpu = opt.sah ? buildBVHSahGPU(scene, &build) : buildBVHGPU(scene, &build);
     } catch (const std::exception& e) {
         std::printf("gpu build failed: %s\n", e.what());
         return 3;
@@ -238,6 +242,10 @@ int main(int argc, char** argv) {
         "nodes=%d depth=%d\n",
         build.mortonMs, build.sortMs, build.scatterMs, build.treeMs, build.refitMs, build.totalMs,
         gpu.nodeCount, gpu.depth);
+    if (opt.sah) {
+        std::printf("gpu sah bin=%.2f split=%.2f partition=%.2f ms\n", build.sahBinMs,
+                    build.sahSplitMs, build.sahPartMs);
+    }
     if (gpu.nodeCount != static_cast<int>(2 * scene.tris.size() - 1)) {
         std::printf("gpu tree FAIL: node count %d\n", gpu.nodeCount);
         return 4;

@@ -54,9 +54,12 @@ struct GpuBVH {
 struct GpuBuildTimings {
     double mortonMs = 0.0;   // 重心 + Morton 码
     double sortMs = 0.0;     // cub::DeviceRadixSort
-    double treeMs = 0.0;     // Karras 内部节点二分
+    double treeMs = 0.0;     // Karras 内部节点二分（SAH 路径为拓扑总耗时）
     double scatterMs = 0.0;  // 三角形按叶子顺序重排
-    double refitMs = 0.0;    // 自底向上合并 AABB
+    double refitMs = 0.0;    // 自底向上合并 AABB（含叶子盒与深度排序）
+    double sahBinMs = 0.0;   // SAH：重心域 + 分箱
+    double sahSplitMs = 0.0; // SAH：选切分 + 分区扫描
+    double sahPartMs = 0.0;  // SAH：稳定分区 + 子节点分配
     double totalMs = 0.0;
 };
 
@@ -73,6 +76,13 @@ bool gpuDescribe(std::string* why);
 
 // 可能抛 std::runtime_error（CUDA 调用失败时）。
 GpuBVH buildBVHGPU(const Scene& scene, GpuBuildTimings* timings = nullptr);
+
+// 自顶向下分箱 SAH（16 箱 × 3 轴，区间 ≤64 图元退回对象中位数 + 串行建子树）。
+// 输出与 LBVH 完全同构（内部/叶子编号、refit 缓存、宽节点折叠全部通用），
+// 只是树形更好、构建更慢；默认路径仍是 LBVH，基准用 --sah 显式切换。
+GpuBVH buildBVHSahGPU(const Scene& scene, GpuBuildTimings* timings = nullptr);
+GpuBVH buildPointBVHSahGPU(const PointCloud& cloud, GpuBuildTimings* timings = nullptr);
+GpuBVH buildGaussianBVHSahGPU(const GaussianCloud& cloud, GpuBuildTimings* timings = nullptr);
 
 // 点云走同一条 LBVH 骨架：Morton 码按点坐标、叶子盒退化成单点。只有叶子载荷
 // （Tri vs Vec3）和求距函数不同，见 gpu/prim_ops.h。

@@ -35,6 +35,12 @@ QueryOrder parseQueryOrder(const std::string& s) {
     throw std::invalid_argument("order must be 'input' or 'morton'");
 }
 
+bool parseSahBuilder(const std::string& s) {
+    if (s == "lbvh") return false;
+    if (s == "sah") return true;
+    throw std::invalid_argument("builder must be 'lbvh' or 'sah'");
+}
+
 std::vector<Tri> trianglesFromArray(const F32Array& arr) {
     if (arr.ndim() != 3 || arr.shape(1) != 3 || arr.shape(2) != 3) {
         throw std::invalid_argument("triangles must have shape (M, 3, 3)");
@@ -300,10 +306,13 @@ py::tuple radiusRun(GpuBVH& bvh, const F32Array& points, float radius, LeafKind 
 
 class PyScene {
 public:
-    explicit PyScene(const F32Array& triangles) : tris_(trianglesFromArray(triangles)) { build(); }
+    explicit PyScene(const F32Array& triangles, const std::string& builder)
+        : tris_(trianglesFromArray(triangles)), sah_(parseSahBuilder(builder)) {
+        build();
+    }
 
-    PyScene(const F32Array& vertices, const I32Array& indices)
-        : tris_(trianglesFromMesh(vertices, indices)) {
+    PyScene(const F32Array& vertices, const I32Array& indices, const std::string& builder)
+        : tris_(trianglesFromMesh(vertices, indices)), sah_(parseSahBuilder(builder)) {
         indices_.assign(indices.data(), indices.data() + indices.size());
         build();
     }
@@ -342,6 +351,9 @@ public:
         out["tree_ms"] = timings_.treeMs;
         out["refit_ms"] = timings_.refitMs;
         out["total_ms"] = timings_.totalMs;
+        out["sah_bin_ms"] = timings_.sahBinMs;
+        out["sah_split_ms"] = timings_.sahSplitMs;
+        out["sah_partition_ms"] = timings_.sahPartMs;
         return out;
     }
 
@@ -410,7 +422,7 @@ private:
         bounds_ = sceneView_.bounds;
         {
             py::gil_scoped_release release;
-            bvh_ = buildBVHGPU(sceneView_, &timings_);
+            bvh_ = sah_ ? buildBVHSahGPU(sceneView_, &timings_) : buildBVHGPU(sceneView_, &timings_);
         }
         buildMs_ = timings_.totalMs;
     }
@@ -456,6 +468,7 @@ public:
 private:
     std::vector<Tri> tris_;
     std::vector<int32_t> indices_;  // 只有 (vertices, indices) 构造时才有
+    bool sah_ = false;
     ::Scene sceneView_;
     AABB bounds_;
     GpuBVH bvh_;
@@ -468,7 +481,8 @@ private:
 
 class PyPointCloud {
 public:
-    explicit PyPointCloud(const F32Array& points) {
+    explicit PyPointCloud(const F32Array& points, const std::string& builder)
+        : sah_(parseSahBuilder(builder)) {
         std::vector<Vec3> pts = pointsFromArray(points, "points");
         if (pts.size() < 2) throw std::invalid_argument("at least 2 points are required");
         cloud_.pts = std::move(pts);
@@ -476,7 +490,8 @@ public:
         bounds_ = cloud_.bounds;
         {
             py::gil_scoped_release release;
-            bvh_ = buildPointBVHGPU(cloud_, &timings_);
+            bvh_ = sah_ ? buildPointBVHSahGPU(cloud_, &timings_)
+                        : buildPointBVHGPU(cloud_, &timings_);
         }
         buildMs_ = timings_.totalMs;
     }
@@ -502,6 +517,9 @@ public:
         out["tree_ms"] = timings_.treeMs;
         out["refit_ms"] = timings_.refitMs;
         out["total_ms"] = timings_.totalMs;
+        out["sah_bin_ms"] = timings_.sahBinMs;
+        out["sah_split_ms"] = timings_.sahSplitMs;
+        out["sah_partition_ms"] = timings_.sahPartMs;
         return out;
     }
 
@@ -567,21 +585,24 @@ private:
     double buildMs_ = 0.0;
     double lastQueryMs_ = 0.0;
     double refitMs_ = 0.0;
+    bool sah_ = false;
 };
 
 // 高斯云：查询语义是椭球实体（内部距离 0，外部到表面），不是概率密度。
 // 因此 closest / knn / radius 的输出与点云完全同构：dist2 + 图元下标。
 class PyGaussianCloud {
 public:
-    PyGaussianCloud(const F32Array& means, const F32Array& rot, const F32Array& scale)
-        : gaussians_(gaussiansFromArrays(means, rot, scale)) {
+    PyGaussianCloud(const F32Array& means, const F32Array& rot, const F32Array& scale,
+                    const std::string& builder)
+        : gaussians_(gaussiansFromArrays(means, rot, scale)), sah_(parseSahBuilder(builder)) {
         if (gaussians_.size() < 2) throw std::invalid_argument("at least 2 gaussians required");
         cloud_.gaussians = gaussians_;
         cloud_.updateBounds();
         bounds_ = cloud_.bounds;
         {
             py::gil_scoped_release release;
-            bvh_ = buildGaussianBVHGPU(cloud_, &timings_);
+            bvh_ = sah_ ? buildGaussianBVHSahGPU(cloud_, &timings_)
+                        : buildGaussianBVHGPU(cloud_, &timings_);
         }
         buildMs_ = timings_.totalMs;
     }
@@ -607,6 +628,9 @@ public:
         out["tree_ms"] = timings_.treeMs;
         out["refit_ms"] = timings_.refitMs;
         out["total_ms"] = timings_.totalMs;
+        out["sah_bin_ms"] = timings_.sahBinMs;
+        out["sah_split_ms"] = timings_.sahSplitMs;
+        out["sah_partition_ms"] = timings_.sahPartMs;
         return out;
     }
 
@@ -676,6 +700,7 @@ private:
     double buildMs_ = 0.0;
     double lastQueryMs_ = 0.0;
     double refitMs_ = 0.0;
+    bool sah_ = false;
 };
 
 py::tuple demoGaussians(const std::string& kind, int count, uint64_t seed) {
@@ -756,10 +781,18 @@ PYBIND11_MODULE(quarry, m) {
           "Return (means (N,3), rot (N,4) xyzw, scales (N,3)) for a demo gaussian cloud");
 
     py::class_<PyScene>(m, "Scene", "Static triangle mesh with a GPU LBVH")
-        .def(py::init<const F32Array&>(), py::arg("triangles"),
-             "Build from triangles with shape (M, 3, 3) float32")
-        .def(py::init<const F32Array&, const I32Array&>(), py::arg("vertices"),
-             py::arg("indices"), "Build from shared vertices (N,3) and indices (M,3)")
+        .def(py::init([](const F32Array& triangles, const std::string& builder) {
+                 return std::make_unique<PyScene>(triangles, builder);
+             }),
+             py::arg("triangles"), py::arg("builder") = "lbvh",
+             "Build from triangles with shape (M, 3, 3) float32; builder is 'lbvh' (fast, "
+             "Morton) or 'sah' (slower build, fewer node tests)")
+        .def(py::init([](const F32Array& vertices, const I32Array& indices,
+                         const std::string& builder) {
+                 return std::make_unique<PyScene>(vertices, indices, builder);
+             }),
+             py::arg("vertices"), py::arg("indices"), py::arg("builder") = "lbvh",
+             "Build from shared vertices (N,3) and indices (M,3)")
         .def_property_readonly("triangle_count", &PyScene::triangleCount)
         .def_property_readonly("node_count", &PyScene::nodeCount)
         .def_property_readonly("depth", &PyScene::depth)
@@ -800,8 +833,11 @@ PYBIND11_MODULE(quarry, m) {
              "sorted by (dist2, index) inside each segment");
 
     py::class_<PyPointCloud>(m, "PointCloud", "Static point cloud with a GPU LBVH")
-        .def(py::init<const F32Array&>(), py::arg("points"),
-             "Build from points with shape (N, 3) float32")
+        .def(py::init([](const F32Array& points, const std::string& builder) {
+                 return std::make_unique<PyPointCloud>(points, builder);
+             }),
+             py::arg("points"), py::arg("builder") = "lbvh",
+             "Build from points with shape (N, 3) float32; builder is 'lbvh' or 'sah'")
         .def_property_readonly("point_count", &PyPointCloud::pointCount)
         .def_property_readonly("node_count", &PyPointCloud::nodeCount)
         .def_property_readonly("depth", &PyPointCloud::depth)
@@ -833,9 +869,13 @@ PYBIND11_MODULE(quarry, m) {
         m, "GaussianCloud",
         "Static gaussian cloud with a GPU LBVH. Query semantics are the solid ellipsoid: "
         "dist2 is 0 inside, otherwise the squared euclidean distance to the surface")
-        .def(py::init<const F32Array&, const F32Array&, const F32Array&>(), py::arg("means"),
-             py::arg("rot"), py::arg("scale"),
-             "Build from means (N,3), rotations (N,4) xyzw quaternions, semi-axes (N,3)")
+        .def(py::init([](const F32Array& means, const F32Array& rot, const F32Array& scale,
+                         const std::string& builder) {
+                 return std::make_unique<PyGaussianCloud>(means, rot, scale, builder);
+             }),
+             py::arg("means"), py::arg("rot"), py::arg("scale"), py::arg("builder") = "lbvh",
+             "Build from means (N,3), rotations (N,4) xyzw quaternions, semi-axes (N,3); "
+             "builder is 'lbvh' or 'sah'")
         .def_property_readonly("gaussian_count", &PyGaussianCloud::gaussianCount)
         .def_property_readonly("node_count", &PyGaussianCloud::nodeCount)
         .def_property_readonly("depth", &PyGaussianCloud::depth)

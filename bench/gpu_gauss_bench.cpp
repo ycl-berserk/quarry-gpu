@@ -50,6 +50,7 @@ struct Options {
     bool refit = false;
     bool querySort = false;
     bool wide = false;
+    bool sah = false;
     double refitShift = 0.002;
     double refitDirty = 0.01;
     std::string motion = "random";
@@ -75,7 +76,8 @@ void printUsage() {
         "  --refit-dirty F               局部 refit 改动的高斯比例，default 0.01\n"
         "  --refit-motion random|coherent 位移方式，default random\n"
         "  --query-sort                  查询点按 Morton 序重排后再遍历\n"
-        "  --wide                        遍历用 4 宽折叠节点（可与 --query-sort 叠加）\n");
+        "  --wide                        遍历用 4 宽折叠节点（可与 --query-sort 叠加）\n"
+        "  --sah                         用自顶向下分箱 SAH 建树（默认 LBVH）\n");
 }
 
 bool parseArgs(int argc, char** argv, Options& opt) {
@@ -140,6 +142,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             opt.querySort = true;
         } else if (arg == "--wide") {
             opt.wide = true;
+        } else if (arg == "--sah") {
+            opt.sah = true;
         } else if (arg == "--refit-dirty") {
             const char* v = needValue("--refit-dirty");
             if (!v) return false;
@@ -386,7 +390,7 @@ int main(int argc, char** argv) {
     GpuBVH gpu;
     try {
         warmupBuildGPU();
-        gpu = buildGaussianBVHGPU(cloud, &build);
+        gpu = opt.sah ? buildGaussianBVHSahGPU(cloud, &build) : buildGaussianBVHGPU(cloud, &build);
     } catch (const std::exception& e) {
         std::printf("gpu build failed: %s\n", e.what());
         return 3;
@@ -396,6 +400,10 @@ int main(int argc, char** argv) {
         "nodes=%d depth=%d\n",
         build.mortonMs, build.sortMs, build.scatterMs, build.treeMs, build.refitMs, build.totalMs,
         gpu.nodeCount, gpu.depth);
+    if (opt.sah) {
+        std::printf("gpu sah bin=%.2f split=%.2f partition=%.2f ms\n", build.sahBinMs,
+                    build.sahSplitMs, build.sahPartMs);
+    }
     const std::string treeError = validateGaussianBVHGPU(gpu, cloud);
     std::printf("gpu tree %s%s\n", treeError.empty() ? "PASS" : "FAIL: ", treeError.c_str());
     if (!treeError.empty()) return 4;

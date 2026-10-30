@@ -51,6 +51,7 @@ struct Options {
     std::string refitMotion = "random";
     bool querySort = false;
     bool wide = false;
+    bool sah = false;
 };
 
 void printUsage() {
@@ -75,7 +76,8 @@ void printUsage() {
         "  --refit-shift F                每个三角形随机平移的幅度（场景对角线的比例），default 0.005\n"
         "  --refit-dirty F                第一步改动的三角形比例，default 0.01\n"
         "  --refit-motion random|coherent 位移方式：逐三角形独立 / 平滑场，default random\n"
-        "  --query-sort                   查询点按 Morton 序重排后再遍历（不能与 --refit 同用）\n");
+        "  --query-sort                   查询点按 Morton 序重排后再遍历（不能与 --refit 同用）\n"
+        "  --sah                          用自顶向下分箱 SAH 建树（默认 LBVH）\n");
 }
 
 bool parseArgs(int argc, char** argv, Options& opt) {
@@ -163,6 +165,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             }
         } else if (arg == "--wide") {
             opt.wide = true;
+        } else if (arg == "--sah") {
+            opt.sah = true;
         } else if (arg == "--query-sort") {
             opt.querySort = true;
         } else if (arg == "-h" || arg == "--help") {
@@ -433,7 +437,7 @@ int main(int argc, char** argv) {
     GpuBVH gpu;
     try {
         warmupBuildGPU();
-        gpu = buildBVHGPU(scene, &build);
+        gpu = opt.sah ? buildBVHSahGPU(scene, &build) : buildBVHGPU(scene, &build);
     } catch (const std::exception& e) {
         std::printf("gpu build failed: %s\n", e.what());
         return 3;
@@ -443,6 +447,10 @@ int main(int argc, char** argv) {
         "nodes=%d depth=%d\n",
         build.mortonMs, build.sortMs, build.scatterMs, build.treeMs, build.refitMs, build.totalMs,
         gpu.nodeCount, gpu.depth);
+    if (opt.sah) {
+        std::printf("gpu sah bin=%.2f split=%.2f partition=%.2f ms\n", build.sahBinMs,
+                    build.sahSplitMs, build.sahPartMs);
+    }
     const std::string treeError = validateBVHGPU(gpu, scene);
     std::printf("gpu tree %s%s\n", treeError.empty() ? "PASS" : "FAIL: ", treeError.c_str());
     if (!treeError.empty()) return 4;
@@ -726,7 +734,8 @@ int main(int argc, char** argv) {
             for (int i = 0; i < opt.runs; ++i) {
                 destroyBVHGPU(rebuilt);
                 rebuild = GpuBuildTimings{};
-                rebuilt = buildBVHGPU(moved, &rebuild);
+                rebuilt = opt.sah ? buildBVHSahGPU(moved, &rebuild)
+                                  : buildBVHGPU(moved, &rebuild);
                 times.push_back(rebuild.totalMs);
             }
             std::sort(times.begin(), times.end());

@@ -238,6 +238,25 @@ def main():
           np.array_equal(m_off, offsets) and np.array_equal(m_rid, rid)
           and np.array_equal(m_rd2.view(np.uint32), rd2.view(np.uint32)))
 
+    # 建树器只改树形，不改查询语义：SAH 树的结果必须和 LBVH 逐位一致
+    sah_scene = quarry.Scene(vertices, indices, builder="sah")
+    check("sah validate", sah_scene.validate() == "", sah_scene.validate())
+    check("sah node_count", sah_scene.node_count == 2 * 2048 - 1, sah_scene.node_count)
+    s_dist2, s_tri = sah_scene.closest(points)
+    check("sah closest bitwise",
+          np.array_equal(s_tri, tri)
+          and np.array_equal(s_dist2.view(np.uint32), dist2.view(np.uint32)),
+          f"{(s_tri != tri).sum()} ids differ")
+    s_kd, s_kid = sah_scene.knn(points, k)
+    check("sah knn bitwise",
+          np.array_equal(s_kid, kid)
+          and np.array_equal(s_kd.view(np.uint32), kd.view(np.uint32)))
+    s_off, s_rd2, s_rid = sah_scene.radius(points, radius)
+    check("sah radius bitwise",
+          np.array_equal(s_off, offsets) and np.array_equal(s_rid, rid)
+          and np.array_equal(s_rd2.view(np.uint32), rd2.view(np.uint32)))
+    check("sah build_stats has bin breakdown", "sah_bin_ms" in sah_scene.build_stats)
+
     origins = (lo + (hi - lo) * rng.random((200, 3))).astype(np.float32)
     origins[:, 1] = hi[1] + 1.0
     dirs = np.tile(np.array([0.0, -1.0, 0.0], dtype=np.float32), (200, 1))
