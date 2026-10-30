@@ -879,10 +879,10 @@ Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
 ## 拓扑可变更新（M3 收尾，2026-10-30）
 
 `updateBVHGPU` / `updatePointBVHGPU` / `updateGaussianBVHGPU` 接受一份编辑脚本
-（删 `deleted`、尾部追加 `appended`、几何改动 `moved`），只重建受影响的子树，
-其余复用，最后做规范化重编号。门禁与 refit 同一套、但更强：**更新后树的查询输出
-必须与"对同一份新场景全新构建"的树逐位相同**，而不只是与 CPU 参考一致。
-纯 move 走原 refit 快路径（`deleted` 空且 `appended == 0`）。
+（删 `deleted`、场景中间插 `inserted`、尾部追加 `appended`、几何改动 `moved`），
+只重建受影响的子树，其余复用，最后做规范化重编号。门禁与 refit 同一套、但更强：
+**更新后树的查询输出必须与"对同一份新场景全新构建"的树逐位相同**，而不只是与
+CPU 参考一致。纯 move 走原 refit 快路径（`deleted` / `inserted` 空且 `appended == 0`）。
 
 **口径**：纵向对照，同会话、同一 exe、同一批输入，每轮与"对 `newScene` 全新构建"
 成对测量，各 5 轮中位数，3 s DVFS 预热，20k 查询点，`--no-cpu`。
@@ -892,6 +892,47 @@ Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
 `wall` 是调用前后的 steady_clock 端到端；`重建 wall` 是同一份场景
 `destroy + build` 的端到端（含 72 MB 场景上传与全部 cudaMalloc）。
 倍数是 update / 重建，**小于 1 表示更新比重建快**。
+
+### v1.2：任意位置插入（2026-10-30 夜）
+
+`GpuTopoEdit::inserted` 让脚本在场景中间插入图元。实现上没有引入稳定槽位：
+新图元不论插在哪，槽位都接在"幸存者压缩槽 + 插入块 + 追加块"的尾部，新增块在
+槽序里始终连续，子树槽区间因此仍然连续；场景下标由 `d_primIds` 单独记录（幸存者的
+新下标用位移表 `shifts[j] = inserted[j] - j` 二分一次求得）。所以插入的结构成本
+与尾部追加相同，差别只在一次下标重映射。
+
+| 规模 | 建树器 | 编辑 | update | wall | 重建 wall | wall 倍数 | 回退 | 深度 |
+|---|---|---|---|---|---|---|---|---|
+| 131k | LBVH | cluster 混合 1% | 3.882 | 4.118 | 4.634 | 0.89× | 0/5 | 25 |
+| 131k | LBVH | cluster 中插 1% | 6.152 | 6.365 | 6.668 | 0.95× | 0/5 | 25 |
+| 131k | LBVH | cluster 四合一 1% | 4.923 | 5.178 | 4.695 | 1.10× | 0/5 | 25 |
+| 2M | LBVH | cluster 混合 1% | 12.272 | 12.486 | 60.338 | 0.21× | 0/5 | 31 |
+| 2M | LBVH | cluster 中插 1% | 22.750 | 23.075 | 71.971 | 0.32× | 0/5 | 31 |
+| 2M | LBVH | cluster 中插 + 宽节点 | 29.780 | 30.014 | 71.564 | 0.42× | 0/5 | 31 |
+| 2M | LBVH | cluster 四合一 1% | 22.456 | 23.408 | 61.360 | 0.38× | 0/5 | 31 |
+| 2M | SAH | cluster 中插 1% | 24.888 | 25.658 | 130.852 | 0.20× | 1/5 | 25 |
+| 2M | SAH | cluster 四合一 1% | 24.775 | 25.029 | 127.764 | 0.20× | 1/5 | 26 |
+
+"四合一" = 删 + 中插 + 尾插 + 移动各约 0.25%（合计 1%）；"中插"只插，不删不移。
+同会话（2026-10-30 夜间）、5 轮中位数；与下面 v1.1 的表不在同一会话，绝对值不可
+跨表读，行内倍数是配对的。
+
+读法：
+
+1. **中插 ≈ 尾插**：2M 中插 23.1 ms、尾插 24.0 ms（同会话各 5 轮，中位数），结构
+   成本相同。这是"槽序不跟随场景序"换来的——不做稳定槽位，就不必为中间插入挪旧槽。
+2. **尾部有新增块时 relayout 明显更贵**：2M 只删 3.4 ms，中插 11–12 ms。对照
+   `--topo-mix delete`（`extra == 0`）确认慢的是"尾部切分块"这条既有路径，与中插
+   本身无关。各段是 CUDA event 计时，异步工作可能被下一段吸收，读趋势、不读单段归因。
+3. **查询质量会缓慢漂**：2M 连续 5 轮 1% 中插，更新树节点测试 513→759，而同轮
+   全新构建 456→439，即 1.1×→1.7×；尾插同形（513→742）。全新构建在同一脚本下
+   也在变（456→439），说明脚本本身在改变场景的可查询性，所以只报同轮比率。
+   SAH 在第 4 轮触发一次整树重建（深度 29 → 25），比率回到 1.17×——深度兜底在
+   起作用；更主动的"升一级切分"启发式（R4）未做。
+4. **正确性**：9 个配置 × 5 轮 = 45 次更新全部 `mismatch=0/0/0` 且 `validate`
+   空串；另有 30 轮 scatter 5% 中插（`--wide`，1 次回退、深度 27）、20 轮四合一、
+   131k/2M SAH ± 宽节点均零失配。Python 侧覆盖插入位置 0 与末尾、三种图元，
+   以及非升序 / 越界 `inserted` 的两条坏输入。
 
 ### v1.1：设备内存池 + 宽节点缓冲复用（2026-10-30 晚）
 
@@ -999,6 +1040,8 @@ build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind
 build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.01 --topo-mix mixed --topo-rounds 5 --sah
 build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.01 --topo-mix move --topo-rounds 5
 build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.01 --topo-mix mixed --topo-rounds 5 --wide
+build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.01 --topo-mix insertmid --topo-rounds 5
+build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.01 --topo-mix mixedmid --topo-rounds 5
 build\gpu_query_bench.exe --grid 256 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.05 --topo-mix mixed --topo-rounds 100
 ```
 

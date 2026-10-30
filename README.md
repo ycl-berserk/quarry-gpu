@@ -388,7 +388,7 @@ py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（84 项检查）
 | `scene.update_triangles(triangles, dirty=None)` | 同上，直接给 `(M,3,3)`；`refit_ms` / `refit_stats` 读上一次的耗时 |
 | `cloud.update_points(points, dirty=None)` | 点云 refit：点数不变；`dirty` 是改动的点索引 |
 | `gcloud.update(means, rot, scale, dirty=None)` | 高斯 refit：数量不变，中心/朝向/半轴可一起换；半轴必须 > 0 |
-| `scene.update_topology(triangles, deleted=None, moved=None)` / `cloud.update_topology(points)` / `gcloud.update_topology(means, rot, scale, ...)` | 增删图元：数组 = 幸存者（原序去掉 `deleted`）+ 尾部追加；`moved` 是新场景里几何变了的下标；返回 timings 字典 |
+| `scene.update_topology(triangles, deleted=None, moved=None, inserted=None)` / `cloud.update_topology(points)` / `gcloud.update_topology(means, rot, scale, ...)` | 增删图元：数组 = 幸存者（原序去掉 `deleted`）+ `inserted` 指定位插入 + 尾部追加；`moved` 是新场景里几何变了的下标；返回 timings 字典 |
 
 - 入参统一按 `float32` / C 连续处理（`forcecast`），传 float64 或非连续数组会先拷贝。
   返回数组在重新拿到 GIL 之后才分配，构建与查询期间 GIL 是释放的。
@@ -453,30 +453,39 @@ scene.refit_ms, scene.refit_stats       # {upload_ms, scatter_ms, mark_ms, merge
 ## 拓扑更新（增删，M3 收尾，2026-10-30）
 
 `updateBVHGPU` 接受一份编辑脚本：删掉 `deleted` 里的旧图元、几何改了的 `moved`、
-在尾部追加 `appended` 个新图元。它只重建被这些编辑碰到的子树，其余原样复用，
-再做一次规范化重编号；查询结果与"对同一份新场景全新构建"**逐位相同**。
+在场景中间插入 `inserted` 个新图元、在尾部追加 `appended` 个新图元。它只重建被
+这些编辑碰到的子树，其余原样复用，再做一次规范化重编号；查询结果与"对同一份
+新场景全新构建"**逐位相同**。
 
 ```cpp
-// newScene = 旧场景删掉 deleted 后的幸存者（保持原顺序）+ 末尾追加 appended 个图元
+// newScene = 旧场景删掉 deleted 后的幸存者（保持原顺序）
+//          + 在 inserted 这些位置插入的新图元 + 末尾 appended 个新图元
 GpuTopoEdit edit;
 edit.deleted  = {12, 40, 41};   // 旧场景下标，升序、不重复
+edit.inserted = {6, 7};         // 新场景下标，升序、不重复、必须 < newScene.size() - appended
 edit.appended = 2;              // 新图元已经接在 newScene 尾部
 edit.moved    = {3, 9};         // 新场景下标：几何变了、拓扑没变
 GpuTopoUpdateTimings ts;
 double ms = updateBVHGPU(bvh, newScene, edit, &ts);
 // ts: planMs / surgeryMs / relayoutMs / mergeMs / wideMs，以及
-//     surgeryRoots / rebuiltLeaves / newDepth / fullRebuild
+//     surgeryRoots / rebuiltLeaves / newDepth / fullRebuild / inserted
 ```
 
 ```python
-scene.update_topology(tris2, deleted=None, moved=None)
+scene.update_topology(tris2, deleted=None, moved=None, inserted=None)
 cloud.update_topology(pts2);  gcloud.update_topology(means2, rot2, scale2)
 ```
 
-只 move（`deleted` 为空且 `appended == 0`）会直接转给原来的 refit 快路径；
-`update_vertices` / `update_points` / `update` 仍然拒绝数量变化。删/增之后新叶子槽位
-是旧槽序的**压缩下标**，所以 `primIds` 一般不再等于 `iota`；查询内核只读
-`slot = -left-1`，不关心 `n` 与节点 id 布局，所以结果不受影响。
+只 move（`deleted` 与 `inserted` 为空、`appended == 0`）会直接转给原来的 refit
+快路径；`update_vertices` / `update_points` / `update` 仍然拒绝数量变化。
+
+**槽序不跟随场景序**。新图元不论插在场景哪里，都进槽空间的尾部：
+`[0, 幸存者数)` 是幸存者按旧槽序压缩后的下标，接着是 `inserted`（按场景序），最后是
+`appended`。于是新增块在槽序里始终是一段连续区间，子树覆盖的槽区间仍然连续，
+切分与重建不用为中间插入动任何旧槽。场景下标由 `d_primIds` 单独记录——它是唯一
+真源，`d_tris` 只是按槽序排好的副本；查询内核只读 `slot = -left-1`，不关心 `n`
+与节点 id 布局，所以结果不受影响。幸存者的新场景下标用一张位移表
+`shifts[j] = inserted[j] - j`（非降）一次二分求出，插入项越多越省。
 
 地形 131k / 2M，每轮改 1%（cluster：局部簇内；scatter：全场景均匀），
 20k 查询点，同会话成对、5 轮中位数（`--no-cpu`）。两列时间分开记：
@@ -522,6 +531,15 @@ steady_clock 端到端；`重建 wall` 是同一份场景 `destroy + build` 的�
   要稳定槽位或稀疏叶子重发。首轮是冷的（2M 37 ms，池还空着），之后才进稳态。
 - **编辑种类**：只增最贵——追加区间要吸收同样多的旧叶子，重建块更大；131k 1%
   只增 4.7 ms 略高于直接重建（1.08×），只删和混合都在重建的一半以下。
+- **任意位置插入**（`inserted`，v1.2）：中插与尾插成本相同（2M 23.1 vs 24.0 ms），
+  因为槽序里新增块一律接在尾部、场景序由 `d_primIds` 单独记录。同会话 5 轮中位数：
+  2M LBVH 中插 22.8 / wall 23.1 / 重建 wall 72.0 ms（0.32×），SAH 中插 24.9 / 25.7 /
+  130.9 ms（0.20×，1 次回退）；131k 中插 6.2 / 6.4 ms（0.95×）。四合一（删 + 中插 +
+  尾插 + 移动）2M LBVH 22.5 / 23.4 ms（0.38×）。这组数字与上表不在同一会话，
+  只看行内倍数。
+- **插入的查询质量会缓慢漂**：2M 连续 5 轮 1% 中插，更新树节点测试 513→759，同轮
+  全新构建 456→439，即 1.1×→1.7×；SAH 触发一次深度回退后回到 1.17×。尾插同形
+  （513→742），与插入功能无关，是"旧子树不重切"的固有代价。
 - **深度会漂，但有上限**：131k 5% 连续 100 轮，深度 25→26、回退 6/100，节点
   测试在 90–163 之间来回；2M 1% 连续 30 轮回退 1/30、深度 31→36（上限是均衡
   深度 + 6 层）。
@@ -590,11 +608,13 @@ learn/        教程配套的单文件练习
 - Python 绑定是同步的：每次调用都上传、同步、回读，没有异步 / 零拷贝接口
 - refit 拓扑冻结：不增删、不重排三角形；局部路径只合并脏叶子的祖先，但逐层 launch
   的数量不变，小场景里启动开销开始主导
-- 拓扑更新只支持**尾部追加**，任意位置插入要调用方先重排。池化之后 2M 上
-  1% 编辑的端到端耗时是直接重建的 0.12–0.69×（LBVH 0.27×、SAH 0.12×），
-  均匀散布的编辑走回退也比重建快（0.48–0.69×）；131k 场景因为整树重建只要
-  4 ms，增量基本持平（0.73–1.08×）。剩余成本是 plan/relayout 两段 O(n)，
-  稳定槽位与节点池还没做。宽节点层每轮整层重发，2M 额外约 3 ms
+- 拓扑更新支持**任意位置插入**（新图元落在槽尾，场景序由 `d_primIds` 记录），但
+  不做稳定槽位：每次更新仍是 O(n) 的规范化重编号，plan/relayout 两段占掉一半。
+  池化之后 2M 上 1% 编辑的端到端耗时是直接重建的 0.12–0.69×（LBVH 0.27×、
+  SAH 0.12×），中插 0.20–0.32×；均匀散布的编辑走回退也比重建快（0.48–0.69×）；
+  131k 场景因为整树重建只要 4 ms，增量基本持平（0.73–1.10×）。宽节点层每轮
+  整层重发，2M 额外约 3 ms；连续多轮插入后查询节点测试会缓慢上升（5 轮约
+  1.7× 同场景新鲜树），靠深度上限触发整树重建兜底，"升一级切分"未做
 - BVH 每叶 1 个三角形，2M 场景 419 万节点；Morton 叶子批量（4–8 个/叶）实测
   遍历更慢（射线 2.2×、kNN 1.8×），已回退。BVH4 宽节点（`--wide`）与自顶向下
   分箱 SAH（`--sah`）都已落地，查询侧已追平 Warp，剩余差距在构建速度；
