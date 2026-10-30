@@ -9,7 +9,8 @@ GPU 原生空间查询引擎：构建加速结构（BVH / 八叉树 / 哈希网�
 （refit），以及**三种图元**：三角形、点云、高斯。三者共用同一棵 LBVH 与同一套查询，
 只在叶子里换"测什么"——高斯的叶子测试是精确的**点到椭球实体**距离。查询批次可以按
 Morton 序重排（`--query-sort` / Python 的 `order="morton"`），二叉节点可以折叠成
-4 宽节点（`--wide`），两者默认关闭、可叠加。
+4 宽节点（`--wide`），建树也可以从并行的 Karras LBVH 换成自顶向下的分箱 SAH
+（`--sah` / Python 的 `builder="sah"`）——三者默认关闭，可以互相叠加。
 没有 CUDA 工具链时自动降级为纯 CPU 构建，CI 与本文档的 CPU 数字不受影响。
 
 ## 现在能跑什么
@@ -30,6 +31,7 @@ build\gpu_query_bench.exe --grid 256 --points 20000 --refit --refit-dirty 0.01  
 build\gpu_query_bench.exe --grid 1024 --points 100000 --query-sort           :: 查询点按 Morton 序重排后再遍历
 build\gpu_bench.exe --grid 1024 --rays 1000000 --runs 5 --wide              :: 4 宽节点折叠后再遍历（--ray-sort 叠加）
 build\gpu_query_bench.exe --grid 1024 --points 100000 --wide --query-sort   :: 宽节点 + 查询重排（可叠加）
+build\gpu_query_bench.exe --grid 1024 --points 20000 --runs 5 --sah --stats :: 自顶向下分箱 SAH 建树（默认 LBVH），查询逐点对拍 CPU
 
 build\gpu_cloud_bench.exe --points 131072 --queries 20000                   :: 点云 closest，GPU 对 kd-tree
 build\gpu_cloud_bench.exe --points 1048576 --queries 20000 --query knn --k 8
@@ -126,11 +128,12 @@ Embree `rtcPointQuery`、Warp 1.6.2（`wp.mesh_query_point_no_sign`）对照；k
   当前最优时仍入栈、并列取场景索引小者），所以 20,000 个点的结果与 CPU 参考逐位相同。
 - closest 的 GPU DFS 反而比 CPU 最优优先遍历多测节点（2M 477 vs 135），但几千个查询
   并发把单次 70–100 ns 的冷缓存延迟藏掉了，这正是点查询最该由 GPU 改写的地方。
-- **Warp 1.6.2 是更强的外部基线**：地形场景 131k 快 1.4×、2M 快 1.2×，8k 持平；随机
-  三角形汤上我们快 1.15×。Warp 是 SAH 建树 + 每叶 4 个图元，我们是 Karras LBVH +
-  每叶 1 个（2M → 419 万节点、深度 31）。把 Morton 相邻的 4 个三角形并成叶子实测
-  **更慢**（射线 2.2×、kNN 1.8×，构建反而快 1.5×），所以差距在树质量；追它需要
-  GPU 自顶向下 SAH 或宽节点。构建则是小场景 Warp 快 1.4–4×、2M 我们快 1.8×。
+- **Warp 1.6.2 是更强的外部基线**：默认 LBVH 下地形 131k 慢 1.4×、2M 慢 1.2×，8k
+  持平；随机三角形汤我们快 1.15×。Warp 是 SAH 建树 + 每叶 4 个图元，我们是 Karras
+  LBVH + 每叶 1 个（2M → 419 万节点、深度 31）。把 Morton 相邻的 4 个三角形并成
+  叶子实测**更慢**（射线 2.2×、kNN 1.8×，构建反而快 1.5×），所以差距在树质量。
+  开 `--sah` 后查询侧就追平了：8k **1.30×**、131k **0.97×**、2M **1.02×**（构建
+  仍比 Warp 慢 2.9–7.6×，见下面「SAH 建树」一节）。
 - kNN 每线程维护按 `(dist2, 索引)` 升序的定长表（k ≤ 32），满 k 后按第 k 近剪枝；
   radius 走 CSR 两遍遍历 + 前缀和，段内排序用每 warp 一个双调网络（长段退回 CUB）。
 - radius 的计时含一次流水线中间的同步（CSR 总长度要先算完前缀和才知道）。
@@ -282,8 +285,9 @@ hit, t = scene.closest(points, order="morton")   # 默认 order="input"
 
 **基线口径**：纵向对照，同一实现、同一会话、同一批输入，关/开 `--wide` 成对跑，
 5 轮中位数，3 s 预热。宽 BVH 本身是 Embree / tinybvh 的标准结构（Aila & Laine 2009
-一脉），这里是**结构对齐**，单射线/单查询、Morton 划分，未配 SIMD packet / SAH，
-绝对吞吐仍按 `docs/baseline.md` 的口径。
+一脉），这里是**结构对齐**，单射线/单查询、Morton 划分，未配 SIMD packet，
+绝对吞吐仍按 `docs/baseline.md` 的口径。宽节点与 `--sah` 可叠加（2M closest
+二叉 SAH 6.09 → 宽 4.71 ms）。
 
 | 场景 | 工作负载 | 二叉 | 4 宽 | 倍数 |
 |---|---|---|---|---|
@@ -313,6 +317,41 @@ hit, t = scene.closest(points, order="morton")   # 默认 order="input"
 - 库默认 `wide=false`：收益依赖树规模与访问模式，代码不替用户猜。教程见
   `Quarry-学习路径/11-宽节点.md`。
 
+## SAH 建树（M3，2026-10-30）
+
+`--sah` 把并行的 Karras LBVH 换成**自顶向下分箱 SAH**（Wald 2007，16 箱 × 3 轴）。
+节点编号规则、叶子顺序、查询/refit/宽节点全部不动，所以两棵树对同一条查询的结果
+**逐位相同**——换的只是树的形状。地形上的收益来自树深和节点测试次数：
+
+| 场景 | 查询 | LBVH | SAH | 倍数 | 节点测试/查询 | 树深 |
+|---|---|---|---|---|---|---|
+| 地形 8k | closest | 0.557 ms | **0.397 ms** | **1.40×** | 74.9 → 48.8 | 19 → 14 |
+| 地形 131k | closest | 1.428 | **1.121** | **1.27×** | 167.4 → 117.6 | 25 → 19 |
+| 地形 2M | closest | 7.752 | **5.757** | **1.35×** | 477.3 → 362.6 | 31 → 23 |
+| 地形 2M | kNN k=8 | 9.799 | **6.779** | **1.45×** | 580.1 → 396.9 | 31 → 23 |
+| 随机 1M 三角形 | closest | **3.777** | 4.158 | 0.91× | 358.8 → 410.0 | 25 → 23 |
+| 点云 1M | closest / kNN8 | 4.26 / 8.85 | 4.50 / **7.45** | 0.95× / **1.19×** | — | 32 → 22 |
+| 高斯 1M | closest | 18.06 | **12.88** | **1.40×** | 356.4 → 279.1 | 33 → 22 |
+
+20k 查询点，成对测量、5 轮中位数、3 s 预热（`--no-cpu`）。
+
+- **查询侧追平 Warp**：8k **1.30×**、131k 0.97×、2M **1.02×**（同一次会话里先跑
+  quarry SAH 再跑 Warp 1.6.2）。默认 LBVH 时这三格是 0.95× / 0.72× / 0.83×。
+- **构建是短板**：地形 131k 2.65 → 10.18 ms（3.8× 慢）、2M 20.3 → 74.5 ms
+  （3.7× 慢）；随机 1M 7.2 → 50.5 ms（7.1× 慢）。比 Warp 的建树仍慢
+  2.9–7.6×——它的叶子装 4 个图元、节点数少一半，我们每层还要扫全数组做分箱，
+  2M 上分箱就占 43%（31.8 / 16.8 / 10.0 / 8.8 ms 对应分箱 / 选切分 / 分区 / 树）。
+- **随机三角形汤是负收益（0.91×）**：均匀随机数据上 Morton 序已近似中位切分，
+  16 箱量化 + 1/8 平衡守卫反而抬高节点测试。32 箱实验无收益且构建更慢，已回退。
+- **可以叠加**：2M closest 二叉 SAH 6.09 → `--wide` 4.71 ms（1.29×）；
+  `--sah --refit` 局部 1.03 ms、全量 17.1–19.2 ms，结果与 CPU 参考零失配。
+- 库默认仍是 LBVH：SAH 对小场景/均匀数据的收益不足以抵消构建成本，代码不替
+  用户猜。教程见 `Quarry-学习路径/12-SAH建树.md`。
+
+```python
+scene = quarry.Scene(v, f, builder="sah")   # 默认 builder="lbvh"
+```
+
 ## Python 绑定
 
 有 Python 3.8+ 和 `pip install pybind11 numpy` 时，`build.bat` 会顺带把扩展模块建到
@@ -329,7 +368,7 @@ d2, tri = scene.closest(points)             # (N,) float32, (N,) int32
 
 ```bat
 py -3.13 python/demo.py          :: 建场景 + 四种查询 + 开销拆分
-py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（72 项检查）
+py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（84 项检查）
 ```
 
 | 入口 | 返回 |
@@ -337,9 +376,9 @@ py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（72 项检查）
 | `quarry.describe()` | 显卡字符串；无 CUDA 时为空串 |
 | `quarry.demo_mesh(kind, grid, random_tris, seed)` | `(vertices (N,3) f32, indices (M,3) i32)` |
 | `quarry.demo_gaussians(kind, count, seed)` | `(means (N,3) f32, rot (N,4) f32 xyzw, scale (N,3) f32 半轴)` |
-| `Scene(vertices, indices)` / `Scene(triangles)` | 构建 GPU BVH；`triangle_count` / `node_count` / `depth` / `bounds` / `build_stats` |
-| `PointCloud(points)` | 构建点云 LBVH；`point_count` / `node_count` / `depth` / `bounds` / `build_stats` |
-| `GaussianCloud(means, rot, scale)` | 构建高斯 LBVH；`gaussian_count` / `node_count` / `depth` / `bounds` / `build_stats` |
+| `Scene(vertices, indices, builder="lbvh")` / `Scene(triangles, builder)` | 构建 GPU BVH；`builder` 可为 `"lbvh"`（默认）或 `"sah"`；`triangle_count` / `node_count` / `depth` / `bounds` / `build_stats` |
+| `PointCloud(points, builder="lbvh")` | 构建点云 BVH；`point_count` / `node_count` / `depth` / `bounds` / `build_stats` |
+| `GaussianCloud(means, rot, scale, builder="lbvh")` | 构建高斯 BVH；`gaussian_count` / `node_count` / `depth` / `bounds` / `build_stats` |
 | `scene.validate()` / `cloud.validate()` / `gcloud.validate()` | 树结构自检，空串表示通过 |
 | `scene.raycast(origins, dirs, tmax=inf)` | `(hit bool[N], t f32[N])`，未命中 `t=inf` |
 | `scene.closest(points)` / `cloud.closest(points)` / `gcloud.closest(points)` | `(dist2 f32[N], triangle/point/gaussian i32[N])` |
@@ -464,8 +503,9 @@ learn/        教程配套的单文件练习
 - refit 拓扑冻结：不增删、不重排三角形；局部路径只合并脏叶子的祖先，但逐层 launch
   的数量不变，小场景里启动开销开始主导
 - BVH 每叶 1 个三角形，2M 场景 419 万节点；Morton 叶子批量（4–8 个/叶）实测
-  遍历更慢（射线 2.2×、kNN 1.8×），已回退。BVH4 宽节点已落地（`--wide`），
-  要追 Warp 的树质量还需 GPU 自顶向下 SAH
+  遍历更慢（射线 2.2×、kNN 1.8×），已回退。BVH4 宽节点（`--wide`）与自顶向下
+  分箱 SAH（`--sah`）都已落地，查询侧已追平 Warp，剩余差距在构建速度；
+  每叶 4 个图元（Warp 的形态）未做
 - 宽节点 + refit 已接：局部路径重发脏祖先所在的宽节点，小树/大改动走整层重发；
   代价是每次 refit 多 0.13–2.0 ms（2M 全量约 1.4 ms）。射线已 Morton 排序时
   宽节点无收益（≈1.0×），非相干次生射线遍历太浅，同样无收益

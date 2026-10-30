@@ -293,6 +293,7 @@ radius（CSR 两遍遍历：计数 → 前缀和 → 填充 → 段内排序；�
    自顶向下 SAH 建树、每叶 4 个图元（`native/bvh.cpp`，`BVH_LEAF_SIZE 4`），
    我们用 Karras LBVH + 每叶 1 个三角形（2M → 419 万节点、深度 31）。
    把 Morton 序相邻的 4 个三角形硬塞进一片叶子实测是**负优化**，见下一小节。
+   （10-30 的分箱 SAH 把这一条差距补上了：查询侧 8k 反超、2M 略胜，见「SAH 建树」。）
 3. **构建的胜负和场景大小反过来**：8k / 131k 我们慢 1.4–4×，2M 和随机 1M 反而
    快 1.6–1.8×。LBVH 的基数排序常数小、完全并行；Warp 的构建在小场景上赢在启动
    路径短，大场景上被它的构建策略拖住。
@@ -806,6 +807,63 @@ Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
    两条路径与 CPU 参考仍逐位一致（三角形、点云、高斯各两种 refit，全部零失配）。
 6. 默认 `wide=false`；原始日志 `out/wide_*.txt`（gitignore）。
 
+## SAH 建树（M3，2026-10-30）
+
+`--sah` 把 LBVH 换成自顶向下分箱 SAH（Wald 2007，16 箱 × 3 轴，`buildSAH`）。
+节点编号、叶子顺序、查询/refit/宽节点全部不变，所以两棵树的结果逐位相同。
+
+**口径**：成对测量，同一次会话、同一 exe、同一批输入，各 5 轮中位数，3 s DVFS
+预热，20k 查询点（`--no-cpu`）。倍数是结论，绝对值跨会话会漂。
+
+| 场景 | 查询 | LBVH | SAH | 倍数 | 节点测试/查询 | 树深 |
+|---|---|---|---|---|---|---|
+| 地形 8k | closest | 0.557 | **0.397** | **1.40×** | 74.9 → 48.8 | 19 → 14 |
+| 地形 131k | closest | 1.428 | **1.121** | **1.27×** | 167.4 → 117.6 | 25 → 19 |
+| 地形 2M | closest | 7.752 | **5.757** | **1.35×** | 477.3 → 362.6 | 31 → 23 |
+| 地形 2M | kNN k=8 | 9.799 | **6.779** | **1.45×** | 580.1 → 396.9 | 31 → 23 |
+| 地形 2M | radius 0.5 | 3.516 | **3.066** | 1.15× | 35.6 → 31.5 | 31 → 23 |
+| 随机 1M 三角形 | closest | **3.777** | 4.158 | 0.91× | 358.8 → 410.0 | 25 → 23 |
+| 点云 1M | closest | **4.26** | 4.50 | 0.95× | 198.4 → 213.3 | 32 → 22 |
+| 点云 1M | kNN k=8 | 8.85 | **7.45** | **1.19×** | — | 32 → 22 |
+| 高斯 1M | closest | 18.06 | **12.88** | **1.40×** | 356.4 → 279.1 | 33 → 22 |
+
+构建（同一批输入，成对）：
+
+| 场景 | LBVH | SAH | 倍数 | SAH 分解（分箱/选切分/分区/树） |
+|---|---|---|---|---|
+| 地形 8k | 1.10 | 4.51 | 4.1× 慢 | — |
+| 地形 131k | 2.65 | 10.18 | 3.8× 慢 | 2.1 / 3.7 / 0.4 / 3.2 |
+| 地形 2M | 20.28 | 74.47 | 3.7× 慢 | 31.8 / 16.8 / 10.0 / 8.8 |
+| 随机 1M | 7.15 | 50.50 | 7.1× 慢 | — |
+| 点云 1M | 10.44 | 27.97 | 2.7× 慢 | — |
+| 高斯 1M | 11.26 | 45.67 | 4.1× 慢 | — |
+
+同场横向（先跑 quarry SAH 再跑 Warp，同一份 `--dump` 场景）：
+
+| 地形 closest | quarry SAH | Warp 1.6.2 | 倍数 | Embree 32T | / Embree 32T | 构建（quarry / Warp / Embree） |
+|---|---|---|---|---|---|---|
+| 8k | **0.386 ms** (51.8 Mq/s) | 0.502 (39.8) | **1.30×** | 3.20 | 8.3× | 4.71 / 0.70 / 1.50 ms |
+| 131k | 1.126 (17.8) | 1.094 (18.3) | 0.97× | 5.91 | 5.3× | 9.09 / 1.19 / 8.86 ms |
+| 2M | 6.093 (3.28) | 6.231 (3.21) | 1.02× | 20.34 | 3.3× | 74.58 / 25.69 / 46.56 ms |
+
+读法：
+
+1. **查询侧追平 Warp**：08 章时是 Warp 的 0.72–1.15 倍，现在是 0.97–1.30 倍，
+   8k 反超 1.30×、2M 略胜。差距确实在树形，不在遍历骨架。
+2. **构建是短板**：Warp 建树快 3–8 倍。它的树是每叶 4 图元（节点数一半），
+   我们的分箱每层要扫全数组、还要一次 CUB 扫描做稳定分区。分箱占 2M 的 43%。
+3. **随机三角形汤是负收益（0.91×）**：Morton 序在均匀随机数据上已经近似 kd 的
+   中位切分，SAH 的 16 箱量化 + 1/8 平衡守卫反而抬高节点测试。试过 32 箱 +
+   1/16 守卫：2M 节点测试持平（360.7 vs 362.6），随机 1M 仍慢（3.925 vs 3.777），
+   构建涨到 107.9 ms，已回退到 16 箱。
+4. **均匀体点云的 closest 也是 0.95×**，kNN 才有 1.19×；高斯（椭球 AABB 重叠多）
+   收益最大，1.40×。
+5. **可与宽节点叠加**：2M closest 二叉 SAH 6.093 → 4 宽 4.708 ms（1.29×）。
+   **可与 refit 叠加**：2M 局部 refit 1.03 ms、全量 17.1–19.2 ms，查询与 CPU
+   参考零失配（宽节点同样）。
+6. 默认 `buildLBVH`；`--sah` 显式开启，Python 是 `builder="sah"`。原始日志
+   `out/sah_*.txt`（gitignore）。
+
 ## 结论
 
 1. **CPU 吞吐随场景大小塌陷一个数量级。** 13 万三角形受缓存保护，32 线程能到 96 Mrays/s；200 万三角形掉到 19.7，属于结构性访存受限，增加线程无用。
@@ -838,7 +896,8 @@ Warp 1.6.2 / Embree 32T 的口径，本节未改内核，横向关系不变。
     Warp 是 SAH + 每叶 4 个图元。把 Morton 相邻三角形批量成叶子已实测是负优化
     （射线 2.2× 慢、kNN 1.8× 慢），差距来自构建器的树质量，不是叶子粒度本身；
     要继续追，应该上 GPU 自顶向下 SAH（或 BVH4 宽节点），而不是改叶子大小。
-    宽节点已于 10-29 落地（见「宽节点」一节），SAH 仍未做。
+    宽节点已于 10-29 落地（见「宽节点」一节）；10-30 的 SAH 落地后查询侧已追平
+    Warp（8k 1.30×、131k 0.97×、2M 1.02×，见「SAH 建树」一节）。
     Warp 的结果是 float32 精度（同位但末位不同），我们是与 CPU 参考逐位相同。
 12. **点云把"延迟受限"推到极端。** closest 每查询只做 110–393 次节点测试，GPU 对
     同进程单线程 kd 是 32× / 27× / 55×——倍数随规模**上升**，因为 kd 每次下潜更贵
@@ -980,6 +1039,21 @@ build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --query knn --k 8 
 build\gpu_query_bench.exe --grid 1024 --points 20000 --runs 3 --no-cpu --wide --refit --refit-dirty 0.01
 build\gpu_cloud_bench.exe --points 1048576 --queries 20000 --wide --refit --refit-dirty 0.01
 build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --wide --refit --refit-dirty 0.01
+
+:: SAH 建树（成对跑：同一条命令去掉 --sah 即 LBVH 基线）
+build\gpu_query_bench.exe --grid 64   --points 20000 --runs 5 --no-cpu --stats --sah
+build\gpu_query_bench.exe --grid 256  --points 20000 --runs 5 --no-cpu --stats --sah
+build\gpu_query_bench.exe --grid 1024 --points 20000 --runs 5 --no-cpu --stats --sah
+build\gpu_query_bench.exe --grid 1024 --points 20000 --runs 5 --no-cpu --sah --query knn --k 8
+build\gpu_query_bench.exe --grid 1024 --points 20000 --runs 5 --no-cpu --sah --query radius --radius 0.5
+build\gpu_query_bench.exe --grid 1024 --points 20000 --runs 5 --no-cpu --sah --wide
+build\gpu_query_bench.exe --grid 1024 --points 20000 --runs 3 --no-cpu --sah --refit --refit-dirty 0.01
+build\gpu_query_bench.exe --scene random --random-tris 1048576 --points 20000 --runs 5 --no-cpu --sah
+build\gpu_cloud_bench.exe --points 1048576 --queries 20000 --runs 5 --no-cpu --sah
+build\gpu_cloud_bench.exe --points 1048576 --queries 20000 --runs 5 --no-cpu --query knn --sah
+build\gpu_gauss_bench.exe --gaussians 1000000 --queries 20000 --runs 5 --no-cpu --sah
+build\gpu_query_bench.exe --grid 1024 --points 20000 --dump out\qry_2m.bin
+py -3.13 bench\warp_query_bench.py --dump out\qry_2m.bin --runs 5
 ```
 
 ## 已知缺口
@@ -1003,13 +1077,16 @@ build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --wide --refit --r
   分母是自写单线程椭球 BVH；语义仅"椭球实体"，Mahalanobis 密度与屏幕空间投影未做
 - 高斯每个 40 字节，10M 是 400 MB 载荷 + 640 MB 节点内存；无叶子批量
 - 椭球距离固定 14 轮、无提前退出（CPU/GPU 逐位一致的代价），最差距离误差 1.7e-7
-- Morton 叶子批量（4–8 图元/叶）实测负结果，已回退到每叶 1 个；BVH4 宽节点已
-  落地，追 Warp 的树质量仍需 GPU 自顶向下 SAH
+- Morton 叶子批量（4–8 图元/叶）实测负结果，已回退到每叶 1 个；BVH4 宽节点与
+  自顶向下分箱 SAH 都已落地，查询侧追平 Warp；差距剩在构建（Warp 每叶 4 图元、
+  构建快 3–8 倍）
+- SAH 只在 1 叶 1 图元下验证；每叶 4 图元要改叶子盒、四条查询内核的叶子分支与
+  校验器，未做。分箱在 2M 占构建的 43%，仍是每层全数组扫描
 - 查询排序只在 ≥10 万查询的三角形场景证明有效；20k 低占用下的延迟假说未做单独
   实验，radius 没有收益，高斯小批次倒退。分块排序与按深度分桶未做
 - 宽节点 + refit 靠"重发"保持正确，不是直接维护宽盒子；局部路径按脏祖先重发，
   但重发 kernel 仍按层 launch（小树改走整层重发来摊掉启动开销），没有做"只重发
   盒子真变了的节点"。射线已排序时宽节点无收益，次生射线遍历太浅，同样无收益
-- 宽节点未配 SIMD packet（单射线/单查询）、未接 SAH；BVH8 未试。每宽节点读 128 B
+- 宽节点未配 SIMD packet（单射线/单查询）；宽节点已可配 SAH，BVH8 未试。每宽节点读 128 B
   在本机 L2（24 MB）上的收益随树规模变化，更小场景只有 1.06–1.29×
 - 第一轮结果（不同场景、20 万条射线）已作废，勿引用
