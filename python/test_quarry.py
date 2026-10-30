@@ -342,6 +342,44 @@ def main():
     check("topo move closest bitwise", np.array_equal(mid, rid)
           and np.array_equal(md2.view(np.uint32), rd2.view(np.uint32)))
 
+    # ---- 中途插入：新三角形夹在幸存者之间，幸存者的场景下标要整体后移 ----
+    n_mid = 60
+    base_n = len(shifted)
+    mid_pos = np.sort(rng.choice(base_n + n_mid, size=n_mid, replace=False)).astype(np.int32)
+    mid_extra = (lo + 0.2 * (hi - lo) * rng.random((n_mid, 3, 3))).astype(np.float32)
+    mid_mask = np.zeros(base_n + n_mid, dtype=bool)
+    mid_mask[mid_pos] = True
+    mid_tris = np.empty((base_n + n_mid, 3, 3), dtype=np.float32)
+    mid_tris[mid_mask] = mid_extra
+    mid_tris[~mid_mask] = shifted
+    itopo = scene.update_topology(mid_tris, inserted=mid_pos)
+    check("mid-insert validate", scene.validate() == "", scene.validate())
+    check("mid-insert counts", itopo["inserted"] == n_mid and itopo["appended"] == 0, itopo)
+    ifresh = quarry.Scene(mid_tris)
+    i_d2, i_id = scene.closest(points)
+    j_d2, j_id = ifresh.closest(points)
+    check("mid-insert closest bitwise", np.array_equal(i_id, j_id)
+          and np.array_equal(i_d2.view(np.uint32), j_d2.view(np.uint32)))
+    i_kd, i_kid = scene.knn(points, 8)
+    j_kd, j_kid = ifresh.knn(points, 8)
+    check("mid-insert knn bitwise", np.array_equal(i_kid, j_kid)
+          and np.array_equal(i_kd.view(np.uint32), j_kd.view(np.uint32)))
+    i_hit, i_t = scene.raycast(origins, dirs)
+    j_hit, j_t = ifresh.raycast(origins, dirs)
+    check("mid-insert raycast bitwise", np.array_equal(i_hit, j_hit)
+          and np.array_equal(i_t.view(np.uint32), j_t.view(np.uint32)))
+    # 边界位置：插在场景最前面和最后面各一个（一个推全体、一个只接在尾部）
+    edge_pos = np.array([0, len(mid_tris)], dtype=np.int32)
+    edge_extra = (lo + 0.2 * (hi - lo) * rng.random((2, 3, 3))).astype(np.float32)
+    edge_tris = np.insert(mid_tris, edge_pos, edge_extra, axis=0)
+    scene.update_topology(edge_tris, inserted=edge_pos)
+    check("edge-insert validate", scene.validate() == "", scene.validate())
+    efresh = quarry.Scene(np.ascontiguousarray(edge_tris, dtype=np.float32))
+    e_d2, e_id = scene.closest(points)
+    f_d2, f_id = efresh.closest(points)
+    check("edge-insert closest bitwise", np.array_equal(e_id, f_id)
+          and np.array_equal(e_d2.view(np.uint32), f_d2.view(np.uint32)))
+
     # 网格绑定在拓扑变化后失效：update_vertices 必须拒绝
     try:
         scene.update_vertices(lifted)
@@ -457,6 +495,25 @@ def main():
     check("point topo closest bitwise", np.array_equal(t_id, f_id)
           and np.array_equal(t_d2.view(np.uint32), f_d2.view(np.uint32)))
 
+    # 中途插入：夹在幸存者之间的新点，幸存者场景下标整体后移
+    p_ins = 200
+    p_base = len(new_pts)
+    p_pos = np.sort(rng.choice(p_base + p_ins, size=p_ins, replace=False)).astype(np.int32)
+    p_mask = np.zeros(p_base + p_ins, dtype=bool)
+    p_mask[p_pos] = True
+    p_mid = np.empty((p_base + p_ins, 3), dtype=np.float32)
+    p_mid[p_mask] = (lo + (hi - lo) * rng.random((p_ins, 3))).astype(np.float32)
+    p_mid[~p_mask] = new_pts
+    pcloud_topo = cloud.update_topology(p_mid, inserted=p_pos)
+    check("point mid-insert validate", cloud.validate() == "", cloud.validate())
+    check("point mid-insert counts",
+          pcloud_topo["inserted"] == p_ins and pcloud_topo["appended"] == 0, pcloud_topo)
+    pm_fresh = quarry.PointCloud(p_mid)
+    m_d2, m_id = cloud.closest(q)
+    n_d2, n_id = pm_fresh.closest(q)
+    check("point mid-insert closest bitwise", np.array_equal(m_id, n_id)
+          and np.array_equal(m_d2.view(np.uint32), n_d2.view(np.uint32)))
+
     # ---- 高斯：椭球实体距离，与 numpy 暴力法对拍 ----
     ngs, ngq = 2000, 200
     gmeans, grot, gscale = quarry.demo_gaussians("sheet", ngs, seed=3)
@@ -565,6 +622,39 @@ def main():
           np.all(gnew_d2[grows, t_id] <= t_d2 * (1 + 1e-4) + 1e-6),
           f"{(gnew_d2[grows, t_id] > t_d2 * (1 + 1e-4) + 1e-6).sum()} strays")
 
+    # 中途插入：三个数组同步插入，距离与全新构建逐位相同
+    g_ins = 40
+    g_base = len(new_m)
+    g_pos = np.sort(rng.choice(g_base + g_ins, size=g_ins, replace=False)).astype(np.int32)
+    g_mask = np.zeros(g_base + g_ins, dtype=bool)
+    g_mask[g_pos] = True
+    ins_m = (gmeans.min(axis=0)
+             + (gmeans.max(axis=0) - gmeans.min(axis=0)) * rng.random((g_ins, 3))).astype(np.float32)
+    ins_r = grot[rng.integers(0, 10, g_ins)]
+    ins_s = gscale[rng.integers(0, 10, g_ins)] * np.float32(0.5)
+    gm_m = np.empty((g_base + g_ins, 3), dtype=np.float32)
+    gm_m[g_mask] = ins_m
+    gm_m[~g_mask] = new_m
+    gm_r = np.empty((g_base + g_ins, 4), dtype=np.float32)
+    gm_r[g_mask] = ins_r
+    gm_r[~g_mask] = new_r
+    gm_s = np.empty((g_base + g_ins, 3), dtype=np.float32)
+    gm_s[g_mask] = ins_s
+    gm_s[~g_mask] = new_s
+    gmid = gcloud.update_topology(gm_m, gm_r, gm_s, inserted=g_pos)
+    check("gaussian mid-insert validate", gcloud.validate() == "", gcloud.validate())
+    check("gaussian mid-insert counts",
+          gmid["inserted"] == g_ins and gmid["appended"] == 0, gmid)
+    gm_fresh = quarry.GaussianCloud(gm_m, gm_r, gm_s)
+    m_d2, m_id = gcloud.closest(gq)
+    n_d2, n_id = gm_fresh.closest(gq)
+    check("gaussian mid-insert dist2 bitwise",
+          np.array_equal(m_d2.view(np.uint32), n_d2.view(np.uint32)))
+
+    # 插入表的坏输入要单独一份场景，否则大小校验会先挡住
+    bad_scene = quarry.Scene(mid_tris)
+    bad_big = np.concatenate([mid_tris, mid_extra[:2]], axis=0)
+
     for bad_call in (lambda: quarry.Scene(np.zeros((5, 3), dtype=np.float32)),
                      lambda: quarry.PointCloud(np.zeros((1, 3), dtype=np.float32)),
                      lambda: scene.knn(points, 0),
@@ -575,6 +665,10 @@ def main():
                      lambda: cloud.update_points(pts[:10]),
                      lambda: gcloud.update(gmoved[:10], grot, gscale),
                      lambda: scene.update_topology(new_tris[:-1]),
+                     lambda: bad_scene.update_topology(bad_big,
+                                                       inserted=np.array([5, 3], dtype=np.int32)),
+                     lambda: bad_scene.update_topology(
+                         bad_big, inserted=np.array([0, len(bad_big)], dtype=np.int32)),
                      lambda: scene.update_topology(new_tris,
                                                    deleted=np.array([5, 3], dtype=np.int32)),
                      lambda: scene.update_topology(new_tris,

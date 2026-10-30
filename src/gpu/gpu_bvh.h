@@ -155,28 +155,34 @@ double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
                            const std::vector<int>& dirty, GpuRefitTimings* timings = nullptr);
 
 // ---- 拓扑变更（M3 收尾）----
-// 编辑脚本：newScene = 旧场景删掉 deleted 之后的幸存者（保持原有相对顺序）+ 末尾
-// 追加 appended 个图元。deleted 是旧场景下标（升序、不含重复），moved 是新场景下标
-// （几何变了、拓扑不变）。不变量：newScene.size() == bvh.primCount - deleted + appended。
+// 编辑脚本：newScene = 旧场景删掉 deleted 之后的幸存者（保持原有相对顺序），再在
+// inserted 这些新场景下标上插入新图元，末尾追加 appended 个图元。
+//   deleted  ：旧场景下标，升序、不含重复；
+//   moved    ：新场景下标，几何变了、拓扑不变；
+//   inserted ：新场景下标，升序、不含重复，每个 < newScene.size() - appended；
+//   appended ：新场景的最后 appended 个位置。
+// 不变量：newScene.size() == bvh.primCount - deleted.size() + inserted.size() + appended。
 //
-// 只有删除/追加才改变树形；改动落在少数几棵子树里时只重建那几棵，其余子树原样复用，
-// 最后整块重编号（叶子恒为 n-1+slot）。改动太散、太深或占比过大时回退成整棵重建，
-// timings->fullRebuild 会置 true。查询结果与"对 newScene 全新构建"逐位相同。
+// 只有删除/插入/追加才改变树形；改动落在少数几棵子树里时只重建那几棵，其余子树原样
+// 复用，最后整块重编号（叶子恒为 n-1+slot）。改动太散、太深或占比过大时回退成整棵
+// 重建，timings->fullRebuild 会置 true。查询结果与"对 newScene 全新构建"逐位相同。
 //
 // 当前实现：切分选择（从删除叶子上溯到 ≤T 叶的 antichain）+ 森林 SAH 只重建受影响
-// 的子树 + 全局规范重编号（内部节点按 (深度, 源序)，叶子 = n-1+slot）。新叶子槽是
-// 旧槽序的压缩下标，保证子树覆盖的槽区间仍然连续；场景下标由 d_primIds 单独记录，
-// 所以更新后 d_primIds 一般不再是 iota。
+// 的子树 + 全局规范重编号（内部节点按 (深度, 源序)，叶子 = n-1+slot）。槽序是
+// 旧槽序的压缩下标（幸存者）后面接新增图元（先 inserted 后 appended），保证子树覆盖
+// 的槽区间仍然连续；槽不跟随场景序，场景下标由 d_primIds 单独记录，所以更新后
+// d_primIds 一般不再是 iota。查询侧只认 slot = -left-1，与槽序无关。
 // 盒子只重算脏节点：重建森林的全部内部节点，加上切分根与移动叶子在新树里的祖先；
-// 没被碰过的旧内部节点直接沿用旧盒。追加区间至少吸收与追加块同样多的旧叶子，
+// 没被碰过的旧内部节点直接沿用旧盒。新增块至少吸收与自身同样多的旧叶子，
 // 且深度超过 topoBaseDepth + 6 时整树重建重新平衡（R4 质量漂移）。
-// 回退条件：删除/追加占比过大、重建叶数超预算、切分根过散、深度越界、n < 2。
+// 回退条件：删除/新增占比过大、重建叶数超预算、切分根过散、深度越界、n < 2。
 //
-// 已知代价（v1）：规划里的前缀和、载荷重排与整块重编号都是 O(n)，2M 三角形下更新
-// 约是整棵重建的 1.6×；稳定槽位 / 节点池 / 缓冲复用留给 v1.1。
+// 已知代价：规划里的前缀和、载荷重排与整块重编号都是 O(n)（2M 三角形 relayout
+// 仍占更新总时间的一半）；设备内存池已让稳态更新降到整棵重建的 0.12–0.27×。
 struct GpuTopoEdit {
     std::vector<int> deleted;
     std::vector<int> moved;
+    std::vector<int> inserted;
     int appended = 0;
 };
 
@@ -190,6 +196,7 @@ struct GpuTopoUpdateTimings {
     double totalMs = 0.0;
     int deleted = 0;
     int moved = 0;            // 实际参与合并的移动图元数
+    int inserted = 0;         // 非尾部位置插入的图元数
     int appended = 0;
     int surgeryRoots = 0;     // 被重建的子树数
     int rebuiltLeaves = 0;    // 这些子树覆盖的叶子总数

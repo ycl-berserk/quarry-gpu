@@ -169,10 +169,11 @@ py::dict boundsDict(const AABB& box) {
     return out;
 }
 
-// 三条拓扑更新共用一份编辑脚本：deleted 是旧下标（升序），moved 是新下标，
-// 追加个数由"新数量 - 旧数量 + 删除数"倒推，调用方不用自己数。
+// 三条拓扑更新共用一份编辑脚本：deleted 是旧下标（升序），inserted / moved 是新下标，
+// 末尾追加的个数由"新数量 - 旧数量 + 删除数 - 插入数"倒推，调用方不用自己数。
 GpuTopoEdit topoEditFromArrays(const py::object& deleted, const py::object& moved,
-                               long long oldCount, long long newCount) {
+                               const py::object& inserted, long long oldCount,
+                               long long newCount) {
     GpuTopoEdit edit;
     if (!deleted.is_none()) {
         const I32Array arr = deleted.cast<I32Array>();
@@ -182,10 +183,15 @@ GpuTopoEdit topoEditFromArrays(const py::object& deleted, const py::object& move
         const I32Array arr = moved.cast<I32Array>();
         edit.moved.assign(arr.data(), arr.data() + arr.size());
     }
-    const long long appended = newCount - oldCount + static_cast<long long>(edit.deleted.size());
+    if (!inserted.is_none()) {
+        const I32Array arr = inserted.cast<I32Array>();
+        edit.inserted.assign(arr.data(), arr.data() + arr.size());
+    }
+    const long long appended = newCount - oldCount + static_cast<long long>(edit.deleted.size()) -
+                               static_cast<long long>(edit.inserted.size());
     if (appended < 0 || appended > std::numeric_limits<int>::max()) {
         throw std::invalid_argument(
-            "new primitive count must be old count - deleted + appended");
+            "new primitive count must be old count - deleted + inserted + appended");
     }
     edit.appended = static_cast<int>(appended);
     return edit;
@@ -203,6 +209,7 @@ py::dict topoTimingsDict(const GpuTopoUpdateTimings& t) {
     out["refit_ms"] = t.refitMs;
     out["deleted"] = t.deleted;
     out["moved"] = t.moved;
+    out["inserted"] = t.inserted;
     out["appended"] = t.appended;
     out["surgery_roots"] = t.surgeryRoots;
     out["rebuilt_leaves"] = t.rebuiltLeaves;
@@ -507,14 +514,14 @@ public:
         update(trianglesFromIndices(verts, indices_), dirty);
     }
 
-    // 拓扑可变的更新：triangles 是"删掉 deleted 后的幸存者（保持原顺序）+ 末尾追加"。
-    // deleted 用旧下标、升序；moved 用新下标，标记几何变了但拓扑不变的三角形。
-    // 网格绑定（构造时的 indices）只对旧拓扑成立，成功之后自动失效。
+    // 拓扑可变的更新：triangles 是新场景 = 幸存者（原顺序）+ 中途插入 + 末尾追加。
+    // deleted 用旧下标、升序；inserted / moved 用新下标（inserted 升序），moved 标记
+    // 几何变了但拓扑不变的三角形。网格绑定（构造时的 indices）成功之后自动失效。
     py::dict updateTopology(const F32Array& triangles, const py::object& deleted,
-                            const py::object& moved) {
+                            const py::object& moved, const py::object& inserted) {
         std::vector<Tri> tris = trianglesFromArray(triangles);
-        const GpuTopoEdit edit =
-            topoEditFromArrays(deleted, moved, bvh_.primCount, static_cast<long long>(tris.size()));
+        const GpuTopoEdit edit = topoEditFromArrays(deleted, moved, inserted, bvh_.primCount,
+                                                    static_cast<long long>(tris.size()));
         ::Scene view;
         view.tris = tris;
         view.updateBounds();
@@ -642,13 +649,13 @@ public:
         }
     }
 
-    // 拓扑可变：points = 删除后的幸存者（保持原顺序）+ 末尾追加，deleted 用旧下标，
-    // moved 用新下标（点是零体积图元，通常不需要 moved）。
+    // 拓扑可变：points = 幸存者（原顺序）+ 中途插入 + 末尾追加，deleted 用旧下标，
+    // inserted / moved 用新下标（点是零体积图元，通常不需要 moved）。
     py::dict updateTopology(const F32Array& points, const py::object& deleted,
-                            const py::object& moved) {
+                            const py::object& moved, const py::object& inserted) {
         std::vector<Vec3> pts = pointsFromArray(points, "points");
-        const GpuTopoEdit edit =
-            topoEditFromArrays(deleted, moved, bvh_.primCount, static_cast<long long>(pts.size()));
+        const GpuTopoEdit edit = topoEditFromArrays(deleted, moved, inserted, bvh_.primCount,
+                                                    static_cast<long long>(pts.size()));
         PointCloud view = cloud_;
         view.pts = pts;
         view.updateBounds();
@@ -777,13 +784,14 @@ public:
         }
     }
 
-    // 拓扑可变：三个数组是删除后的幸存者（保持原顺序）+ 末尾追加，
-    // deleted 用旧下标，moved 用新下标。
+    // 拓扑可变：三个数组是幸存者（原顺序）+ 中途插入 + 末尾追加，
+    // deleted 用旧下标，inserted / moved 用新下标。
     py::dict updateTopology(const F32Array& means, const F32Array& rot, const F32Array& scale,
-                            const py::object& deleted, const py::object& moved) {
+                            const py::object& deleted, const py::object& moved,
+                            const py::object& inserted) {
         std::vector<Gaussian> gs = gaussiansFromArrays(means, rot, scale);
-        const GpuTopoEdit edit =
-            topoEditFromArrays(deleted, moved, bvh_.primCount, static_cast<long long>(gs.size()));
+        const GpuTopoEdit edit = topoEditFromArrays(deleted, moved, inserted, bvh_.primCount,
+                                                    static_cast<long long>(gs.size()));
         GaussianCloud view = cloud_;
         view.gaussians = gs;
         view.updateBounds();
@@ -928,10 +936,12 @@ PYBIND11_MODULE(quarry, m) {
              "used to construct this Scene")
         .def("update_topology", &PyScene::updateTopology, py::arg("triangles"),
              py::arg("deleted") = py::none(), py::arg("moved") = py::none(),
-             "Change the primitive count: triangles must hold the survivors (original order "
-             "minus deleted, old indices ascending) followed by the appended ones. moved lists "
-             "new-scene indices whose geometry changed but whose topology did not. Returns a "
-             "timings dict; query results match a fresh build of the new scene bit for bit")
+             py::arg("inserted") = py::none(),
+             "Change the primitive count: triangles is the new scene = survivors (original "
+             "order minus deleted, old indices ascending) with new triangles inserted at the "
+             "new-scene indices listed in inserted, then extra ones appended at the end. moved "
+             "lists new-scene indices whose geometry changed but whose topology did not. "
+             "Returns a timings dict; query results match a fresh build bit for bit")
         .def("raycast", &PyScene::raycast, py::arg("origins"), py::arg("dirs"),
              py::arg("tmax") = std::numeric_limits<float>::infinity(),
              "Return (hit bool[N], t float32[N]); t is inf on a miss. dirs need not be normalized")
@@ -970,8 +980,10 @@ PYBIND11_MODULE(quarry, m) {
              "of point indices to upload; omit it to upload everything")
         .def("update_topology", &PyPointCloud::updateTopology, py::arg("points"),
              py::arg("deleted") = py::none(), py::arg("moved") = py::none(),
-             "Change the point count: points must hold the survivors (original order minus "
-             "deleted, old indices ascending) followed by the appended ones")
+             py::arg("inserted") = py::none(),
+             "Change the point count: points is the new scene = survivors (original order minus "
+             "deleted, old indices ascending), with new points inserted at the new-scene "
+             "indices listed in inserted, then extra ones appended at the end")
         .def("closest", &PyPointCloud::closest, py::arg("points"),
              py::arg("order") = "input",
              "Return (dist2 float32[N], index int32[N]); index is -1 on a miss")
@@ -1013,9 +1025,10 @@ PYBIND11_MODULE(quarry, m) {
              "array of indices to upload; omit it to upload everything")
         .def("update_topology", &PyGaussianCloud::updateTopology, py::arg("means"),
              py::arg("rot"), py::arg("scale"), py::arg("deleted") = py::none(),
-             py::arg("moved") = py::none(),
-             "Change the gaussian count: the arrays must hold the survivors (original order "
-             "minus deleted, old indices ascending) followed by the appended ones")
+             py::arg("moved") = py::none(), py::arg("inserted") = py::none(),
+             "Change the gaussian count: the arrays are the new scene = survivors (original "
+             "order minus deleted, old indices ascending), with new gaussians inserted at the "
+             "new-scene indices listed in inserted, then extra ones appended at the end")
         .def("closest", &PyGaussianCloud::closest, py::arg("points"),
              py::arg("order") = "input",
              "Return (dist2 float32[N], index int32[N]); index is -1 on a miss")

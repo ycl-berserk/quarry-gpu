@@ -84,7 +84,8 @@ void printUsage() {
         "  --refit-motion random|coherent 位移方式：逐三角形独立 / 平滑场，default random\n"
         "  --topo                         拓扑更新实验：每轮增/删/移动，与整棵重建对拍\n"
         "  --topo-kind cluster|scatter    编辑落在局部簇内 / 全场景均匀，default cluster\n"
-        "  --topo-mix insert|delete|move|mixed  每轮的编辑种类，default mixed\n"
+        "  --topo-mix insert|insertmid|delete|move|mixed|mixedmid  每轮的编辑种类，\n"
+        "                                 insertmid / mixedmid 含场景中间插入，default mixed\n"
         "  --topo-frac F                  每轮改动的三角形比例，default 0.01\n"
         "  --topo-rounds N                连续更新的轮数，default 5\n"
         "  --query-sort                   查询点按 Morton 序重排后再遍历（不能与 --refit 同用）\n"
@@ -188,8 +189,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             const char* v = needValue("--topo-mix");
             if (!v) return false;
             opt.topoMix = v;
-            if (opt.topoMix != "insert" && opt.topoMix != "delete" && opt.topoMix != "move" &&
-                opt.topoMix != "mixed") {
+            if (opt.topoMix != "insert" && opt.topoMix != "insertmid" && opt.topoMix != "delete" &&
+                opt.topoMix != "move" && opt.topoMix != "mixed" && opt.topoMix != "mixedmid") {
                 std::fprintf(stderr, "unknown --topo-mix: %s\n", v);
                 return false;
             }
@@ -438,13 +439,21 @@ TopoScript makeTopoScript(const Scene& s, const std::string& kind, const std::st
     int count = std::max(1, static_cast<int>(std::lround(frac * n)));
     count = std::min(count, std::max(0, n - 2));  // 至少留两个图元
 
-    int nDel = 0, nAdd = 0, nMov = 0;
+    int nDel = 0, nAdd = 0, nIns = 0, nMov = 0;
     if (mix == "insert") {
         nAdd = count;
+    } else if (mix == "insertmid") {
+        nIns = count;
     } else if (mix == "delete") {
         nDel = count;
     } else if (mix == "move") {
         nMov = count;
+    } else if (mix == "mixedmid") {
+        // 四种编辑同时出现：删、中部插、尾部追加、移动。
+        nDel = count / 4;
+        nIns = count / 4;
+        nAdd = count / 4;
+        nMov = count - nDel - nIns - nAdd;
     } else {
         nDel = count / 3;
         nAdd = count / 3;
@@ -464,12 +473,15 @@ TopoScript makeTopoScript(const Scene& s, const std::string& kind, const std::st
         sc.edit.deleted.push_back(pick.ids[static_cast<size_t>(i)]);
     }
 
-    sc.next.tris.reserve(static_cast<size_t>(n - nDel + nAdd));
+    sc.next.tris.reserve(static_cast<size_t>(n - nDel + nAdd + nIns));
     for (int i = 0; i < n; ++i) {
         if (!dead[static_cast<size_t>(i)]) sc.next.tris.push_back(s.tris[static_cast<size_t>(i)]);
     }
 
-    for (int i = 0; i < nAdd; ++i) {
+    // 新图元的几何：cluster 贴着锚点三角形抖动，scatter 撒在场景包围盒里。
+    std::vector<Tri> fresh;
+    fresh.reserve(static_cast<size_t>(nAdd + nIns));
+    for (int i = 0; i < nAdd + nIns; ++i) {
         const int tpl = kind == "cluster" ? pick.anchor : rng.below(n);
         const Tri& t = s.tris[static_cast<size_t>(tpl)];
         Vec3 d;
@@ -484,7 +496,44 @@ TopoScript makeTopoScript(const Scene& s, const std::string& kind, const std::st
                                  mid.z + (rng.unit() - 0.5f) * ext.z};
             d = target - c;
         }
-        sc.next.tris.push_back({t.a + d, t.b + d, t.c + d});
+        fresh.push_back({t.a + d, t.b + d, t.c + d});
+    }
+
+    if (nIns > 0) {
+        // 中途插入：先选 nIns 个新场景位置（cluster 取连续一段，scatter 均匀撒开），
+        // 再把新图元插进去——inserted 是升序的新场景下标。
+        const int total = static_cast<int>(sc.next.tris.size()) + nIns;
+        std::vector<int> pos(static_cast<size_t>(nIns));
+        if (kind == "cluster") {
+            const int base = rng.below(total - nIns + 1);
+            for (int i = 0; i < nIns; ++i) pos[static_cast<size_t>(i)] = base + i;
+        } else {
+            std::vector<int> all(static_cast<size_t>(total));
+            for (int i = 0; i < total; ++i) all[static_cast<size_t>(i)] = i;
+            for (int i = 0; i < nIns; ++i) {
+                const int j = i + rng.below(total - i);
+                std::swap(all[static_cast<size_t>(i)], all[static_cast<size_t>(j)]);
+            }
+            all.resize(static_cast<size_t>(nIns));
+            std::sort(all.begin(), all.end());
+            pos = std::move(all);
+        }
+        std::vector<Tri> merged;
+        merged.reserve(static_cast<size_t>(total));
+        int pi = 0, si = 0;
+        for (int j = 0; j < total; ++j) {
+            if (pi < nIns && pos[static_cast<size_t>(pi)] == j) {
+                merged.push_back(fresh[static_cast<size_t>(pi)]);
+                ++pi;
+            } else {
+                merged.push_back(sc.next.tris[static_cast<size_t>(si++)]);
+            }
+        }
+        sc.next.tris = std::move(merged);
+        sc.edit.inserted = std::move(pos);
+    }
+    for (int k = 0; k < nAdd; ++k) {
+        sc.next.tris.push_back(fresh[static_cast<size_t>(nIns + k)]);
     }
 
     // moved 用新场景下标：挑一部分幸存者小幅位移（拓扑不变）。
@@ -1011,20 +1060,23 @@ int main(int argc, char** argv) {
             rebuildWalls.push_back(rebuildWall);
 
             const QueryOutput got = runQuery(gpu, true);
-            const QueryOutput want = runQuery(fresh, false);
+            const QueryOutput want = runQuery(fresh, true);
             const Mismatch m = compareQueryOutput(want, got);
             destroyBVHGPU(fresh);
 
             std::printf(
-                "topo round=%d del=%zu add=%d move=%zu update=%.3f wall=%.3f ms rebuild=%.3f "
-                "rebuild_wall=%.3f ms x=%.2f "
-                "full=%d roots=%d leaves=%d depth=%d node_tests=%.1f mismatch=%llu/%llu/%llu"
+                "topo round=%d del=%zu ins=%zu add=%d move=%zu update=%.3f wall=%.3f ms "
+                "rebuild=%.3f rebuild_wall=%.3f ms x=%.2f "
+                "full=%d roots=%d leaves=%d depth=%d node_tests=%.1f fresh_tests=%.1f "
+                "mismatch=%llu/%llu/%llu"
                 " tree=0x%016llx"
                 " [plan=%.2f surgery=%.2f relayout=%.2f merge=%.2f wide=%.2f]\n",
-                r, sc.edit.deleted.size(), sc.edit.appended, sc.edit.moved.size(), upd, wall,
+                r, sc.edit.deleted.size(), sc.edit.inserted.size(), sc.edit.appended,
+                sc.edit.moved.size(), upd, wall,
                 fb.totalMs, rebuildWall, fb.totalMs > 0.0 ? upd / fb.totalMs : 0.0,
                 tt.fullRebuild ? 1 : 0, tt.surgeryRoots, tt.rebuiltLeaves, gpu.depth,
-                got.stats.nodeTests / nPoints, static_cast<unsigned long long>(m.count),
+                got.stats.nodeTests / nPoints, want.stats.nodeTests / nPoints,
+                static_cast<unsigned long long>(m.count),
                 static_cast<unsigned long long>(m.tri), static_cast<unsigned long long>(m.dist),
                 static_cast<unsigned long long>(treeHashGPU(gpu)), tt.planMs, tt.surgeryMs,
                 tt.relayoutMs, tt.mergeMs, tt.wideMs);

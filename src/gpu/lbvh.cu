@@ -1357,30 +1357,31 @@ __global__ void invertPermKernel(const int* __restrict__ primIds, int n,
 }
 
 // 每个被删掉的叶子往上爬到第一个"够大、且自己能凑够两个新叶子"的祖先。
-// 删除表是场景下标，先用 primSlot 换成叶子槽。追加的图元只能落进拥有最后一个
-// 旧叶子的那棵子树，所以尾部叶子也参与一次爬升，并且只有它可以靠追加补足新叶子数。
+// 删除表是场景下标，先用 primSlot 换成叶子槽。新增的图元（中途插入 + 尾部追加）
+// 在槽序里都接在最后一个旧叶子之后，只能落进拥有最后一个旧叶子的那棵子树，所以
+// 尾部叶子也参与一次爬升，并且只有它可以靠新增块补足新叶子数。
 // 同一棵子树会被多个删除叶子选中，epoch 标记顺手去重（谁先写都一样）。
 //
-// 尾部那份用单独的 minSize：追加块越大，切分根就得越高，否则每轮都只把新增
-// 图元挂在一条越来越深的路径底下（R4 漂移）。要求重建区间里至少有一份与追加
+// 尾部那份用单独的 minSize：新增块越大，切分根就得越高，否则每轮都只把新增
+// 图元挂在一条越来越深的路径底下（R4 漂移）。要求重建区间里至少有一份与新增
 // 块同样多的旧叶子，新子树的根才能稳定在上一次的位置。
 __global__ void climbKernel(const int* __restrict__ deleted, const int* __restrict__ primSlot,
-                            int delCount, int tailLeaf, int appended,
+                            int delCount, int tailLeaf, int extra,
                             const int* __restrict__ parent, const int* __restrict__ size,
                             const int* __restrict__ minSlot, const int* __restrict__ keptPrefix,
-                            int nOld, int minSize, int appendedMinSize, int* __restrict__ mark,
+                            int nOld, int minSize, int extraMinSize, int* __restrict__ mark,
                             int epoch, int* __restrict__ cand, int* __restrict__ flag) {
     const int i = blockIdx.x * kBlock + threadIdx.x;
-    const int total = delCount + (appended > 0 ? 1 : 0);
+    const int total = delCount + (extra > 0 ? 1 : 0);
     if (i >= total) return;
     const int slot = i < delCount ? primSlot[deleted[i]] : tailLeaf;
-    const int need = i < delCount ? minSize : appendedMinSize;
+    const int need = i < delCount ? minSize : extraMinSize;
     int node = parent[nOld - 1 + slot];
     while (node > 0) {
         const int beg = minSlot[node];
         const int end = beg + size[node];
         const int kept = keptPrefix[end] - keptPrefix[beg];
-        const int bonus = (appended > 0 && end == nOld) ? appended : 0;
+        const int bonus = (extra > 0 && end == nOld) ? extra : 0;
         if (size[node] >= need && kept + bonus >= 2) break;
         node = parent[node];
     }
@@ -1436,13 +1437,13 @@ __global__ void cutMetaKernel(const int* __restrict__ ids, const int* __restrict
                               const int* __restrict__ keepOff, int count,
                               const int* __restrict__ minSlot, const int* __restrict__ size,
                               const int* __restrict__ depth, const int* __restrict__ keptSlotPrefix,
-                              int nOld, int appended, int* __restrict__ meta) {
+                              int nOld, int extra, int* __restrict__ meta) {
     const int i = blockIdx.x * kBlock + threadIdx.x;
     if (i >= count || !keep[i]) return;
     const int id = ids[i];
     const int beg = minSlot[id];
     const int end = beg + size[id];
-    const int tail = (appended > 0 && end == nOld) ? appended : 0;
+    const int tail = (extra > 0 && end == nOld) ? extra : 0;
     int* out = meta + static_cast<size_t>(keepOff[i]) * kCutFields;
     out[0] = beg;
     out[1] = end;
@@ -1454,11 +1455,11 @@ __global__ void cutMetaKernel(const int* __restrict__ ids, const int* __restrict
 // 森林只重建这些区间：把每个删除区间里的幸存者按槽序压进一张紧凑数组。区间
 // 下标 pos 对应真正的新叶子槽 slotOf[pos]（槽序压缩下标），排序数组 order 也
 // 存这个下标——森林内部只需要"紧凑位置连续"，叶引用可以指向任意新槽。
-// 追加的图元接在尾区间的末尾（新槽就是 nSurv 之后）。
+// 新增的图元接在尾区间的末尾（新槽就是 nSurv 之后），中途插入的在前、追加的在后。
 __global__ void buildSlotOfKernel(int nOld, const int* __restrict__ keptSlotPrefix,
                                   const int* __restrict__ cutBeg, const int* __restrict__ cutEnd,
                                   int cutCount, const int* __restrict__ compactBeg, int nSurv,
-                                  int appended, int compactLen, int* __restrict__ slotOf,
+                                  int extra, int compactLen, int* __restrict__ slotOf,
                                   int* __restrict__ order, int* __restrict__ slotTask) {
     const int s = blockIdx.x * kBlock + threadIdx.x;
     if (s < nOld) {
@@ -1479,9 +1480,9 @@ __global__ void buildSlotOfKernel(int nOld, const int* __restrict__ keptSlotPref
         slotOf[pos] = newSlot;
         order[pos] = newSlot;
         slotTask[pos] = r;
-    } else if (s < nOld + appended) {
+    } else if (s < nOld + extra) {
         const int k = s - nOld;
-        const int pos = compactLen - appended + k;
+        const int pos = compactLen - extra + k;
         slotOf[pos] = nSurv + k;
         order[pos] = slotOf[pos];
         slotTask[pos] = cutCount - 1;
@@ -1500,19 +1501,40 @@ __global__ void gatherSurvivorsKernel(const typename Ops::Item* __restrict__ old
     if (slotPrefix[s + 1] != dst) newTris[dst] = oldTris[s];  // 删掉的位置不写
 }
 
-// 新槽 -> 新场景下标：幸存者沿旧 primIds 换成新场景里的位置，追加的图元接在
-// 幸存者之后。删除/追加之后 primIds 一般不再是 iota，查询输出靠它回场景下标。
+// 中途插入会把后面的幸存者往后推。设插入表为 i_j，位移 e_j = i_j - j（非降），
+// 则场景序里第 k 个幸存者的位移恰好是 e_j <= k 的插入个数（插入位置只可能落到
+// 已排好的幸存者之间）。一次二分，不必为每个槽建整张映射表。
+__device__ inline int survivorScene(const int* __restrict__ shifts, int nIns, int k) {
+    int lo = 0, hi = nIns;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (shifts[mid] <= k) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return k + lo;
+}
+
+// 新槽 -> 新场景下标：幸存者沿旧 primIds 先换成场景序的幸存者序号 k，再按插入
+// 位移换成真正的新场景下标；新增块按 extraScene 取（先中途插入、后尾部追加）。
+// 删除/插入/追加之后 primIds 一般不再是 iota，查询输出靠它回场景下标。
 __global__ void remapPermKernel(const int* __restrict__ primIds,
                                 const int* __restrict__ slotPrefix,
-                                const int* __restrict__ scenePrefix, int nOld, int nSurv,
-                                int appended, int* __restrict__ newPrimIds) {
+                                const int* __restrict__ scenePrefix,
+                                const int* __restrict__ shifts, int nIns, int nOld, int nSurv,
+                                int extra, const int* __restrict__ extraScene,
+                                int* __restrict__ newPrimIds) {
     const int s = blockIdx.x * kBlock + threadIdx.x;
     if (s < nOld) {
         const int dst = slotPrefix[s];
-        if (slotPrefix[s + 1] != dst) newPrimIds[dst] = scenePrefix[primIds[s]];
-    } else if (s < nOld + appended) {
-        const int slot = nSurv + (s - nOld);
-        newPrimIds[slot] = slot;
+        if (slotPrefix[s + 1] != dst) {
+            const int k = scenePrefix[primIds[s]];
+            newPrimIds[dst] = nIns > 0 ? survivorScene(shifts, nIns, k) : k;
+        }
+    } else if (s < nOld + extra) {
+        newPrimIds[nSurv + (s - nOld)] = extraScene[s - nOld];
     }
 }
 
@@ -2523,7 +2545,8 @@ double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
 constexpr int kTopoDepthSlack = 6;
 
 // 拓扑更新。编辑脚本的语义写在 gpu_bvh.h 的 GpuTopoEdit 上：newScene 是幸存者
-// （保序）+ 末尾追加，所以幸存者的新下标 = 旧下标 - 它前面删掉的数量。
+// （保序）+ 中途插入 + 末尾追加。槽序不跟随场景序：幸存者按旧槽序压缩在前，
+// 新增块接在最后（先插入后追加），子树覆盖的槽区间因此仍然连续。
 template <typename Ops>
 static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>& items,
                              const GpuTopoEdit& edit, GpuTopoUpdateTimings* timings) {
@@ -2539,10 +2562,21 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
         }
     }
     const long long nNew = static_cast<long long>(nOld) - static_cast<long long>(edit.deleted.size()) +
-                           edit.appended;
+                           static_cast<long long>(edit.inserted.size()) + edit.appended;
     if (nNew < 2) throw std::invalid_argument("updateBVHGPU: at least 2 primitives required");
     if (static_cast<long long>(items.size()) != nNew) {
         throw std::invalid_argument("updateBVHGPU: scene size does not match the edit");
+    }
+    const int nIns = static_cast<int>(edit.inserted.size());
+    const long long tailBeg = nNew - edit.appended;  // 追加块从新场景的这个位置开始
+    for (size_t i = 0; i < edit.inserted.size(); ++i) {
+        const int id = edit.inserted[i];
+        if (id < 0 || id >= tailBeg) {
+            throw std::invalid_argument("updateBVHGPU: inserted index out of range");
+        }
+        if (i > 0 && id <= edit.inserted[i - 1]) {
+            throw std::invalid_argument("updateBVHGPU: inserted must be ascending and unique");
+        }
     }
     for (int id : edit.moved) {
         if (id < 0 || id >= static_cast<int>(nNew)) {
@@ -2554,11 +2588,12 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     GpuTopoUpdateTimings* t = timings ? timings : &local;
     *t = GpuTopoUpdateTimings{};
     t->deleted = static_cast<int>(edit.deleted.size());
+    t->inserted = nIns;
     t->appended = edit.appended;
     t->newDepth = bvh.depth;
     if (bvh.topoBaseDepth <= 0) bvh.topoBaseDepth = bvh.depth;
 
-    if (edit.deleted.empty() && edit.appended == 0) {
+    if (edit.deleted.empty() && nIns == 0 && edit.appended == 0) {
         // 纯移动：树形没变，走原来的增量 refit 快路径（上传只含改动的图元）。
         GpuRefitTimings rt;
         t->refitMs = refitImpl<Ops>(bvh, items, &edit.moved, &rt);
@@ -2576,6 +2611,7 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     const int nNewI = static_cast<int>(nNew);
     const int delCount = static_cast<int>(edit.deleted.size());
     const int nSurv = nOld - delCount;
+    const int extra = nIns + edit.appended;  // 新增块：槽尾连续的 extra 个叶子
 
     // 回退：整棵按同一套建树器重建。拓扑缓存的形状全变了，没有可复用的部分。
     // 旧树不 cudaFree 而是整棵还进池——重建要的正是同一批同尺寸的块，
@@ -2638,7 +2674,7 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     }
     // 改动过半：局部重建的规划成本（一趟全树统计 + 一趟重编号）已经接近重建，
     // 而且最后大概率也要超过下面的重建叶子上限。
-    if (delCount + edit.appended > nOld / 2) return rebuildAll();
+    if (delCount + extra > nOld / 2) return rebuildAll();
 
     const int nodeCount = bvh.nodeCount;
     const int internalOld = nOld - 1;
@@ -2696,23 +2732,22 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
            "slot scan");
 
     // ---- 切分选择：每个删除点爬到一个够大的祖先，去重、排序、压掉被包含的候选 ----
-    const int cabMax = delCount + (edit.appended > 0 ? 1 : 0);
+    const int cabMax = delCount + (extra > 0 ? 1 : 0);
     const int budget = std::max(64, nNewI / 8);
     int minSize = budget / std::max(1, delCount);
     minSize = std::max(64, std::min(4096, minSize));
-    // 追加区间至少吸收与追加块同样多的旧叶子，新子树的根才不会逐轮下沉。
-    const int appendedMinSize =
-        edit.appended > 0 ? std::max(minSize, std::min(4096, edit.appended)) : minSize;
+    // 新增区间至少吸收与新增块同样多的旧叶子，新子树的根才不会逐轮下沉。
+    const int extraMinSize = extra > 0 ? std::max(minSize, std::min(4096, extra)) : minSize;
 
     DevBuf<int> dCand(cabMax), dCandFlag(cabMax + 1), dCandOff(cabMax + 1);
     DevBuf<int> dPrimSlot(nOld);
     invertPermKernel<<<blocksFor(nOld), kBlock>>>(oldPrimIds, nOld, dPrimSlot.p);
     cudaOk(cudaGetLastError(), "invert perm");
     ++bvh.refitEpoch;
-    climbKernel<<<blocksFor(cabMax), kBlock>>>(dDeleted.p, dPrimSlot.p, delCount, nOld - 1,
-                                               edit.appended, oldParent, dSize.p, dMinSlot.p,
-                                               dSlotPrefix.p, nOld, minSize, appendedMinSize, mark,
-                                               bvh.refitEpoch, dCand.p, dCandFlag.p);
+    climbKernel<<<blocksFor(cabMax), kBlock>>>(dDeleted.p, dPrimSlot.p, delCount, nOld - 1, extra,
+                                               oldParent, dSize.p, dMinSlot.p, dSlotPrefix.p, nOld,
+                                               minSize, extraMinSize, mark, bvh.refitEpoch,
+                                               dCand.p, dCandFlag.p);
     cudaOk(cudaGetLastError(), "topo climb");
     cudaOk(cudaMemset(dCandFlag.p + cabMax, 0, sizeof(int)), "cand tail");
     cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, dCandFlag.p, dCandOff.p, cabMax + 1),
@@ -2766,8 +2801,7 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     DevBuf<int> dCutMeta(static_cast<size_t>(cutCount) * kCutFields);
     cutMetaKernel<<<blocksFor(candCount), kBlock>>>(dCandValSorted.p, dKeep.p, dKeepOff.p,
                                                     candCount, dMinSlot.p, dSize.p, oldDepth,
-                                                    dSlotPrefix.p, nOld, edit.appended,
-                                                    dCutMeta.p);
+                                                    dSlotPrefix.p, nOld, extra, dCutMeta.p);
     cudaOk(cudaGetLastError(), "topo cut meta");
     std::vector<int> cuts(static_cast<size_t>(cutCount) * kCutFields);
     cudaOk(cudaMemcpy(cuts.data(), dCutMeta.p, cuts.size() * sizeof(int), cudaMemcpyDeviceToHost),
@@ -2795,19 +2829,48 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     if (sumOld > nNewI / 4) return rebuildAll();
     const int want = compactLen - cutCount;
 
-    // ---- B 暂存：幸存者按旧槽序拷贝，追加和移动直接落新槽 ----
+    // ---- B 暂存：幸存者按旧槽序拷贝，插入、追加和移动直接落新槽 ----
     // 新槽是槽序压缩下标（保持子树区间连续）；新场景下标由 primIds 单独记录。
     DevBuf<Item> dNewTris(nNewI);
     DevBuf<int> dNewPrimIds(nNewI);
     gatherSurvivorsKernel<Ops><<<blocksFor(nOld), kBlock>>>(oldTris, dSlotPrefix.p, nOld,
                                                             dNewTris.p);
-    if (edit.appended > 0) {
-        cudaOk(cudaMemcpy(dNewTris.p + nSurv, items.data() + nSurv,
-                          static_cast<size_t>(edit.appended) * sizeof(Item), cudaMemcpyHostToDevice),
-               "append H2D");
+    // 新增块：槽 [nSurv, nNew) 依次装中途插入的 nIns 个和尾部追加的 appended 个，
+    // 对应场景下标记在 extraScene（inserted 升序在前、追加位置在后）。
+    DevBuf<int> dExtraScene(extra > 0 ? extra : 1);
+    if (extra > 0) {
+        std::vector<int> extraScene(static_cast<size_t>(extra));
+        std::vector<Item> extraItems(static_cast<size_t>(extra));
+        for (int e = 0; e < nIns; ++e) extraScene[static_cast<size_t>(e)] = edit.inserted[e];
+        for (int k = 0; k < edit.appended; ++k) {
+            extraScene[static_cast<size_t>(nIns + k)] = nNewI - edit.appended + k;
+        }
+        for (int e = 0; e < extra; ++e) {
+            extraItems[static_cast<size_t>(e)] = items[static_cast<size_t>(extraScene[e])];
+        }
+        cudaOk(cudaMemcpy(dExtraScene.p, extraScene.data(), static_cast<size_t>(extra) * sizeof(int),
+                          cudaMemcpyHostToDevice),
+               "extra scenes H2D");
+        cudaOk(cudaMemcpy(dNewTris.p + nSurv, extraItems.data(),
+                          static_cast<size_t>(extra) * sizeof(Item), cudaMemcpyHostToDevice),
+               "extra prims H2D");
     }
-    remapPermKernel<<<blocksFor(nOld + edit.appended), kBlock>>>(
-        oldPrimIds, dSlotPrefix.p, dKeptPrefix.p, nOld, nSurv, edit.appended, dNewPrimIds.p);
+    // 中途插入才要位移表（形态是 i_j - j，非降，供核内二分）；没有插入时幸存者
+    // 的新场景下标就是 keptPrefix 的值。
+    DevBuf<int> dShifts;
+    if (nIns > 0) {
+        std::vector<int> shifts(static_cast<size_t>(nIns));
+        for (int j = 0; j < nIns; ++j) {
+            shifts[static_cast<size_t>(j)] = edit.inserted[static_cast<size_t>(j)] - j;
+        }
+        dShifts = DevBuf<int>(nIns);
+        cudaOk(cudaMemcpy(dShifts.p, shifts.data(), static_cast<size_t>(nIns) * sizeof(int),
+                          cudaMemcpyHostToDevice),
+               "insert shifts H2D");
+    }
+    remapPermKernel<<<blocksFor(nOld + extra), kBlock>>>(
+        oldPrimIds, dSlotPrefix.p, dKeptPrefix.p, dShifts.p, nIns, nOld, nSurv, extra,
+        dExtraScene.p, dNewPrimIds.p);
     cudaOk(cudaGetLastError(), "topo stage");
     // E 阶段还要用移动表标脏，所以这两个缓冲区留到函数末尾。
     const int mvCount = static_cast<int>(edit.moved.size());
@@ -2857,9 +2920,9 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
                       cudaMemcpyHostToDevice),
            "cut end H2D");
     SahWorkspace ws(compactLen);
-    buildSlotOfKernel<<<blocksFor(nOld + edit.appended), kBlock>>>(
-        nOld, dSlotPrefix.p, dCutBegDev.p, dCutEndDev.p, cutCount, dCompactBeg.p, nSurv,
-        edit.appended, compactLen, dSlotOf.p, ws.orderA.p, ws.slotA.p);
+    buildSlotOfKernel<<<blocksFor(nOld + extra), kBlock>>>(
+        nOld, dSlotPrefix.p, dCutBegDev.p, dCutEndDev.p, cutCount, dCompactBeg.p, nSurv, extra,
+        compactLen, dSlotOf.p, ws.orderA.p, ws.slotA.p);
     cudaOk(cudaGetLastError(), "compact slots");
 
     cudaOk(cudaMemcpy(ws.beginA.p, seedBegin.data(), static_cast<size_t>(cutCount) * sizeof(int),
