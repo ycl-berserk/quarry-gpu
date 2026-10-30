@@ -1004,12 +1004,16 @@ int main(int argc, char** argv) {
 
             std::printf(
                 "topo round=%d del=%zu add=%d move=%zu update=%.3f ms rebuild=%.3f ms x=%.2f "
-                "full=%d roots=%d leaves=%d depth=%d node_tests=%.1f mismatch=%llu/%llu/%llu\n",
+                "full=%d roots=%d leaves=%d depth=%d node_tests=%.1f mismatch=%llu/%llu/%llu"
+                " tree=0x%016llx"
+                " [plan=%.2f surgery=%.2f relayout=%.2f merge=%.2f wide=%.2f]\n",
                 r, sc.edit.deleted.size(), sc.edit.appended, sc.edit.moved.size(), upd,
                 fb.totalMs, fb.totalMs > 0.0 ? upd / fb.totalMs : 0.0,
                 tt.fullRebuild ? 1 : 0, tt.surgeryRoots, tt.rebuiltLeaves, gpu.depth,
                 got.stats.nodeTests / nPoints, static_cast<unsigned long long>(m.count),
-                static_cast<unsigned long long>(m.tri), static_cast<unsigned long long>(m.dist));
+                static_cast<unsigned long long>(m.tri), static_cast<unsigned long long>(m.dist),
+                static_cast<unsigned long long>(treeHashGPU(gpu)), tt.planMs, tt.surgeryMs,
+                tt.relayoutMs, tt.mergeMs, tt.wideMs);
             if (m.count || m.tri || m.dist) exitCode = 6;
             cur = std::move(sc.next);
         }

@@ -141,8 +141,14 @@ double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
 // 最后整块重编号（叶子恒为 n-1+slot）。改动太散、太深或占比过大时回退成整棵重建，
 // timings->fullRebuild 会置 true。查询结果与"对 newScene 全新构建"逐位相同。
 //
-// 当前阶段：纯移动走 refit 快路径，增删一律回退成整棵重建（fullRebuild 恒为 true）；
-// 切分选择、森林 SAH 与规范重编号还没接上。
+// 当前实现：切分选择（从删除叶子上溯到 ≤T 叶的 antichain）+ 森林 SAH 只重建受影响
+// 的子树 + 全局规范重编号（内部节点按 (深度, 源序)，叶子 = n-1+slot）。新叶子槽是
+// 旧槽序的压缩下标，保证子树覆盖的槽区间仍然连续；场景下标由 d_primIds 单独记录，
+// 所以更新后 d_primIds 一般不再是 iota。
+// 回退条件：删除/追加占比过大、重建叶数超预算、切分根过散、预估深度 ≥ 63、n < 2。
+//
+// 已知代价（v1）：规划里的前缀和、载荷重排与整块重编号都是 O(n)，2M 三角形下更新
+// 与整棵重建同量级；稳定槽位 / 节点池留给 v1.1。
 struct GpuTopoEdit {
     std::vector<int> deleted;
     std::vector<int> moved;
@@ -309,3 +315,6 @@ void warmupQueryGPU();
 std::string validateBVHGPU(const GpuBVH& bvh, const Scene& scene);
 std::string validatePointBVHGPU(const GpuBVH& bvh, const PointCloud& cloud);
 std::string validateGaussianBVHGPU(const GpuBVH& bvh, const GaussianCloud& cloud);
+
+// 节点数组的 64 位 FNV 指纹（只读）。确定性门禁：同一批脚本跑两次必须同值。
+uint64_t treeHashGPU(const GpuBVH& bvh);

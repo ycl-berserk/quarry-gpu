@@ -33,6 +33,7 @@ void cudaOk(cudaError_t err, const char* what) {
 template <typename T>
 struct DevBuf {
     T* p = nullptr;
+    DevBuf() = default;
     explicit DevBuf(size_t count) {
         cudaOk(cudaMalloc(reinterpret_cast<void**>(&p), count * sizeof(T)), "cudaMalloc");
     }
@@ -46,6 +47,15 @@ struct DevBuf {
     }
     DevBuf(const DevBuf&) = delete;
     DevBuf& operator=(const DevBuf&) = delete;
+    DevBuf(DevBuf&& o) noexcept : p(o.p) { o.p = nullptr; }
+    DevBuf& operator=(DevBuf&& o) noexcept {
+        if (this != &o) {
+            if (p) cudaFree(p);
+            p = o.p;
+            o.p = nullptr;
+        }
+        return *this;
+    }
 };
 
 int blocksFor(int n) { return (n + kBlock - 1) / kBlock; }
@@ -330,6 +340,25 @@ __global__ void depthOffsetsKernel(const uint32_t* __restrict__ sortedKeys, int 
     offsets[d] = lo;
 }
 
+// 与 depthOffsetsKernel 相同，只是键是 (深度 << 26) | 来源序 的打包形式；全 1 哨兵
+// （深度 63）排在所有有效键之后，不会被算进任何一层。
+__global__ void depthOffsetsPackedKernel(const uint32_t* __restrict__ sortedKeys, int nodeCount,
+                                         int bins, int* __restrict__ offsets) {
+    const int d = threadIdx.x;
+    if (d > bins) return;
+    int lo = 0;
+    int hi = nodeCount;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (static_cast<int>(sortedKeys[mid] >> 26) < d) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    offsets[d] = lo;
+}
+
 // 同一层里没有父子关系，可以整层并行；孩子的层已经在前一批 kernel 里算完。
 // 叶子盒在 leafInitKernel 里就定稿了，这里只处理内部节点。
 //
@@ -443,6 +472,24 @@ __global__ void checkNodesKernel(const GpuBVHNode* __restrict__ nodes,
     }
 }
 
+// 深度必须与父子关系一致：重编号、层序合并和切分选择都靠它，而且查询栈只有 64 层。
+__global__ void checkDepthKernel(const GpuBVHNode* __restrict__ nodes,
+                                 const int* __restrict__ depth, int n, int nodeCount,
+                                 int* __restrict__ errors) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= nodeCount) return;
+    if (i == 0) {
+        if (depth[i] != 0) atomicAdd(&errors[5], 1);
+    }
+    if (i < n - 1) {
+        const int l = nodes[i].left;
+        const int r = nodes[i].right;
+        if (l >= 0 && l < nodeCount && depth[l] != depth[i] + 1) atomicAdd(&errors[5], 1);
+        if (r >= 0 && r < nodeCount && depth[r] != depth[i] + 1) atomicAdd(&errors[5], 1);
+    }
+    if (depth[i] >= 63) atomicAdd(&errors[5], 1);
+}
+
 __global__ void checkRefsKernel(const int* __restrict__ visited, int nodeCount,
                                 int* __restrict__ errors) {
     const int i = blockIdx.x * kBlock + threadIdx.x;
@@ -469,6 +516,29 @@ __global__ void checkPermCountKernel(const int* __restrict__ hist, int n,
     const int i = blockIdx.x * kBlock + threadIdx.x;
     if (i >= n) return;
     if (hist[i] != 1) atomicAdd(&errors[4], 1);
+}
+
+// 叶子载荷必须就是 primIds 指向的那个图元：d_tris 与 primIds 是同一个置换的两半，
+// 两个都错但互相自洽时上面几项都查不出来（拓扑更新最容易在这里漂）。
+template <typename Ops>
+__global__ void checkPayloadKernel(const typename Ops::Item* __restrict__ sorted,
+                                   const typename Ops::Item* __restrict__ items,
+                                   const int* __restrict__ primIds, int n,
+                                   int* __restrict__ errors) {
+    const int s = blockIdx.x * kBlock + threadIdx.x;
+    if (s >= n) return;
+    const int id = primIds[s];
+    if (id < 0 || id >= n) {
+        atomicAdd(&errors[4], 1);
+        return;
+    }
+    const typename Ops::Item a = sorted[s];
+    const typename Ops::Item b = items[id];
+    const unsigned char* pa = reinterpret_cast<const unsigned char*>(&a);
+    const unsigned char* pb = reinterpret_cast<const unsigned char*>(&b);
+    int diff = 0;
+    for (size_t k = 0; k < sizeof(typename Ops::Item); ++k) diff |= pa[k] ^ pb[k];
+    if (diff != 0) atomicAdd(&errors[4], 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -927,13 +997,23 @@ __global__ void sahScatterKernel(const int* __restrict__ order,
                              : (rc > 1 ? base + (lc > 1 ? 1 : 0) : -1);
 }
 
+// 叶子引用有两种编码：整棵构建时叶子就在同一片节点池里（n-1+slot）；森林模式只
+// 重建几个区间，叶子没有临时 id，直接写 -(slot+1)——这正是查询侧期望的编码。
+// posSlot 非空时区间下标是压缩后的局部序号，要查回真正的叶子槽。
+__device__ __forceinline__ int leafRefOf(int leafBase, const int* posSlot, int pos) {
+    if (posSlot) return -(posSlot[pos] + 1);
+    return leafBase + pos;
+}
+
 __global__ void sahAssignKernel(int taskCount, const int* __restrict__ taskBegin,
                                 const int* __restrict__ taskEnd, const int* __restrict__ taskNode,
                                 const int* __restrict__ leftCount,
-                                const int* __restrict__ childBase, int internalBase,
-                                int n, GpuBVHNode* __restrict__ nodes,
+                                const int* __restrict__ childBase, int internalBase, int leafBase,
+                                const int* __restrict__ posSlot, GpuBVHNode* __restrict__ nodes,
                                 int* __restrict__ parent, int* __restrict__ nextBegin,
-                                int* __restrict__ nextEnd, int* __restrict__ nextNode) {
+                                int* __restrict__ nextEnd, int* __restrict__ nextNode,
+                                const int* __restrict__ taskDepth, int* __restrict__ nextDepth,
+                                int* __restrict__ depthOut) {
     const int t = blockIdx.x * kBlock + threadIdx.x;
     if (t >= taskCount) return;
     const int begin = taskBegin[t];
@@ -943,23 +1023,29 @@ __global__ void sahAssignKernel(int taskCount, const int* __restrict__ taskBegin
     const int p = childBase[t];
     const int node = taskNode[t];
 
-    const int leftId = lc > 1 ? internalBase + p : n - 1 + begin;
-    const int rightId = rc > 1 ? internalBase + p + (lc > 1 ? 1 : 0) : n - 1 + begin + lc;
+    const int leftId = lc > 1 ? internalBase + p : leafRefOf(leafBase, posSlot, begin);
+    const int rightId = rc > 1 ? internalBase + p + (lc > 1 ? 1 : 0)
+                               : leafRefOf(leafBase, posSlot, begin + lc);
     nodes[node].left = leftId;
     nodes[node].right = rightId;
-    parent[leftId] = node;
-    parent[rightId] = node;
+    if (leftId >= 0) parent[leftId] = node;
+    if (rightId >= 0) parent[rightId] = node;
+
+    const int childDepth = taskDepth ? taskDepth[t] + 1 : 0;
+    if (depthOut) depthOut[node] = taskDepth[t];
 
     if (lc > 1) {
         nextBegin[p] = begin;
         nextEnd[p] = begin + lc;
         nextNode[p] = leftId;
+        if (nextDepth) nextDepth[p] = childDepth;
     }
     if (rc > 1) {
         const int id = p + (lc > 1 ? 1 : 0);
         nextBegin[id] = begin + lc;
         nextEnd[id] = end;
         nextNode[id] = rightId;
+        if (nextDepth) nextDepth[id] = childDepth;
     }
 }
 
@@ -976,14 +1062,16 @@ __global__ void sahSubtreeSizeKernel(int taskCount, const int* __restrict__ task
 __global__ void sahSerialBuildKernel(int taskCount, const int* __restrict__ taskBegin,
                                      const int* __restrict__ taskEnd,
                                      const int* __restrict__ taskNode,
-                                     const int* __restrict__ childBase, int internalBase, int n,
+                                     const int* __restrict__ childBase, int internalBase,
+                                     int leafBase, const int* __restrict__ posSlot,
                                      GpuBVHNode* __restrict__ nodes, int* __restrict__ parent,
+                                     const int* __restrict__ taskDepth, int* __restrict__ depthOut,
                                      int* __restrict__ errors) {
     const int t = blockIdx.x * kBlock + threadIdx.x;
     if (t >= taskCount) return;
 
     struct Frame {
-        int begin, count, id, next;
+        int begin, count, id, next, depth;
     };
     Frame st[32];
     int sp = 0;
@@ -992,24 +1080,368 @@ __global__ void sahSerialBuildKernel(int taskCount, const int* __restrict__ task
         atomicAdd(&errors[0], 1);
         return;
     }
-    st[sp++] = {taskBegin[t], count, taskNode[t], internalBase + childBase[t]};
+    st[sp++] = {taskBegin[t], count, taskNode[t], internalBase + childBase[t],
+                taskDepth ? taskDepth[t] : 0};
     while (sp > 0) {
         const Frame f = st[--sp];
         const int lc = f.count / 2;
         const int rc = f.count - lc;
-        const int leftId = lc == 1 ? (n - 1 + f.begin) : f.next;
-        const int rightId = rc == 1 ? (n - 1 + f.begin + lc) : f.next + (lc - 1);
+        const int leftId = lc == 1 ? leafRefOf(leafBase, posSlot, f.begin) : f.next;
+        const int rightId = rc == 1 ? leafRefOf(leafBase, posSlot, f.begin + lc)
+                                    : f.next + (lc - 1);
         nodes[f.id].left = leftId;
         nodes[f.id].right = rightId;
-        parent[leftId] = f.id;
-        parent[rightId] = f.id;
-        if (rc > 1 && sp < 32) st[sp++] = {f.begin + lc, rc, rightId, rightId + 1};
-        if (lc > 1 && sp < 32) st[sp++] = {f.begin, lc, leftId, leftId + 1};
+        if (leftId >= 0) parent[leftId] = f.id;
+        if (rightId >= 0) parent[rightId] = f.id;
+        if (depthOut) depthOut[f.id] = f.depth;
+        if (rc > 1 && sp < 32) st[sp++] = {f.begin + lc, rc, rightId, rightId + 1, f.depth + 1};
+        if (lc > 1 && sp < 32) st[sp++] = {f.begin, lc, leftId, leftId + 1, f.depth + 1};
         if ((rc > 1 || lc > 1) && sp >= 32) {
             atomicAdd(&errors[0], 1);
             return;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 拓扑变更：子树统计 → 切分选择 → 规范重编号。
+// 树里每个内部节点的子树覆盖一段连续的叶子槽，这一点让"删了谁、剩多少、重建
+// 哪一块"全部可以用区间算术表达，不需要在主机上还原整棵树。
+// ---------------------------------------------------------------------------
+constexpr int kCutFields = 5;  // oldBeg, oldEnd, newSize, depth, nodeId
+
+// 叶子贡献 size=1，内部节点先清零；随后按深度自深向浅逐层相加（和 refit 一样，
+// 第 d 层只读第 d+1 层）。minSlot 顺带算出子树的区间起点。
+__global__ void subtreeInitKernel(int* __restrict__ size, int* __restrict__ minSlot, int n,
+                                  int nodeCount) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= nodeCount) return;
+    if (i >= n - 1) {
+        size[i] = 1;
+        minSlot[i] = i - (n - 1);
+    } else {
+        size[i] = 0;
+        minSlot[i] = 0x7fffffff;
+    }
+}
+
+__global__ void subtreeMergeKernel(const GpuBVHNode* __restrict__ nodes, int* __restrict__ size,
+                                   int* __restrict__ minSlot, const int* __restrict__ level,
+                                   int count) {
+    const int t = blockIdx.x * kBlock + threadIdx.x;
+    if (t >= count) return;
+    const int i = level[t];
+    const int l = nodes[i].left;
+    const int r = nodes[i].right;
+    size[i] = size[l] + size[r];
+    minSlot[i] = minSlot[l] < minSlot[r] ? minSlot[l] : minSlot[r];
+}
+
+// 删除位图 + 它的前缀和：keptPrefix[s] 是 s 之前还剩多少个图元，也就是旧槽 s
+// 在新场景里的下标。多留一格哨兵，扫描一次就能拿到总数。
+__global__ void keptFlagsInitKernel(int n, int* __restrict__ flags) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i > n) return;
+    flags[i] = i < n ? 1 : 0;
+}
+
+__global__ void clearKeptFlagsKernel(const int* __restrict__ deleted, int count,
+                                     int* __restrict__ flags) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i < count) flags[deleted[i]] = 0;
+}
+
+// 子树区间是"叶子槽"的区间，删除表却是场景下标，所以还要一张槽序的存活位图。
+__global__ void slotKeptFlagsKernel(const int* __restrict__ primIds,
+                                    const int* __restrict__ keptPrefix, int n,
+                                    int* __restrict__ flags) {
+    const int s = blockIdx.x * kBlock + threadIdx.x;
+    if (s >= n) return;
+    const int id = primIds[s];
+    flags[s] = (keptPrefix[id + 1] != keptPrefix[id]) ? 1 : 0;
+}
+
+// primIds 的反向：场景下标 -> 叶子槽。只有建树时那次重排之后两者不同，拓扑
+// 更新完又变回 iota，但每条编辑脚本都要从"场景下标"找到真正的叶子。
+__global__ void invertPermKernel(const int* __restrict__ primIds, int n,
+                                 int* __restrict__ primSlot) {
+    const int s = blockIdx.x * kBlock + threadIdx.x;
+    if (s < n) primSlot[primIds[s]] = s;
+}
+
+// 每个被删掉的叶子往上爬到第一个"够大、且自己能凑够两个新叶子"的祖先。
+// 删除表是场景下标，先用 primSlot 换成叶子槽。追加的图元只能落进拥有最后一个
+// 旧叶子的那棵子树，所以尾部叶子也参与一次爬升，并且只有它可以靠追加补足新叶子数。
+// 同一棵子树会被多个删除叶子选中，epoch 标记顺手去重（谁先写都一样）。
+__global__ void climbKernel(const int* __restrict__ deleted, const int* __restrict__ primSlot,
+                            int delCount, int tailLeaf, int appended,
+                            const int* __restrict__ parent, const int* __restrict__ size,
+                            const int* __restrict__ minSlot, const int* __restrict__ keptPrefix,
+                            int nOld, int minSize, int* __restrict__ mark, int epoch,
+                            int* __restrict__ cand, int* __restrict__ flag) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    const int total = delCount + (appended > 0 ? 1 : 0);
+    if (i >= total) return;
+    const int slot = i < delCount ? primSlot[deleted[i]] : tailLeaf;
+    int node = parent[nOld - 1 + slot];
+    while (node > 0) {
+        const int beg = minSlot[node];
+        const int end = beg + size[node];
+        const int kept = keptPrefix[end] - keptPrefix[beg];
+        const int bonus = (appended > 0 && end == nOld) ? appended : 0;
+        if (size[node] >= minSize && kept + bonus >= 2) break;
+        node = parent[node];
+    }
+    if (node < 0) node = 0;  // 树比 minSize 还小：整棵当切分根
+    cand[i] = node;
+    flag[i] = (atomicExch(&mark[node], epoch) == epoch) ? 0 : 1;
+}
+
+// 区间起点升序；同起点时大的（祖先）在前，后面一趟扫描一次就能压掉被包含的候选。
+__global__ void candKeyKernel(const int* __restrict__ ids, int count,
+                              const int* __restrict__ minSlot, const int* __restrict__ size,
+                              uint64_t* __restrict__ keys, int* __restrict__ vals) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= count) return;
+    const int id = ids[i];
+    keys[i] = (static_cast<uint64_t>(static_cast<uint32_t>(minSlot[id])) << 32) |
+              static_cast<uint32_t>(~size[id]);
+    vals[i] = id;
+}
+
+// 候选按祖先关系构成一片森林：一个候选被压掉，当且仅当它有一个候选祖先。
+// 每个候选从父节点往上爬，找到第一个候选祖先就说明自己被它包含，标记自己后停。
+// 祖先候选自己的线程会继续往上找，所以每层只爬一趟。
+__global__ void markDominatedKernel(const int* __restrict__ cands, int count,
+                                    const int* __restrict__ parent,
+                                    const int* __restrict__ candEpochMark, int epoch,
+                                    int* __restrict__ dom) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= count) return;
+    int node = parent[cands[i]];
+    while (node > 0) {
+        if (candEpochMark[node] == epoch) {
+            dom[cands[i]] = 1;
+            return;
+        }
+        node = parent[node];
+    }
+}
+
+__global__ void keepFromDomKernel(const int* __restrict__ cands, int count,
+                                  const int* __restrict__ dom, int* __restrict__ keep) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i < count) keep[i] = dom[cands[i]] ? 0 : 1;
+}
+
+__global__ void compactKernel(const int* __restrict__ src, const int* __restrict__ flag,
+                              const int* __restrict__ off, int count, int* __restrict__ dst) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i < count && flag[i]) dst[off[i]] = src[i];
+}
+
+__global__ void cutMetaKernel(const int* __restrict__ ids, const int* __restrict__ keep,
+                              const int* __restrict__ keepOff, int count,
+                              const int* __restrict__ minSlot, const int* __restrict__ size,
+                              const int* __restrict__ depth, const int* __restrict__ keptSlotPrefix,
+                              int nOld, int appended, int* __restrict__ meta) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= count || !keep[i]) return;
+    const int id = ids[i];
+    const int beg = minSlot[id];
+    const int end = beg + size[id];
+    const int tail = (appended > 0 && end == nOld) ? appended : 0;
+    int* out = meta + static_cast<size_t>(keepOff[i]) * kCutFields;
+    out[0] = beg;
+    out[1] = end;
+    out[2] = keptSlotPrefix[end] - keptSlotPrefix[beg] + tail;  // 重建后这块有几个叶子
+    out[3] = depth[id];
+    out[4] = id;
+}
+
+// 森林只重建这些区间：把每个删除区间里的幸存者按槽序压进一张紧凑数组。区间
+// 下标 pos 对应真正的新叶子槽 slotOf[pos]（槽序压缩下标），排序数组 order 也
+// 存这个下标——森林内部只需要"紧凑位置连续"，叶引用可以指向任意新槽。
+// 追加的图元接在尾区间的末尾（新槽就是 nSurv 之后）。
+__global__ void buildSlotOfKernel(int nOld, const int* __restrict__ keptSlotPrefix,
+                                  const int* __restrict__ cutBeg, const int* __restrict__ cutEnd,
+                                  int cutCount, const int* __restrict__ compactBeg, int nSurv,
+                                  int appended, int compactLen, int* __restrict__ slotOf,
+                                  int* __restrict__ order, int* __restrict__ slotTask) {
+    const int s = blockIdx.x * kBlock + threadIdx.x;
+    if (s < nOld) {
+        if (keptSlotPrefix[s + 1] == keptSlotPrefix[s]) return;  // 被删掉的槽
+        int lo = 0, hi = cutCount;
+        while (lo < hi) {
+            const int mid = (lo + hi) / 2;
+            if (cutBeg[mid] <= s) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        const int r = lo - 1;
+        if (r < 0 || cutEnd[r] <= s) return;  // 不在任何重建区间里
+        const int newSlot = keptSlotPrefix[s];
+        const int pos = compactBeg[r] + (keptSlotPrefix[s] - keptSlotPrefix[cutBeg[r]]);
+        slotOf[pos] = newSlot;
+        order[pos] = newSlot;
+        slotTask[pos] = r;
+    } else if (s < nOld + appended) {
+        const int k = s - nOld;
+        const int pos = compactLen - appended + k;
+        slotOf[pos] = nSurv + k;
+        order[pos] = slotOf[pos];
+        slotTask[pos] = cutCount - 1;
+    }
+}
+
+// 新叶子槽 = 旧槽序里删掉删除项之后的压缩下标。载荷按槽序重排，场景顺序由
+// d_primIds 单独记录——两者不能混：重建子树的叶子区间只在槽序里连续。
+template <typename Ops>
+__global__ void gatherSurvivorsKernel(const typename Ops::Item* __restrict__ oldTris,
+                                      const int* __restrict__ slotPrefix, int nOld,
+                                      typename Ops::Item* __restrict__ newTris) {
+    const int s = blockIdx.x * kBlock + threadIdx.x;
+    if (s >= nOld) return;
+    const int dst = slotPrefix[s];
+    if (slotPrefix[s + 1] != dst) newTris[dst] = oldTris[s];  // 删掉的位置不写
+}
+
+// 新槽 -> 新场景下标：幸存者沿旧 primIds 换成新场景里的位置，追加的图元接在
+// 幸存者之后。删除/追加之后 primIds 一般不再是 iota，查询输出靠它回场景下标。
+__global__ void remapPermKernel(const int* __restrict__ primIds,
+                                const int* __restrict__ slotPrefix,
+                                const int* __restrict__ scenePrefix, int nOld, int nSurv,
+                                int appended, int* __restrict__ newPrimIds) {
+    const int s = blockIdx.x * kBlock + threadIdx.x;
+    if (s < nOld) {
+        const int dst = slotPrefix[s];
+        if (slotPrefix[s + 1] != dst) newPrimIds[dst] = scenePrefix[primIds[s]];
+    } else if (s < nOld + appended) {
+        const int slot = nSurv + (s - nOld);
+        newPrimIds[slot] = slot;
+    }
+}
+
+// 移动图元按"新场景下标 -> 新叶子槽"散写。场景下标与槽位只有初始树相等，
+// 一次拓扑更新之后这种对应就断了。
+template <typename Ops>
+__global__ void scatterItemsKernel(const int* __restrict__ sceneIds,
+                                   const typename Ops::Item* __restrict__ src, int count,
+                                   typename Ops::Item* __restrict__ dst,
+                                   const int* __restrict__ sceneSlot) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i < count) dst[sceneSlot[sceneIds[i]]] = src[i];
+}
+
+// 最终编号 = 按 (深度, 来源序) 的排名。键的高 6 位是深度、低 26 位是来源序，
+// 死掉的旧节点用全 1 哨兵键排到最后——这样"保留哪些"不需要另一张标记表。
+__global__ void relayoutKeyKernel(const int* __restrict__ minSlot, const int* __restrict__ size,
+                                  const int* __restrict__ depth, const int* __restrict__ cutBeg,
+                                  const int* __restrict__ cutEnd, int cutCount,
+                                  int nOldInternal, const int* __restrict__ tempDepth, int want,
+                                  uint32_t* __restrict__ keys, int* __restrict__ vals) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= nOldInternal + want) return;
+    if (i < nOldInternal) {
+        const int beg = minSlot[i];
+        int lo = 0, hi = cutCount;
+        while (lo < hi) {
+            const int mid = (lo + hi) / 2;
+            if (cutBeg[mid] <= beg) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        const bool dead = lo > 0 && cutEnd[lo - 1] >= beg + size[i];
+        keys[i] = dead ? 0xffffffffu
+                       : (static_cast<uint32_t>(depth[i]) << 26) | static_cast<uint32_t>(i);
+        vals[i] = i;
+    } else {
+        const int t = i - nOldInternal;
+        keys[i] = (static_cast<uint32_t>(tempDepth[t]) << 26) | static_cast<uint32_t>(i);
+        vals[i] = i;
+    }
+}
+
+__global__ void rankKernel(const int* __restrict__ sortedVals, int count,
+                           int* __restrict__ idMap) {
+    const int p = blockIdx.x * kBlock + threadIdx.x;
+    if (p < count) idMap[sortedVals[p]] = p;
+}
+
+// 三处重映射。旧节点的孩子有三种：另一个活着的旧内部节点（idMap）、旧叶子
+// （节点 id = nOld-1+slot，新 id = nNew-1+slotPrefix[slot]）、以及被整块替换掉的
+// 切分根（换成重建森林的根 idMap[nOldInternal + r]）。临时节点的孩子只有两种：
+// 临时内部（idMap）和负号叶子引用 -(slot+1)。
+__global__ void relayoutKernel(const int* __restrict__ sortedVals, int internalCount,
+                               const GpuBVHNode* __restrict__ oldNodes,
+                               const int* __restrict__ oldDepth, int nOldInternal,
+                               const int* __restrict__ minSlot, const int* __restrict__ size,
+                               const int* __restrict__ cutBeg, const int* __restrict__ cutEnd,
+                               const int* __restrict__ slotPrefix,
+                               const GpuBVHNode* __restrict__ tempNodes,
+                               const int* __restrict__ tempDepth, const int* __restrict__ idMap,
+                               int nNew, GpuBVHNode* __restrict__ newNodes,
+                               int* __restrict__ newParent, int* __restrict__ newDepth,
+                               int cutCount) {
+    const int p = blockIdx.x * kBlock + threadIdx.x;
+    if (p >= internalCount) return;
+    const int src = sortedVals[p];
+    GpuBVHNode out;
+    int l = 0, r = 0, d = 0;
+    if (src < nOldInternal) {
+        out = oldNodes[src];
+        auto remapOld = [&](int c) {
+            if (c < 0) return nNew - 1 + slotPrefix[-c - 1];  // 旧式负号叶子引用
+            if (c >= nOldInternal) {  // 叶子节点 id：旧槽经槽序前缀换成新槽
+                return nNew - 1 + slotPrefix[c - nOldInternal];
+            }
+            // 内部节点：活着就换名，死掉的话它必然是某个切分根，换成森林的根。
+            const int beg = minSlot[c];
+            int lo = 0, hi = cutCount;
+            while (lo < hi) {
+                const int mid = (lo + hi) / 2;
+                if (cutBeg[mid] <= beg) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            const bool dead = lo > 0 && cutEnd[lo - 1] >= beg + size[c];
+            return dead ? idMap[nOldInternal + lo - 1] : idMap[c];
+        };
+        l = remapOld(out.left);
+        r = remapOld(out.right);
+        d = oldDepth[src];
+    } else {
+        const int t = src - nOldInternal;
+        out = tempNodes[t];
+        l = out.left >= 0 ? idMap[nOldInternal + out.left] : nNew - 2 - out.left;
+        r = out.right >= 0 ? idMap[nOldInternal + out.right] : nNew - 2 - out.right;
+        d = tempDepth[t];
+    }
+    out.left = l;
+    out.right = r;
+    newNodes[p] = out;
+    newParent[l] = p;
+    newParent[r] = p;
+    newDepth[p] = d;
+}
+
+template <typename Ops>
+__global__ void emitLeafKernel(const typename Ops::Item* __restrict__ newTris, int nNew,
+                               GpuBVHNode* __restrict__ newNodes,
+                               const int* __restrict__ newParent, int* __restrict__ newDepth) {
+    const int j = blockIdx.x * kBlock + threadIdx.x;
+    if (j >= nNew) return;
+    GpuBVHNode& leaf = newNodes[nNew - 1 + j];
+    setNodeBox(leaf, Ops::bounds(newTris[j]));
+    leaf.left = -(j + 1);
+    leaf.right = 1;
+    newDepth[nNew - 1 + j] = newDepth[newParent[nNew - 1 + j]] + 1;
 }
 
 }  // namespace
@@ -1132,6 +1564,183 @@ void finalizeTree(GpuBVH& bvh, int n, GpuBVHNode* nodes, const typename Ops::Ite
     if (boxMs) *boxMs = clock.ms(1, 2);
 }
 
+// SAH 层流水线的工作区。层间只换缓冲区、不重新分配；构建与增量更新用同一份。
+struct SahWorkspace {
+    DevBuf<int> orderA, orderB;
+    DevBuf<int> slotA, slotB;
+    DevBuf<int> beginA, endA, nodeA;
+    DevBuf<int> beginB, endB, nodeB;
+    DevBuf<int> depthA, depthB;  // 每个任务的局部深度（只有森林模式用）
+    DevBuf<int> splitInfo, leftCount, childInt, childBase, subtree;
+    DevBuf<int> leftFlag, leftPrefix;
+    DevBuf<uint32_t> cenLo, cenHi;
+    DevBuf<int> binId, chunkTask, chunkBegin, chunkEnd;
+    DevBuf<uint32_t> bins;
+    DevBuf<int> counters, errors;
+    std::size_t scanBytes = 0;
+    DevBuf<unsigned char> scanTemp;
+
+    explicit SahWorkspace(int n)
+        : orderA(n), orderB(n), slotA(n), slotB(n), beginA(n), endA(n), nodeA(n), beginB(n),
+          endB(n), nodeB(n), depthA(n), depthB(n), splitInfo(n), leftCount(n), childInt(n),
+          childBase(n), subtree(n), leftFlag(n), leftPrefix(n),
+          cenLo(static_cast<size_t>(n) * 3), cenHi(static_cast<size_t>(n) * 3), binId(n),
+          chunkTask(n / 32 + 16), chunkBegin(n / 32 + 16), chunkEnd(n / 32 + 16),
+          bins(static_cast<size_t>(n / (kSahMedian + 1) + 2) * kSahBinWords), counters(2),
+          errors(1) {
+        std::size_t childBytes = 0;
+        std::size_t leftBytes = 0;
+        cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, childBytes, childInt.p, childBase.p, n),
+               "child scan(probe)");
+        cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, leftBytes, leftFlag.p, leftPrefix.p, n),
+               "left scan(probe)");
+        scanBytes = std::max(childBytes, leftBytes);
+        scanTemp = DevBuf<unsigned char>(scanBytes > 0 ? scanBytes : 1);
+    }
+};
+
+struct SahLevelTimings {
+    double bin = 0.0;
+    double split = 0.0;
+    double part = 0.0;
+};
+
+// 层流水线本体：把一批已种好的任务（区间 + 目标节点 + 局部深度）自顶向下建完。
+// 整棵构建是一个任务、根节点 0、叶子 n-1+slot；拓扑更新是 K 个任务、临时区节点
+// 0..K-1、叶子写成 -(slot+1)。两者的记账规则相同：最终用掉的内部节点数必须正好
+// 等于 want，否则说明某个任务的区间被算漏了。
+template <typename Ops>
+int* sahBuildForest(const typename Ops::Item* dItems, int n, int leafBase, const int* posSlot,
+                    int internalBase0, int taskCount, SahWorkspace& ws, GpuBVHNode* nodes,
+                    int* parent, int want, int* depthOut, SahLevelTimings* lt) {
+    int* order = ws.orderA.p;
+    int* orderOther = ws.orderB.p;
+    int* slot = ws.slotA.p;
+    int* slotOther = ws.slotB.p;
+    int* begin = ws.beginA.p;
+    int* beginOther = ws.beginB.p;
+    int* end = ws.endA.p;
+    int* endOther = ws.endB.p;
+    int* nodeId = ws.nodeA.p;
+    int* nodeIdOther = ws.nodeB.p;
+    int* taskDepth = depthOut ? ws.depthA.p : nullptr;
+    int* taskDepthOther = depthOut ? ws.depthB.p : nullptr;
+
+    int internalBase = internalBase0;
+    int level = 0;
+    double binMs = 0.0, splitMs = 0.0, partMs = 0.0;
+    QuadClock qc;
+
+    while (taskCount > 0) {
+        if (++level >= kDepthBins) throw std::runtime_error("buildSAH: depth limit");
+        cudaOk(cudaMemset(ws.counters.p, 0, 2 * sizeof(int)), "counters");
+        sahPrepKernel<<<blocksFor(taskCount), kBlock>>>(
+            taskCount, begin, end, ws.binId.p, ws.chunkTask.p, ws.chunkBegin.p, ws.chunkEnd.p,
+            ws.cenLo.p, ws.cenHi.p, ws.counters.p, ws.counters.p + 1);
+        cudaOk(cudaGetLastError(), "sah prep");
+        int hBin = 0, hChunk = 0;
+        cudaOk(cudaMemcpy(&hBin, ws.counters.p, sizeof(int), cudaMemcpyDeviceToHost), "bin count");
+        cudaOk(cudaMemcpy(&hChunk, ws.counters.p + 1, sizeof(int), cudaMemcpyDeviceToHost),
+               "chunk count");
+        if (hBin == 0) break;  // 全部区间都 <= kSahMedian，交给串行收尾
+
+        qc.mark(0);
+        sahClearBinsKernel<<<blocksFor(hBin * kSahBinWords), kBlock>>>(ws.bins.p,
+                                                                      hBin * kSahBinWords);
+        sahCenBoundsKernel<Ops><<<hChunk, kBlock>>>(dItems, order, ws.chunkTask.p,
+                                                    ws.chunkBegin.p, ws.chunkEnd.p, hChunk,
+                                                    ws.cenLo.p, ws.cenHi.p);
+        sahBinKernel<Ops><<<hChunk, kBlock>>>(dItems, order, ws.chunkTask.p, ws.chunkBegin.p,
+                                              ws.chunkEnd.p, hChunk, ws.binId.p, ws.cenLo.p,
+                                              ws.cenHi.p, ws.bins.p);
+        cudaOk(cudaGetLastError(), "sah bins");
+        qc.mark(1);
+
+        sahSplitKernel<<<blocksFor(taskCount), kBlock>>>(taskCount, begin, end, ws.binId.p,
+                                                         ws.cenLo.p, ws.cenHi.p, ws.bins.p,
+                                                         ws.splitInfo.p, ws.leftCount.p,
+                                                         ws.childInt.p);
+        cudaOk(cudaGetLastError(), "sah split");
+        cudaOk(cub::DeviceScan::ExclusiveSum(ws.scanTemp.p, ws.scanBytes, ws.childInt.p,
+                                             ws.childBase.p, taskCount),
+               "child scan");
+        sahSideKernel<Ops><<<blocksFor(n), kBlock>>>(dItems, order, slot, ws.splitInfo.p,
+                                                     ws.leftCount.p, begin, ws.cenLo.p, ws.cenHi.p,
+                                                     n, ws.leftFlag.p);
+        cudaOk(cudaGetLastError(), "sah side");
+        cudaOk(cub::DeviceScan::ExclusiveSum(ws.scanTemp.p, ws.scanBytes, ws.leftFlag.p,
+                                             ws.leftPrefix.p, n),
+               "left scan");
+        qc.mark(2);
+
+        sahScatterKernel<<<blocksFor(n), kBlock>>>(order, slot, ws.leftFlag.p, ws.leftCount.p,
+                                                   begin, end, ws.childBase.p, ws.leftPrefix.p, n,
+                                                   orderOther, slotOther);
+        sahAssignKernel<<<blocksFor(taskCount), kBlock>>>(
+            taskCount, begin, end, nodeId, ws.leftCount.p, ws.childBase.p, internalBase, leafBase,
+            posSlot, nodes, parent, beginOther, endOther, nodeIdOther, taskDepth, taskDepthOther,
+            depthOut);
+        cudaOk(cudaGetLastError(), "sah partition");
+        qc.mark(3);
+        cudaOk(cudaEventSynchronize(qc.ev[3]), "sah level");
+        binMs += qc.ms(0, 1);
+        splitMs += qc.ms(1, 2);
+        partMs += qc.ms(2, 3);
+
+        int lastBase = 0, lastInt = 0;
+        cudaOk(cudaMemcpy(&lastBase, ws.childBase.p + (taskCount - 1), sizeof(int),
+                          cudaMemcpyDeviceToHost),
+               "child base");
+        cudaOk(cudaMemcpy(&lastInt, ws.childInt.p + (taskCount - 1), sizeof(int),
+                          cudaMemcpyDeviceToHost),
+               "child int");
+        const int total = lastBase + lastInt;
+
+        std::swap(order, orderOther);
+        std::swap(slot, slotOther);
+        std::swap(begin, beginOther);
+        std::swap(end, endOther);
+        std::swap(nodeId, nodeIdOther);
+        std::swap(taskDepth, taskDepthOther);
+        taskCount = total;
+        internalBase += total;
+    }
+
+    if (taskCount > 0) {  // 收尾：每个小区间串行建平衡子树
+        sahSubtreeSizeKernel<<<blocksFor(taskCount), kBlock>>>(taskCount, begin, end, ws.subtree.p);
+        cudaOk(cub::DeviceScan::ExclusiveSum(ws.scanTemp.p, ws.scanBytes, ws.subtree.p,
+                                             ws.childBase.p, taskCount),
+               "subtree scan");
+        cudaOk(cudaMemset(ws.errors.p, 0, sizeof(int)), "errors");
+        sahSerialBuildKernel<<<blocksFor(taskCount), kBlock>>>(
+            taskCount, begin, end, nodeId, ws.childBase.p, internalBase, leafBase, posSlot, nodes,
+            parent, taskDepth, depthOut, ws.errors.p);
+        cudaOk(cudaGetLastError(), "sah serial");
+
+        int lastBase = 0, lastSize = 0, hErr = 0;
+        cudaOk(cudaMemcpy(&lastBase, ws.childBase.p + (taskCount - 1), sizeof(int),
+                          cudaMemcpyDeviceToHost),
+               "subtree base");
+        cudaOk(cudaMemcpy(&lastSize, ws.subtree.p + (taskCount - 1), sizeof(int),
+                          cudaMemcpyDeviceToHost),
+               "subtree size");
+        cudaOk(cudaMemcpy(&hErr, ws.errors.p, sizeof(int), cudaMemcpyDeviceToHost), "serial err");
+        if (hErr) throw std::runtime_error("buildSAH: serial subtree failed");
+        if (internalBase + lastBase + lastSize != want) {
+            throw std::runtime_error("buildSAH: internal node accounting mismatch");
+        }
+    } else if (internalBase != want) {
+        throw std::runtime_error("buildSAH: internal node accounting mismatch");
+    }
+
+    if (lt) {
+        lt->bin = binMs;
+        lt->split = splitMs;
+        lt->part = partMs;
+    }
+    return order;  // 层间会换缓冲区，最终顺序不一定在最初那张数组里
+}
+
 template <typename Ops>
 GpuBVH buildLBVH(const typename Ops::Item* hostItems, int n, GpuBuildTimings* timings) {
     using Item = typename Ops::Item;
@@ -1249,157 +1858,23 @@ GpuBVH buildSAH(const typename Ops::Item* hostItems, int n, GpuBuildTimings* tim
                           cudaMemcpyHostToDevice),
                "H2D prims");
 
-        DevBuf<int> dOrderA(n), dOrderB(n);
-        DevBuf<int> dSlotA(n), dSlotB(n);
-        DevBuf<int> dBeginA(n), dEndA(n), dNodeA(n);
-        DevBuf<int> dBeginB(n), dEndB(n), dNodeB(n);
-        DevBuf<int> dSplitInfo(n), dLeftCount(n), dChildInt(n), dChildBase(n), dSubtree(n);
-        DevBuf<int> dLeftFlag(n), dLeftPrefix(n);
-        DevBuf<uint32_t> dCenLo(static_cast<size_t>(n) * 3), dCenHi(static_cast<size_t>(n) * 3);
-        DevBuf<int> dBinId(n);
-        const int maxChunks = n / 32 + 16;
-        DevBuf<int> dChunkTask(maxChunks), dChunkBegin(maxChunks), dChunkEnd(maxChunks);
-        const int maxLarge = n / (kSahMedian + 1) + 2;
-        DevBuf<uint32_t> dBins(static_cast<size_t>(maxLarge) * kSahBinWords);
-        DevBuf<int> dCounters(2);
+        SahWorkspace ws(n);
         DevBuf<int> dParent(nodeCount);
         DevBuf<int> dDepth(nodeCount);
         DevBuf<int> dMaxDepth(1);
-        DevBuf<int> dErrors(1);
-
-        std::size_t childScanBytes = 0;
-        std::size_t leftScanBytes = 0;
-        cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, childScanBytes, dChildInt.p, dChildBase.p, n),
-               "child scan(probe)");
-        cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, leftScanBytes, dLeftFlag.p, dLeftPrefix.p, n),
-               "left scan(probe)");
-        std::size_t scanBytes = std::max(childScanBytes, leftScanBytes);
-        DevBuf<unsigned char> dScanTemp(scanBytes > 0 ? scanBytes : 1);
 
         StageClock clock;
-        QuadClock qc;
         clock.mark();  // 0
 
         cudaOk(cudaMemset(dParent.p, 0xff, static_cast<size_t>(nodeCount) * sizeof(int)), "parent");
-        sahInitKernel<<<blocksFor(n), kBlock>>>(n, dOrderA.p, dSlotA.p, dBeginA.p, dEndA.p,
-                                                dNodeA.p);
+        sahInitKernel<<<blocksFor(n), kBlock>>>(n, ws.orderA.p, ws.slotA.p, ws.beginA.p,
+                                                ws.endA.p, ws.nodeA.p);
         cudaOk(cudaGetLastError(), "sah init");
 
-        int* order = dOrderA.p;
-        int* orderOther = dOrderB.p;
-        int* slot = dSlotA.p;
-        int* slotOther = dSlotB.p;
-        int* begin = dBeginA.p;
-        int* beginOther = dBeginB.p;
-        int* end = dEndA.p;
-        int* endOther = dEndB.p;
-        int* nodeId = dNodeA.p;
-        int* nodeIdOther = dNodeB.p;
-
-        int taskCount = 1;
-        int internalBase = 1;  // 根节点 0 已经分配
-        double binMs = 0.0, splitMs = 0.0, partMs = 0.0;
-
-        int level = 0;
-        while (taskCount > 0) {
-            if (++level >= kDepthBins) throw std::runtime_error("buildSAH: depth limit");
-            cudaOk(cudaMemset(dCounters.p, 0, 2 * sizeof(int)), "counters");
-            sahPrepKernel<<<blocksFor(taskCount), kBlock>>>(
-                taskCount, begin, end, dBinId.p, dChunkTask.p, dChunkBegin.p, dChunkEnd.p,
-                dCenLo.p, dCenHi.p, dCounters.p, dCounters.p + 1);
-            cudaOk(cudaGetLastError(), "sah prep");
-            int hBin = 0, hChunk = 0;
-            cudaOk(cudaMemcpy(&hBin, dCounters.p, sizeof(int), cudaMemcpyDeviceToHost), "bin count");
-            cudaOk(cudaMemcpy(&hChunk, dCounters.p + 1, sizeof(int), cudaMemcpyDeviceToHost),
-                   "chunk count");
-            if (hBin == 0) break;  // 全部区间都 <= kSahMedian，交给串行收尾
-
-            qc.mark(0);
-            sahClearBinsKernel<<<blocksFor(hBin * kSahBinWords), kBlock>>>(dBins.p,
-                                                                           hBin * kSahBinWords);
-            sahCenBoundsKernel<Ops><<<hChunk, kBlock>>>(dSrc.p, order, dChunkTask.p, dChunkBegin.p,
-                                                        dChunkEnd.p, hChunk, dCenLo.p, dCenHi.p);
-            sahBinKernel<Ops><<<hChunk, kBlock>>>(dSrc.p, order, dChunkTask.p, dChunkBegin.p,
-                                                  dChunkEnd.p, hChunk, dBinId.p, dCenLo.p,
-                                                  dCenHi.p, dBins.p);
-            cudaOk(cudaGetLastError(), "sah bins");
-            qc.mark(1);
-
-            sahSplitKernel<<<blocksFor(taskCount), kBlock>>>(taskCount, begin, end, dBinId.p,
-                                                             dCenLo.p, dCenHi.p, dBins.p,
-                                                             dSplitInfo.p, dLeftCount.p,
-                                                             dChildInt.p);
-            cudaOk(cudaGetLastError(), "sah split");
-            cudaOk(cub::DeviceScan::ExclusiveSum(dScanTemp.p, scanBytes, dChildInt.p, dChildBase.p,
-                                                 taskCount),
-                   "child scan");
-            sahSideKernel<Ops><<<blocksFor(n), kBlock>>>(dSrc.p, order, slot, dSplitInfo.p,
-                                                         dLeftCount.p, begin, dCenLo.p, dCenHi.p,
-                                                         n, dLeftFlag.p);
-            cudaOk(cudaGetLastError(), "sah side");
-            cudaOk(cub::DeviceScan::ExclusiveSum(dScanTemp.p, scanBytes, dLeftFlag.p,
-                                                 dLeftPrefix.p, n),
-                   "left scan");
-            qc.mark(2);
-
-            sahScatterKernel<<<blocksFor(n), kBlock>>>(order, slot, dLeftFlag.p, dLeftCount.p,
-                                                       begin, end, dChildBase.p, dLeftPrefix.p, n,
-                                                       orderOther, slotOther);
-            sahAssignKernel<<<blocksFor(taskCount), kBlock>>>(
-                taskCount, begin, end, nodeId, dLeftCount.p, dChildBase.p, internalBase, n, nodes,
-                dParent.p, beginOther, endOther, nodeIdOther);
-            cudaOk(cudaGetLastError(), "sah partition");
-            qc.mark(3);
-            cudaOk(cudaEventSynchronize(qc.ev[3]), "sah level");
-            binMs += qc.ms(0, 1);
-            splitMs += qc.ms(1, 2);
-            partMs += qc.ms(2, 3);
-
-            int lastBase = 0, lastInt = 0;
-            cudaOk(cudaMemcpy(&lastBase, dChildBase.p + (taskCount - 1), sizeof(int),
-                              cudaMemcpyDeviceToHost),
-                   "child base");
-            cudaOk(cudaMemcpy(&lastInt, dChildInt.p + (taskCount - 1), sizeof(int),
-                              cudaMemcpyDeviceToHost),
-                   "child int");
-            const int total = lastBase + lastInt;
-
-            std::swap(order, orderOther);
-            std::swap(slot, slotOther);
-            std::swap(begin, beginOther);
-            std::swap(end, endOther);
-            std::swap(nodeId, nodeIdOther);
-            taskCount = total;
-            internalBase += total;
-        }
-
-        if (taskCount > 0) {  // 收尾：每个小区间串行建平衡子树
-            sahSubtreeSizeKernel<<<blocksFor(taskCount), kBlock>>>(taskCount, begin, end,
-                                                                   dSubtree.p);
-            cudaOk(cub::DeviceScan::ExclusiveSum(dScanTemp.p, scanBytes, dSubtree.p,
-                                                 dChildBase.p, taskCount),
-                   "subtree scan");
-            cudaOk(cudaMemset(dErrors.p, 0, sizeof(int)), "errors");
-            sahSerialBuildKernel<<<blocksFor(taskCount), kBlock>>>(
-                taskCount, begin, end, nodeId, dChildBase.p, internalBase, n, nodes, dParent.p,
-                dErrors.p);
-            cudaOk(cudaGetLastError(), "sah serial");
-
-            int lastBase = 0, lastSize = 0, hErr = 0;
-            cudaOk(cudaMemcpy(&lastBase, dChildBase.p + (taskCount - 1), sizeof(int),
-                              cudaMemcpyDeviceToHost),
-                   "subtree base");
-            cudaOk(cudaMemcpy(&lastSize, dSubtree.p + (taskCount - 1), sizeof(int),
-                              cudaMemcpyDeviceToHost),
-                   "subtree size");
-            cudaOk(cudaMemcpy(&hErr, dErrors.p, sizeof(int), cudaMemcpyDeviceToHost), "serial err");
-            if (hErr) throw std::runtime_error("buildSAH: serial subtree failed");
-            if (internalBase + lastBase + lastSize != internalCount) {
-                throw std::runtime_error("buildSAH: internal node accounting mismatch");
-            }
-        } else if (internalBase != internalCount) {
-            throw std::runtime_error("buildSAH: internal node accounting mismatch");
-        }
+        SahLevelTimings lt;
+        const int* finalOrder = sahBuildForest<Ops>(dSrc.p, n, n - 1, nullptr, 1, 1, ws, nodes,
+                                                    dParent.p, internalCount, nullptr, &lt);
+        const double binMs = lt.bin, splitMs = lt.split, partMs = lt.part;
         clock.mark();  // 1: 拓扑完成
 
         cudaOk(cudaMemset(dMaxDepth.p, 0, sizeof(int)), "maxDepth");
@@ -1407,7 +1882,8 @@ GpuBVH buildSAH(const typename Ops::Item* hostItems, int n, GpuBuildTimings* tim
         cudaOk(cudaMemcpy(&bvh.depth, dMaxDepth.p, sizeof(int), cudaMemcpyDeviceToHost), "depth");
         clock.mark();  // 2
 
-        scatterTrisKernel<Ops><<<blocksFor(n), kBlock>>>(dSrc.p, order, n, sortedTris, primIds);
+        scatterTrisKernel<Ops><<<blocksFor(n), kBlock>>>(dSrc.p, finalOrder, n, sortedTris,
+                                                         primIds);
         cudaOk(cudaGetLastError(), "scatter tris");
         clock.mark();  // 3
 
@@ -1810,6 +2286,7 @@ double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
 template <typename Ops>
 static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>& items,
                              const GpuTopoEdit& edit, GpuTopoUpdateTimings* timings) {
+    using Item = typename Ops::Item;
     const int nOld = bvh.primCount;
     if (bvh.d_nodes == nullptr || nOld < 2) throw std::invalid_argument("updateBVHGPU: BVH not built");
     if (edit.appended < 0) throw std::invalid_argument("updateBVHGPU: appended must be >= 0");
@@ -1848,32 +2325,399 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
         return t->totalMs;
     }
 
-    // 局部重建（切分 → 森林 SAH → 重编号）还没接上；这一版先把编辑脚本、非法输入
-    // 检查与回退语义定下来：整棵按同一套建树器重建，接口与 timings 不变。
     const bool wide = bvh.d_wideNodes != nullptr;
     const bool sah = bvh.sah;
+    const int nNewI = static_cast<int>(nNew);
+    const int delCount = static_cast<int>(edit.deleted.size());
+    const int nSurv = nOld - delCount;
+
+    // 回退：整棵按同一套建树器重建。拓扑缓存的形状全变了，没有可复用的部分。
+    auto rebuildAll = [&]() -> double {
+        StageClock clock;
+        clock.mark();  // 0
+        destroyBVHGPU(bvh);
+        GpuBuildTimings bt;
+        bvh = sah ? buildSAH<Ops>(items.data(), nNewI, &bt) : buildLBVH<Ops>(items.data(), nNewI, &bt);
+        clock.mark();  // 1
+        double wideMs = 0.0;
+        if (wide) {
+            wideMs = buildWideNodesGPU(bvh);
+            clock.mark();  // 2
+        }
+        cudaOk(cudaEventSynchronize(clock.ev[clock.marks - 1]), "topo sync");
+
+        t->surgeryRoots = 1;
+        t->rebuiltLeaves = nNewI;
+        t->newDepth = bvh.depth;
+        t->fullRebuild = true;
+        t->wideMs = wideMs;
+        t->totalMs = clock.ms(0, clock.marks - 1);
+        t->surgeryMs = t->totalMs - wideMs;
+        return t->totalMs;
+    };
+
+    if (bvh.d_parent == nullptr || bvh.d_depth == nullptr || bvh.d_refitOrder == nullptr) {
+        return rebuildAll();
+    }
+    // 改动过半：局部重建的规划成本（一趟全树统计 + 一趟重编号）已经接近重建，
+    // 而且最后大概率也要超过下面的重建叶子上限。
+    if (delCount + edit.appended > nOld / 2) return rebuildAll();
+
+    const int nodeCount = bvh.nodeCount;
+    const int internalOld = nOld - 1;
+    const auto* oldNodes = static_cast<const GpuBVHNode*>(bvh.d_nodes);
+    const auto* oldTris = static_cast<const Item*>(bvh.d_tris);
+    const int* oldParent = static_cast<const int*>(bvh.d_parent);
+    const int* oldDepth = static_cast<const int*>(bvh.d_depth);
+    const int* oldPrimIds = static_cast<const int*>(bvh.d_primIds);
+    const int* refitOrder = static_cast<const int*>(bvh.d_refitOrder);
+    int* mark = static_cast<int*>(bvh.d_mark);
+    const int binsOld = static_cast<int>(bvh.refitOffsets.size()) - 1;
 
     StageClock clock;
-    clock.mark();                                // 0
-    destroyBVHGPU(bvh);
-    GpuBuildTimings bt;
-    bvh = sah ? buildSAH<Ops>(items.data(), static_cast<int>(nNew), &bt)
-              : buildLBVH<Ops>(items.data(), static_cast<int>(nNew), &bt);
-    clock.mark();                                // 1
+    clock.mark();  // 0
+
+    // ---- A 规划：子树大小 / 区间起点 / 删除前缀和 ----
+    DevBuf<int> dSize(nodeCount), dMinSlot(nodeCount);
+    subtreeInitKernel<<<blocksFor(nodeCount), kBlock>>>(dSize.p, dMinSlot.p, nOld, nodeCount);
+    for (int d = binsOld - 1; d >= 0; --d) {
+        const int count = bvh.refitOffsets[d + 1] - bvh.refitOffsets[d];
+        if (count == 0) continue;
+        subtreeMergeKernel<<<blocksFor(count), kBlock>>>(oldNodes, dSize.p, dMinSlot.p,
+                                                         refitOrder + bvh.refitOffsets[d], count);
+    }
+    cudaOk(cudaGetLastError(), "topo subtree stats");
+
+    DevBuf<int> dKeptFlag(nOld + 1), dKeptPrefix(nOld + 1);
+    keptFlagsInitKernel<<<blocksFor(nOld + 1), kBlock>>>(nOld, dKeptFlag.p);
+    DevBuf<int> dDeleted(delCount > 0 ? delCount : 1);
+    if (delCount > 0) {
+        cudaOk(cudaMemcpy(dDeleted.p, edit.deleted.data(), static_cast<size_t>(delCount) * sizeof(int),
+                          cudaMemcpyHostToDevice),
+               "deleted H2D");
+        clearKeptFlagsKernel<<<blocksFor(delCount), kBlock>>>(dDeleted.p, delCount, dKeptFlag.p);
+    }
+    cudaOk(cudaGetLastError(), "topo kept flags");
+    std::size_t scanBytes = 0;
+    cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, dKeptFlag.p, dKeptPrefix.p, nOld + 1),
+           "kept scan(probe)");
+    DevBuf<unsigned char> dScan(scanBytes > 0 ? scanBytes : 1);
+    cudaOk(cub::DeviceScan::ExclusiveSum(dScan.p, scanBytes, dKeptFlag.p, dKeptPrefix.p, nOld + 1),
+           "kept scan");
+
+    // 第二张前缀和：同一批删改在"叶子槽"顺序下的版本。子树区间是槽序的，删除表
+    // 是场景序的，切分选择与重建区间里的幸存者计数都要用槽序这一份。
+    DevBuf<int> dSlotFlag(nOld + 1), dSlotPrefix(nOld + 1);
+    slotKeptFlagsKernel<<<blocksFor(nOld), kBlock>>>(oldPrimIds, dKeptPrefix.p, nOld, dSlotFlag.p);
+    cudaOk(cudaMemset(dSlotFlag.p + nOld, 0, sizeof(int)), "slot flag tail");
+    cudaOk(cudaGetLastError(), "slot flags");
+    cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, dSlotFlag.p, dSlotPrefix.p, nOld + 1),
+           "slot scan(probe)");
+    DevBuf<unsigned char> dScan1b(scanBytes > 0 ? scanBytes : 1);
+    cudaOk(cub::DeviceScan::ExclusiveSum(dScan1b.p, scanBytes, dSlotFlag.p, dSlotPrefix.p,
+                                         nOld + 1),
+           "slot scan");
+
+    // ---- 切分选择：每个删除点爬到一个够大的祖先，去重、排序、压掉被包含的候选 ----
+    const int cabMax = delCount + (edit.appended > 0 ? 1 : 0);
+    const int budget = std::max(64, nNewI / 8);
+    int minSize = budget / std::max(1, delCount);
+    minSize = std::max(64, std::min(4096, minSize));
+
+    DevBuf<int> dCand(cabMax), dCandFlag(cabMax + 1), dCandOff(cabMax + 1);
+    DevBuf<int> dPrimSlot(nOld);
+    invertPermKernel<<<blocksFor(nOld), kBlock>>>(oldPrimIds, nOld, dPrimSlot.p);
+    cudaOk(cudaGetLastError(), "invert perm");
+    ++bvh.refitEpoch;
+    climbKernel<<<blocksFor(cabMax), kBlock>>>(dDeleted.p, dPrimSlot.p, delCount, nOld - 1,
+                                               edit.appended, oldParent, dSize.p, dMinSlot.p,
+                                               dSlotPrefix.p, nOld, minSize, mark, bvh.refitEpoch,
+                                               dCand.p, dCandFlag.p);
+    cudaOk(cudaGetLastError(), "topo climb");
+    cudaOk(cudaMemset(dCandFlag.p + cabMax, 0, sizeof(int)), "cand tail");
+    cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, dCandFlag.p, dCandOff.p, cabMax + 1),
+           "cand scan(probe)");
+    DevBuf<unsigned char> dScan2(scanBytes > 0 ? scanBytes : 1);
+    cudaOk(cub::DeviceScan::ExclusiveSum(dScan2.p, scanBytes, dCandFlag.p, dCandOff.p, cabMax + 1),
+           "cand scan");
+    DevBuf<int> dCandIds(cabMax);
+    compactKernel<<<blocksFor(cabMax), kBlock>>>(dCand.p, dCandFlag.p, dCandOff.p, cabMax,
+                                                 dCandIds.p);
+    cudaOk(cudaGetLastError(), "topo compact");
+    int candCount = 0;
+    cudaOk(cudaMemcpy(&candCount, dCandOff.p + cabMax, sizeof(int), cudaMemcpyDeviceToHost),
+           "cand count D2H");
+
+    DevBuf<uint64_t> dCandKey(candCount), dCandKeySorted(candCount);
+    DevBuf<int> dCandVal(candCount), dCandValSorted(candCount);
+    candKeyKernel<<<blocksFor(candCount), kBlock>>>(dCandIds.p, candCount, dMinSlot.p, dSize.p,
+                                                    dCandKey.p, dCandVal.p);
+    cudaOk(cudaGetLastError(), "cand keys");
+    std::size_t sortBytes = 0;
+    cudaOk(cub::DeviceRadixSort::SortPairs(nullptr, sortBytes, dCandKey.p, dCandKeySorted.p,
+                                           dCandVal.p, dCandValSorted.p, candCount),
+           "cand sort(probe)");
+    DevBuf<unsigned char> dSortTemp(sortBytes > 0 ? sortBytes : 1);
+    cudaOk(cub::DeviceRadixSort::SortPairs(dSortTemp.p, sortBytes, dCandKey.p, dCandKeySorted.p,
+                                           dCandVal.p, dCandValSorted.p, candCount),
+           "cand sort");
+
+    // 压掉被祖先包住的候选：候选之间的包含关系就是祖先关系，所以一张"被包含"表
+    // 加一趟爬链就够了，不需要再做一次前缀最大值扫描（cub 的 DeviceScan 只有求和）。
+    DevBuf<int> dDomMark(nodeCount), dKeep(candCount + 1), dKeepOff(candCount + 1);
+    cudaOk(cudaMemset(dDomMark.p, 0, static_cast<size_t>(nodeCount) * sizeof(int)), "dom clear");
+    markDominatedKernel<<<blocksFor(candCount), kBlock>>>(dCandValSorted.p, candCount, oldParent,
+                                                          mark, bvh.refitEpoch, dDomMark.p);
+    cudaOk(cudaGetLastError(), "cand dominance");
+    keepFromDomKernel<<<blocksFor(candCount), kBlock>>>(dCandValSorted.p, candCount, dDomMark.p,
+                                                        dKeep.p);
+    cudaOk(cudaGetLastError(), "cand keep");
+    cudaOk(cudaMemset(dKeep.p + candCount, 0, sizeof(int)), "keep tail");
+    cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, dKeep.p, dKeepOff.p, candCount + 1),
+           "keep scan(probe)");
+    DevBuf<unsigned char> dScan4(scanBytes > 0 ? scanBytes : 1);
+    cudaOk(cub::DeviceScan::ExclusiveSum(dScan4.p, scanBytes, dKeep.p, dKeepOff.p, candCount + 1),
+           "keep scan");
+    int cutCount = 0;
+    cudaOk(cudaMemcpy(&cutCount, dKeepOff.p + candCount, sizeof(int), cudaMemcpyDeviceToHost),
+           "cut count D2H");
+    if (cutCount <= 0 || cutCount > 8192) return rebuildAll();
+
+    DevBuf<int> dCutMeta(static_cast<size_t>(cutCount) * kCutFields);
+    cutMetaKernel<<<blocksFor(candCount), kBlock>>>(dCandValSorted.p, dKeep.p, dKeepOff.p,
+                                                    candCount, dMinSlot.p, dSize.p, oldDepth,
+                                                    dSlotPrefix.p, nOld, edit.appended,
+                                                    dCutMeta.p);
+    cudaOk(cudaGetLastError(), "topo cut meta");
+    std::vector<int> cuts(static_cast<size_t>(cutCount) * kCutFields);
+    cudaOk(cudaMemcpy(cuts.data(), dCutMeta.p, cuts.size() * sizeof(int), cudaMemcpyDeviceToHost),
+           "cut meta D2H");
+    clock.mark();  // 1
+
+    std::vector<int> dCutBeg(cutCount), dCutEnd(cutCount);
+    std::vector<int> compactBeg(cutCount), seedBegin(cutCount), seedEnd(cutCount);
+    std::vector<int> seedNode(cutCount), seedDepth(cutCount);
+    long long sumOld = 0, sumNew = 0;
+    int compactLen = 0;
+    for (int r = 0; r < cutCount; ++r) {
+        const int* c = cuts.data() + static_cast<size_t>(r) * kCutFields;
+        dCutBeg[static_cast<size_t>(r)] = c[0];
+        dCutEnd[static_cast<size_t>(r)] = c[1];
+        compactBeg[static_cast<size_t>(r)] = compactLen;
+        seedBegin[static_cast<size_t>(r)] = compactLen;      // 紧凑数组里的区间（不是叶子槽）
+        seedEnd[static_cast<size_t>(r)] = compactLen + c[2];
+        seedNode[static_cast<size_t>(r)] = r;
+        seedDepth[static_cast<size_t>(r)] = c[3];
+        sumOld += c[1] - c[0];
+        sumNew += c[2];
+        compactLen += c[2];
+    }
+    if (sumOld > nNewI / 4) return rebuildAll();
+    const int want = compactLen - cutCount;
+
+    // ---- B 暂存：幸存者按旧槽序拷贝，追加和移动直接落新槽 ----
+    // 新槽是槽序压缩下标（保持子树区间连续）；新场景下标由 primIds 单独记录。
+    DevBuf<Item> dNewTris(nNewI);
+    DevBuf<int> dNewPrimIds(nNewI);
+    gatherSurvivorsKernel<Ops><<<blocksFor(nOld), kBlock>>>(oldTris, dSlotPrefix.p, nOld,
+                                                            dNewTris.p);
+    if (edit.appended > 0) {
+        cudaOk(cudaMemcpy(dNewTris.p + nSurv, items.data() + nSurv,
+                          static_cast<size_t>(edit.appended) * sizeof(Item), cudaMemcpyHostToDevice),
+               "append H2D");
+    }
+    remapPermKernel<<<blocksFor(nOld + edit.appended), kBlock>>>(
+        oldPrimIds, dSlotPrefix.p, dKeptPrefix.p, nOld, nSurv, edit.appended, dNewPrimIds.p);
+    cudaOk(cudaGetLastError(), "topo stage");
+    if (!edit.moved.empty()) {
+        // 移动表给的是新场景下标，散写前先换成新叶子槽（primIds 一般不再是 iota）。
+        const int mvCount = static_cast<int>(edit.moved.size());
+        std::vector<int> scenes(static_cast<size_t>(mvCount));
+        std::vector<Item> moved(static_cast<size_t>(mvCount));
+        for (int i = 0; i < mvCount; ++i) {
+            scenes[static_cast<size_t>(i)] = edit.moved[static_cast<size_t>(i)];
+            moved[static_cast<size_t>(i)] =
+                items[static_cast<size_t>(edit.moved[static_cast<size_t>(i)])];
+        }
+        DevBuf<int> dScenes(mvCount), dSceneSlot(nNewI);
+        DevBuf<Item> dMoved(mvCount);
+        cudaOk(cudaMemcpy(dScenes.p, scenes.data(), static_cast<size_t>(mvCount) * sizeof(int),
+                          cudaMemcpyHostToDevice),
+               "moved scenes H2D");
+        cudaOk(cudaMemcpy(dMoved.p, moved.data(), static_cast<size_t>(mvCount) * sizeof(Item),
+                          cudaMemcpyHostToDevice),
+               "moved prims H2D");
+        invertPermKernel<<<blocksFor(nNewI), kBlock>>>(dNewPrimIds.p, nNewI, dSceneSlot.p);
+        cudaOk(cudaGetLastError(), "moved invert");
+        scatterItemsKernel<Ops><<<blocksFor(mvCount), kBlock>>>(dScenes.p, dMoved.p, mvCount,
+                                                                dNewTris.p, dSceneSlot.p);
+        cudaOk(cudaGetLastError(), "moved scatter");
+    }
+
+    // ---- C 森林 SAH：每个切分区间独立建一棵子树，节点写在临时区 ----
+    DevBuf<GpuBVHNode> dTempNodes(want);
+    DevBuf<int> dTempParent(want), dTempDepth(want);
+    internalInitKernel<<<blocksFor(want), kBlock>>>(dTempNodes.p, want);
+    cudaOk(cudaMemset(dTempParent.p, 0xff, static_cast<size_t>(want) * sizeof(int)), "temp parent");
+
+    DevBuf<int> dCompactBeg(cutCount), dSlotOf(compactLen);
+    cudaOk(cudaMemcpy(dCompactBeg.p, compactBeg.data(), static_cast<size_t>(cutCount) * sizeof(int),
+                      cudaMemcpyHostToDevice),
+           "compact beg H2D");
+    // 切分区间要在 D 之前就拿到设备副本：叶子映射与重编号都要用。
+    DevBuf<int> dCutBegDev(cutCount), dCutEndDev(cutCount);
+    cudaOk(cudaMemcpy(dCutBegDev.p, dCutBeg.data(), static_cast<size_t>(cutCount) * sizeof(int),
+                      cudaMemcpyHostToDevice),
+           "cut beg H2D");
+    cudaOk(cudaMemcpy(dCutEndDev.p, dCutEnd.data(), static_cast<size_t>(cutCount) * sizeof(int),
+                      cudaMemcpyHostToDevice),
+           "cut end H2D");
+    SahWorkspace ws(compactLen);
+    buildSlotOfKernel<<<blocksFor(nOld + edit.appended), kBlock>>>(
+        nOld, dSlotPrefix.p, dCutBegDev.p, dCutEndDev.p, cutCount, dCompactBeg.p, nSurv,
+        edit.appended, compactLen, dSlotOf.p, ws.orderA.p, ws.slotA.p);
+    cudaOk(cudaGetLastError(), "compact slots");
+
+    cudaOk(cudaMemcpy(ws.beginA.p, seedBegin.data(), static_cast<size_t>(cutCount) * sizeof(int),
+                      cudaMemcpyHostToDevice),
+           "seed begin H2D");
+    cudaOk(cudaMemcpy(ws.endA.p, seedEnd.data(), static_cast<size_t>(cutCount) * sizeof(int),
+                      cudaMemcpyHostToDevice),
+           "seed end H2D");
+    cudaOk(cudaMemcpy(ws.nodeA.p, seedNode.data(), static_cast<size_t>(cutCount) * sizeof(int),
+                      cudaMemcpyHostToDevice),
+           "seed node H2D");
+    cudaOk(cudaMemcpy(ws.depthA.p, seedDepth.data(), static_cast<size_t>(cutCount) * sizeof(int),
+                      cudaMemcpyHostToDevice),
+           "seed depth H2D");
+
+    SahLevelTimings lt;
+    sahBuildForest<Ops>(dNewTris.p, compactLen, -1, dSlotOf.p, cutCount, cutCount, ws,
+                        dTempNodes.p, dTempParent.p, want, dTempDepth.p, &lt);
+    clock.mark();  // 2
+
+    // ---- D 规范重编号：活着的旧内部 + 临时内部按 (深度, 来源序) 排名 ----
+    const int internalNew = nNewI - 1;
+    const int numSrc = internalOld + want;
+
+    DevBuf<uint32_t> dKeys(numSrc), dKeysSorted(numSrc);
+    DevBuf<int> dVals(numSrc), dValsSorted(numSrc), dIdMap(numSrc);
+    relayoutKeyKernel<<<blocksFor(numSrc), kBlock>>>(dMinSlot.p, dSize.p, oldDepth, dCutBegDev.p,
+                                                     dCutEndDev.p, cutCount, internalOld,
+                                                     dTempDepth.p, want, dKeys.p, dVals.p);
+    cudaOk(cudaGetLastError(), "relayout keys");
+    cudaOk(cub::DeviceRadixSort::SortPairs(nullptr, sortBytes, dKeys.p, dKeysSorted.p, dVals.p,
+                                           dValsSorted.p, numSrc, 26, 32),
+           "relayout sort(probe)");
+    DevBuf<unsigned char> dSortTemp2(sortBytes > 0 ? sortBytes : 1);
+    cudaOk(cub::DeviceRadixSort::SortPairs(dSortTemp2.p, sortBytes, dKeys.p, dKeysSorted.p,
+                                           dVals.p, dValsSorted.p, numSrc, 26, 32),
+           "relayout sort");
+
+    uint32_t maxKey = 0;
+    cudaOk(cudaMemcpy(&maxKey, dKeysSorted.p + (internalNew - 1), sizeof(uint32_t),
+                      cudaMemcpyDeviceToHost),
+           "max depth D2H");
+    const int maxInternalDepth = static_cast<int>(maxKey >> 26);
+    if (maxInternalDepth >= 63) return rebuildAll();  // 查询栈 64 层，不能再深了
+    const int newDepthTotal = maxInternalDepth + 1;
+
+    const int binsNew = newDepthTotal;
+    DevBuf<int> dOffsetsDev(binsNew + 1);
+    depthOffsetsPackedKernel<<<1, kDepthBins + 1>>>(dKeysSorted.p, internalNew, binsNew,
+                                                    dOffsetsDev.p);
+    cudaOk(cudaGetLastError(), "depth offsets");
+    int offsets[kDepthBins + 1] = {};
+    cudaOk(cudaMemcpy(offsets, dOffsetsDev.p, static_cast<size_t>(binsNew + 1) * sizeof(int),
+                      cudaMemcpyDeviceToHost),
+           "offsets D2H");
+    if (offsets[binsNew] != internalNew) {
+        throw std::runtime_error("topo update: depth bucketing lost nodes");
+    }
+
+    const int totalNewNodes = 2 * nNewI - 1;
+    DevBuf<GpuBVHNode> dNewNodes(totalNewNodes);
+    DevBuf<int> dNewParent(totalNewNodes);
+    DevBuf<int> dNewDepth(totalNewNodes);
+    cudaOk(cudaMemset(dNewParent.p, 0xff, static_cast<size_t>(totalNewNodes) * sizeof(int)),
+           "new parent");
+    rankKernel<<<blocksFor(internalNew), kBlock>>>(dValsSorted.p, internalNew, dIdMap.p);
+    relayoutKernel<<<blocksFor(internalNew), kBlock>>>(
+        dValsSorted.p, internalNew, oldNodes, oldDepth, internalOld, dMinSlot.p, dSize.p,
+        dCutBegDev.p, dCutEndDev.p, dSlotPrefix.p, dTempNodes.p, dTempDepth.p, dIdMap.p, nNewI,
+        dNewNodes.p, dNewParent.p, dNewDepth.p, cutCount);
+    emitLeafKernel<Ops><<<blocksFor(nNewI), kBlock>>>(dNewTris.p, nNewI, dNewNodes.p, dNewParent.p,
+                                                      dNewDepth.p);
+    cudaOk(cudaGetLastError(), "relayout");
+    clock.mark();  // 3
+
+
+    // ---- E 合并：叶子盒已定稿，按新层序自深向浅合并全部内部节点 ----
+    DevBuf<int> dRefitOrderNew(internalNew);
+    iotaKernel<<<blocksFor(internalNew), kBlock>>>(dRefitOrderNew.p, internalNew);
+    for (int d = binsNew - 1; d >= 0; --d) {
+        const int count = offsets[d + 1] - offsets[d];
+        if (count == 0) continue;
+        const int blocks = (count + kBlock * kRefitUnroll - 1) / (kBlock * kRefitUnroll);
+        refitKernel<<<blocks, kBlock>>>(dNewNodes.p, dRefitOrderNew.p + offsets[d], count);
+    }
+    cudaOk(cudaGetLastError(), "topo merge");
+    clock.mark();  // 4
+
+    DevBuf<int> dDirtyOrderNew(internalNew), dLevelCountsNew(binsNew);
+    DevBuf<int> dRefitOffsetsNew(binsNew + 1);
+    DevBuf<int> dMarkNew(totalNewNodes);
+    cudaOk(cudaMemcpy(dRefitOffsetsNew.p, offsets, static_cast<size_t>(binsNew + 1) * sizeof(int),
+                      cudaMemcpyHostToDevice),
+           "refit offsets H2D");
+    cudaOk(cudaMemset(dMarkNew.p, 0, static_cast<size_t>(totalNewNodes) * sizeof(int)), "mark clear");
+
+    // ---- 整体换树：到这里以前旧树一个字节都没动过，失败可以直接原地回退 ----
+    if (bvh.d_nodes) cudaFree(bvh.d_nodes);
+    bvh.d_nodes = dNewNodes.release();
+    if (bvh.d_tris) cudaFree(bvh.d_tris);
+    bvh.d_tris = dNewTris.release();
+    if (bvh.d_primIds) cudaFree(bvh.d_primIds);
+    bvh.d_primIds = dNewPrimIds.release();
+    if (bvh.d_refitOrder) cudaFree(bvh.d_refitOrder);
+    bvh.d_refitOrder = dRefitOrderNew.release();
+    if (bvh.d_parent) cudaFree(bvh.d_parent);
+    bvh.d_parent = dNewParent.release();
+    if (bvh.d_depth) cudaFree(bvh.d_depth);
+    bvh.d_depth = dNewDepth.release();
+    if (bvh.d_mark) cudaFree(bvh.d_mark);
+    bvh.d_mark = dMarkNew.release();
+    if (bvh.d_dirtyOrder) cudaFree(bvh.d_dirtyOrder);
+    bvh.d_dirtyOrder = dDirtyOrderNew.release();
+    if (bvh.d_refitOffsets) cudaFree(bvh.d_refitOffsets);
+    bvh.d_refitOffsets = dRefitOffsetsNew.release();
+    if (bvh.d_levelCounts) cudaFree(bvh.d_levelCounts);
+    bvh.d_levelCounts = dLevelCountsNew.release();
+    bvh.refitOffsets.assign(offsets, offsets + binsNew + 1);
+    bvh.primSlot.clear();  // 反向映射变了，局部 refit 下次用到时按新 primIds 重建
+    bvh.primCount = nNewI;
+    bvh.nodeCount = totalNewNodes;
+    bvh.depth = newDepthTotal;
+
     double wideMs = 0.0;
     if (wide) {
         wideMs = buildWideNodesGPU(bvh);
-        clock.mark();                                // 2
+        clock.mark();  // 5
     }
     cudaOk(cudaEventSynchronize(clock.ev[clock.marks - 1]), "topo sync");
 
-    t->surgeryRoots = 1;
-    t->rebuiltLeaves = static_cast<int>(nNew);
+    t->surgeryRoots = cutCount;
+    t->rebuiltLeaves = static_cast<int>(sumOld);
     t->newDepth = bvh.depth;
-    t->fullRebuild = true;
+    t->fullRebuild = false;
     t->wideMs = wideMs;
+    t->planMs = clock.ms(0, 1);
+    t->surgeryMs = clock.ms(1, 2);
+    t->relayoutMs = clock.ms(2, 3);
+    t->mergeMs = clock.ms(3, 4);
+    t->uploadMs = 0.0;
+    t->moved = static_cast<int>(edit.moved.size());
     t->totalMs = clock.ms(0, clock.marks - 1);
-    t->surgeryMs = t->totalMs - wideMs;
     return t->totalMs;
 }
 
@@ -1904,10 +2748,14 @@ std::string validateImpl(const GpuBVH& bvh, const std::vector<typename Ops::Item
     const auto* sortedTris = static_cast<const typename Ops::Item*>(bvh.d_tris);
 
     DevBuf<int> dVisited(nodeCount);
-    DevBuf<int> dErrors(5);
+    DevBuf<int> dErrors(6);
     DevBuf<int> dHist(static_cast<size_t>(n));
+    DevBuf<typename Ops::Item> dItems(static_cast<size_t>(n));
+    cudaOk(cudaMemcpy(dItems.p, items.data(), static_cast<size_t>(n) * sizeof(typename Ops::Item),
+                      cudaMemcpyHostToDevice),
+           "validate H2D items");
     cudaOk(cudaMemset(dVisited.p, 0, static_cast<size_t>(nodeCount) * sizeof(int)), "visited");
-    cudaOk(cudaMemset(dErrors.p, 0, 5 * sizeof(int)), "errors");
+    cudaOk(cudaMemset(dErrors.p, 0, 6 * sizeof(int)), "errors");
     cudaOk(cudaMemset(dHist.p, 0, static_cast<size_t>(n) * sizeof(int)), "prim hist");
 
     checkNodesKernel<Ops><<<blocksFor(nodeCount), kBlock>>>(nodes, sortedTris, n, nodeCount,
@@ -1916,8 +2764,14 @@ std::string validateImpl(const GpuBVH& bvh, const std::vector<typename Ops::Item
     checkPermKernel<<<blocksFor(n), kBlock>>>(static_cast<const int*>(bvh.d_primIds), n, dHist.p,
                                               dErrors.p);
     checkPermCountKernel<<<blocksFor(n), kBlock>>>(dHist.p, n, dErrors.p);
+    checkPayloadKernel<Ops><<<blocksFor(n), kBlock>>>(sortedTris, dItems.p,
+                                                     static_cast<const int*>(bvh.d_primIds), n,
+                                                     dErrors.p);
+    checkDepthKernel<<<blocksFor(nodeCount), kBlock>>>(nodes,
+                                                       static_cast<const int*>(bvh.d_depth), n,
+                                                       nodeCount, dErrors.p);
 
-    int errors[5] = {};
+    int errors[6] = {};
     cudaOk(cudaMemcpy(errors, dErrors.p, sizeof(errors), cudaMemcpyDeviceToHost), "D2H errors");
 
     GpuBVHNode root{};
@@ -1938,6 +2792,7 @@ std::string validateImpl(const GpuBVH& bvh, const std::vector<typename Ops::Item
     if (errors[2]) add("bad_refcount", errors[2]);
     if (errors[3]) add("bad_leaf_id", errors[3]);
     if (errors[4]) add("bad_prim_map", errors[4]);
+    if (errors[5]) add("bad_depth", errors[5]);
     if (badRoot) add("root_box_mismatch", 1);
     return why;
 }
@@ -1952,4 +2807,20 @@ std::string validatePointBVHGPU(const GpuBVH& bvh, const PointCloud& cloud) {
 
 std::string validateGaussianBVHGPU(const GpuBVH& bvh, const GaussianCloud& cloud) {
     return validateImpl<GaussianOps>(bvh, cloud.gaussians, cloud.bounds);
+}
+
+uint64_t treeHashGPU(const GpuBVH& bvh) {
+    // 只看节点数组：盒按位、子引用、叶子区间。同样的输入两次更新必须同值，
+    // 否则说明某条路径依赖了不确定的顺序（原子竞争、未初始化槽等）。
+    std::vector<unsigned char> bytes(static_cast<size_t>(bvh.nodeCount) * sizeof(GpuBVHNode));
+    if (!bytes.empty()) {
+        cudaOk(cudaMemcpy(bytes.data(), bvh.d_nodes, bytes.size(), cudaMemcpyDeviceToHost),
+               "tree hash D2H");
+    }
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (unsigned char c : bytes) {
+        h ^= static_cast<uint64_t>(c);
+        h *= 0x100000001b3ull;
+    }
+    return h;
 }
