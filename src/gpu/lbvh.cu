@@ -423,6 +423,83 @@ __global__ void refitAncestorKernel(GpuBVHNode* __restrict__ nodes,
     out.mxz = l.mxz > r.mxz ? l.mxz : r.mxz;
 }
 
+// 拓扑更新 E 阶段：新树的 mark 表是刚分配的，直接按 epoch 写就相当于清空。
+// 临时森林的全部内部节点都要合并（建森林只定拓扑、不算盒子）；切分根和移动
+// 叶子的祖先盒子变了，沿 parent 链标脏——其余旧内部节点原样沿用旧盒。
+__global__ void markTempNodesKernel(const int* __restrict__ idMap, int base, int count,
+                                    int* __restrict__ mark, int epoch) {
+    const int t = blockIdx.x * kBlock + threadIdx.x;
+    if (t < count) mark[idMap[base + t]] = epoch;
+}
+
+// starts 是"第一个要合并其祖先的节点"（切分根传森林根，从它的父节点开始爬）。
+__global__ void markNodeAncestorsKernel(const int* __restrict__ starts, int count,
+                                        const int* __restrict__ parent,
+                                        int* __restrict__ mark, int epoch) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= count) return;
+    int node = parent[starts[i]];
+    while (node >= 0) {
+        if (atomicExch(&mark[node], epoch) == epoch) break;
+        node = parent[node];
+    }
+}
+
+// 移动叶子：先经 sceneSlot（新场景下标 -> 新叶子槽）找到叶子，再从父节点往上爬。
+__global__ void markMovedAncestorsKernel(const int* __restrict__ sceneIds, int count,
+                                         const int* __restrict__ sceneSlot,
+                                         const int* __restrict__ parent, int nNew,
+                                         int* __restrict__ mark, int epoch) {
+    const int i = blockIdx.x * kBlock + threadIdx.x;
+    if (i >= count) return;
+    int node = parent[nNew - 1 + sceneSlot[sceneIds[i]]];
+    while (node >= 0) {
+        if (atomicExch(&mark[node], epoch) == epoch) break;
+        node = parent[node];
+    }
+}
+
+// 只在层区间 [begin, begin+count) 里合并标脏的节点。层内没有父子关系，
+// 自深向浅逐层发射即可；干净节点连子盒都不读。
+__global__ void refitDirtyKernel(GpuBVHNode* __restrict__ nodes, int begin, int count,
+                                 const int* __restrict__ mark, int epoch) {
+    const int base = blockIdx.x * (kBlock * kRefitUnroll) + threadIdx.x;
+
+    int ids[kRefitUnroll];
+    GpuBVHNode l[kRefitUnroll], r[kRefitUnroll];
+    bool ok[kRefitUnroll];
+
+#pragma unroll
+    for (int u = 0; u < kRefitUnroll; ++u) {
+        const int t = base + u * kBlock;
+        ok[u] = false;
+        if (t < count) {
+            const int i = begin + t;
+            if (mark[i] == epoch) {
+                const GpuBVHNode nd = nodes[i];
+                if (nd.left >= 0) {
+                    ok[u] = true;
+                    ids[u] = i;
+                    l[u] = nodes[nd.left];
+                    r[u] = nodes[nd.right];
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int u = 0; u < kRefitUnroll; ++u) {
+        if (!ok[u]) continue;
+        GpuBVHNode& nd = nodes[ids[u]];
+        nd.mnx = l[u].mnx < r[u].mnx ? l[u].mnx : r[u].mnx;
+        nd.mny = l[u].mny < r[u].mny ? l[u].mny : r[u].mny;
+        nd.mnz = l[u].mnz < r[u].mnz ? l[u].mnz : r[u].mnz;
+        nd.mxx = l[u].mxx > r[u].mxx ? l[u].mxx : r[u].mxx;
+        nd.mxy = l[u].mxy > r[u].mxy ? l[u].mxy : r[u].mxy;
+        nd.mxz = l[u].mxz > r[u].mxz ? l[u].mxz : r[u].mxz;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 结构校验：父盒必须逐位等于两个子盒的并，叶子盒必须逐位等于三角形包围盒，
 // 每个非根节点必须被恰好引用一次。
@@ -1173,23 +1250,28 @@ __global__ void invertPermKernel(const int* __restrict__ primIds, int n,
 // 删除表是场景下标，先用 primSlot 换成叶子槽。追加的图元只能落进拥有最后一个
 // 旧叶子的那棵子树，所以尾部叶子也参与一次爬升，并且只有它可以靠追加补足新叶子数。
 // 同一棵子树会被多个删除叶子选中，epoch 标记顺手去重（谁先写都一样）。
+//
+// 尾部那份用单独的 minSize：追加块越大，切分根就得越高，否则每轮都只把新增
+// 图元挂在一条越来越深的路径底下（R4 漂移）。要求重建区间里至少有一份与追加
+// 块同样多的旧叶子，新子树的根才能稳定在上一次的位置。
 __global__ void climbKernel(const int* __restrict__ deleted, const int* __restrict__ primSlot,
                             int delCount, int tailLeaf, int appended,
                             const int* __restrict__ parent, const int* __restrict__ size,
                             const int* __restrict__ minSlot, const int* __restrict__ keptPrefix,
-                            int nOld, int minSize, int* __restrict__ mark, int epoch,
-                            int* __restrict__ cand, int* __restrict__ flag) {
+                            int nOld, int minSize, int appendedMinSize, int* __restrict__ mark,
+                            int epoch, int* __restrict__ cand, int* __restrict__ flag) {
     const int i = blockIdx.x * kBlock + threadIdx.x;
     const int total = delCount + (appended > 0 ? 1 : 0);
     if (i >= total) return;
     const int slot = i < delCount ? primSlot[deleted[i]] : tailLeaf;
+    const int need = i < delCount ? minSize : appendedMinSize;
     int node = parent[nOld - 1 + slot];
     while (node > 0) {
         const int beg = minSlot[node];
         const int end = beg + size[node];
         const int kept = keptPrefix[end] - keptPrefix[beg];
         const int bonus = (appended > 0 && end == nOld) ? appended : 0;
-        if (size[node] >= minSize && kept + bonus >= 2) break;
+        if (size[node] >= need && kept + bonus >= 2) break;
         node = parent[node];
     }
     if (node < 0) node = 0;  // 树比 minSize 还小：整棵当切分根
@@ -2281,6 +2363,10 @@ double refitGaussianBVHGPU(GpuBVH& bvh, const GaussianCloud& cloud,
     return refitImpl<GaussianOps>(bvh, cloud.gaussians, &dirty, timings);
 }
 
+// 增量更新允许比"最近一次均衡构建"深多少层。追加永远落在槽尾，每轮都会给
+// 那一侧加 log2(新增) 的深度；放宽太多会让查询退化，收紧则频繁整树重建。
+constexpr int kTopoDepthSlack = 6;
+
 // 拓扑更新。编辑脚本的语义写在 gpu_bvh.h 的 GpuTopoEdit 上：newScene 是幸存者
 // （保序）+ 末尾追加，所以幸存者的新下标 = 旧下标 - 它前面删掉的数量。
 template <typename Ops>
@@ -2315,6 +2401,7 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     t->deleted = static_cast<int>(edit.deleted.size());
     t->appended = edit.appended;
     t->newDepth = bvh.depth;
+    if (bvh.topoBaseDepth <= 0) bvh.topoBaseDepth = bvh.depth;
 
     if (edit.deleted.empty() && edit.appended == 0) {
         // 纯移动：树形没变，走原来的增量 refit 快路径（上传只含改动的图元）。
@@ -2353,6 +2440,7 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
         t->wideMs = wideMs;
         t->totalMs = clock.ms(0, clock.marks - 1);
         t->surgeryMs = t->totalMs - wideMs;
+        bvh.topoBaseDepth = bvh.depth;
         return t->totalMs;
     };
 
@@ -2423,6 +2511,9 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     const int budget = std::max(64, nNewI / 8);
     int minSize = budget / std::max(1, delCount);
     minSize = std::max(64, std::min(4096, minSize));
+    // 追加区间至少吸收与追加块同样多的旧叶子，新子树的根才不会逐轮下沉。
+    const int appendedMinSize =
+        edit.appended > 0 ? std::max(minSize, std::min(4096, edit.appended)) : minSize;
 
     DevBuf<int> dCand(cabMax), dCandFlag(cabMax + 1), dCandOff(cabMax + 1);
     DevBuf<int> dPrimSlot(nOld);
@@ -2431,8 +2522,8 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     ++bvh.refitEpoch;
     climbKernel<<<blocksFor(cabMax), kBlock>>>(dDeleted.p, dPrimSlot.p, delCount, nOld - 1,
                                                edit.appended, oldParent, dSize.p, dMinSlot.p,
-                                               dSlotPrefix.p, nOld, minSize, mark, bvh.refitEpoch,
-                                               dCand.p, dCandFlag.p);
+                                               dSlotPrefix.p, nOld, minSize, appendedMinSize, mark,
+                                               bvh.refitEpoch, dCand.p, dCandFlag.p);
     cudaOk(cudaGetLastError(), "topo climb");
     cudaOk(cudaMemset(dCandFlag.p + cabMax, 0, sizeof(int)), "cand tail");
     cudaOk(cub::DeviceScan::ExclusiveSum(nullptr, scanBytes, dCandFlag.p, dCandOff.p, cabMax + 1),
@@ -2529,9 +2620,12 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     remapPermKernel<<<blocksFor(nOld + edit.appended), kBlock>>>(
         oldPrimIds, dSlotPrefix.p, dKeptPrefix.p, nOld, nSurv, edit.appended, dNewPrimIds.p);
     cudaOk(cudaGetLastError(), "topo stage");
-    if (!edit.moved.empty()) {
+    // E 阶段还要用移动表标脏，所以这两个缓冲区留到函数末尾。
+    const int mvCount = static_cast<int>(edit.moved.size());
+    DevBuf<int> dScenesMv, dSceneSlotMv;
+    DevBuf<Item> dMovedMv;
+    if (mvCount > 0) {
         // 移动表给的是新场景下标，散写前先换成新叶子槽（primIds 一般不再是 iota）。
-        const int mvCount = static_cast<int>(edit.moved.size());
         std::vector<int> scenes(static_cast<size_t>(mvCount));
         std::vector<Item> moved(static_cast<size_t>(mvCount));
         for (int i = 0; i < mvCount; ++i) {
@@ -2539,18 +2633,19 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
             moved[static_cast<size_t>(i)] =
                 items[static_cast<size_t>(edit.moved[static_cast<size_t>(i)])];
         }
-        DevBuf<int> dScenes(mvCount), dSceneSlot(nNewI);
-        DevBuf<Item> dMoved(mvCount);
-        cudaOk(cudaMemcpy(dScenes.p, scenes.data(), static_cast<size_t>(mvCount) * sizeof(int),
+        dScenesMv = DevBuf<int>(mvCount);
+        dSceneSlotMv = DevBuf<int>(nNewI);
+        dMovedMv = DevBuf<Item>(mvCount);
+        cudaOk(cudaMemcpy(dScenesMv.p, scenes.data(), static_cast<size_t>(mvCount) * sizeof(int),
                           cudaMemcpyHostToDevice),
                "moved scenes H2D");
-        cudaOk(cudaMemcpy(dMoved.p, moved.data(), static_cast<size_t>(mvCount) * sizeof(Item),
+        cudaOk(cudaMemcpy(dMovedMv.p, moved.data(), static_cast<size_t>(mvCount) * sizeof(Item),
                           cudaMemcpyHostToDevice),
                "moved prims H2D");
-        invertPermKernel<<<blocksFor(nNewI), kBlock>>>(dNewPrimIds.p, nNewI, dSceneSlot.p);
+        invertPermKernel<<<blocksFor(nNewI), kBlock>>>(dNewPrimIds.p, nNewI, dSceneSlotMv.p);
         cudaOk(cudaGetLastError(), "moved invert");
-        scatterItemsKernel<Ops><<<blocksFor(mvCount), kBlock>>>(dScenes.p, dMoved.p, mvCount,
-                                                                dNewTris.p, dSceneSlot.p);
+        scatterItemsKernel<Ops><<<blocksFor(mvCount), kBlock>>>(dScenesMv.p, dMovedMv.p, mvCount,
+                                                                dNewTris.p, dSceneSlotMv.p);
         cudaOk(cudaGetLastError(), "moved scatter");
     }
 
@@ -2619,7 +2714,13 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
                       cudaMemcpyDeviceToHost),
            "max depth D2H");
     const int maxInternalDepth = static_cast<int>(maxKey >> 26);
-    if (maxInternalDepth >= 63) return rebuildAll();  // 查询栈 64 层，不能再深了
+    // 查询栈 64 层是硬约束。连续同向追加会让某条路径逐轮变深——清洁子树永远
+    // 不重切，靠增量更新自己回不到浅处，所以超过基深度 kTopoDepthSlack 层就
+    // 整树重建重新平衡（R4）。
+    if (maxInternalDepth >= 63 ||
+        maxInternalDepth + 1 > bvh.topoBaseDepth + kTopoDepthSlack) {
+        return rebuildAll();
+    }
     const int newDepthTotal = maxInternalDepth + 1;
 
     const int binsNew = newDepthTotal;
@@ -2652,25 +2753,40 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     clock.mark();  // 3
 
 
-    // ---- E 合并：叶子盒已定稿，按新层序自深向浅合并全部内部节点 ----
-    DevBuf<int> dRefitOrderNew(internalNew);
-    iotaKernel<<<blocksFor(internalNew), kBlock>>>(dRefitOrderNew.p, internalNew);
+    // ---- E 合并：只合并本次新算过盒子的节点 ----
+    // 临时森林的内部节点还没有盒子（建森林只定拓扑），全部标脏；切分根与移动
+    // 叶子在新树里的祖先盒子变了，沿 parent 链标脏。调用方没碰过的旧内部节点
+    // 直接沿用旧盒，所以合并量是"重建叶数 + 树高"，与场景大小无关。
+    DevBuf<int> dMarkNew(totalNewNodes);
+    cudaOk(cudaMemset(dMarkNew.p, 0, static_cast<size_t>(totalNewNodes) * sizeof(int)),
+           "mark clear");
+    ++bvh.refitEpoch;  // 新表的坑位全 0，这个 epoch 不可能撞上
+    markTempNodesKernel<<<blocksFor(want), kBlock>>>(dIdMap.p, internalOld, want, dMarkNew.p,
+                                                     bvh.refitEpoch);
+    markNodeAncestorsKernel<<<blocksFor(cutCount), kBlock>>>(
+        dIdMap.p + internalOld, cutCount, dNewParent.p, dMarkNew.p, bvh.refitEpoch);
+    if (mvCount > 0) {
+        markMovedAncestorsKernel<<<blocksFor(mvCount), kBlock>>>(
+            dScenesMv.p, mvCount, dSceneSlotMv.p, dNewParent.p, nNewI, dMarkNew.p, bvh.refitEpoch);
+    }
+    cudaOk(cudaGetLastError(), "topo dirty");
     for (int d = binsNew - 1; d >= 0; --d) {
         const int count = offsets[d + 1] - offsets[d];
         if (count == 0) continue;
         const int blocks = (count + kBlock * kRefitUnroll - 1) / (kBlock * kRefitUnroll);
-        refitKernel<<<blocks, kBlock>>>(dNewNodes.p, dRefitOrderNew.p + offsets[d], count);
+        refitDirtyKernel<<<blocks, kBlock>>>(dNewNodes.p, offsets[d], count, dMarkNew.p,
+                                             bvh.refitEpoch);
     }
     cudaOk(cudaGetLastError(), "topo merge");
     clock.mark();  // 4
 
+    DevBuf<int> dRefitOrderNew(internalNew);
+    iotaKernel<<<blocksFor(internalNew), kBlock>>>(dRefitOrderNew.p, internalNew);
     DevBuf<int> dDirtyOrderNew(internalNew), dLevelCountsNew(binsNew);
     DevBuf<int> dRefitOffsetsNew(binsNew + 1);
-    DevBuf<int> dMarkNew(totalNewNodes);
     cudaOk(cudaMemcpy(dRefitOffsetsNew.p, offsets, static_cast<size_t>(binsNew + 1) * sizeof(int),
                       cudaMemcpyHostToDevice),
            "refit offsets H2D");
-    cudaOk(cudaMemset(dMarkNew.p, 0, static_cast<size_t>(totalNewNodes) * sizeof(int)), "mark clear");
 
     // ---- 整体换树：到这里以前旧树一个字节都没动过，失败可以直接原地回退 ----
     if (bvh.d_nodes) cudaFree(bvh.d_nodes);
@@ -2698,6 +2814,8 @@ static double updateTopology(GpuBVH& bvh, const std::vector<typename Ops::Item>&
     bvh.primCount = nNewI;
     bvh.nodeCount = totalNewNodes;
     bvh.depth = newDepthTotal;
+    // 只在树变浅时下调基深度（删除会让整个场景变小）；变深由上面的上限管。
+    if (newDepthTotal < bvh.topoBaseDepth) bvh.topoBaseDepth = newDepthTotal;
 
     double wideMs = 0.0;
     if (wide) {
