@@ -107,6 +107,41 @@ struct RayHit {
     int triangle = -1;
 };
 
+// 命中参数是否真的落在盒子的 slab 区间里。遍历用的 intersectAABB 只看区间非空，
+// 这里额外要求 t 本身在区间内——见 intersectTriangle 里的说明。
+QUARRY_HD inline bool hitParamInsideBox(const Ray& ray, const AABB& box, float t) {
+    constexpr float kPad = 1e-6f;
+    float t0 = ray.tMin;
+    float t1 = std::numeric_limits<float>::infinity();
+
+    for (int axis = 0; axis < 3; ++axis) {
+        const float o = component(ray.origin, axis);
+        const float d = component(ray.dir, axis);
+        const float lo = component(box.mn, axis);
+        const float hi = component(box.mx, axis);
+
+        if (fabsf(d) < 1e-20f) {
+            if (o < lo || o > hi) return false;
+            continue;
+        }
+
+        const float inv = 1.0f / d;
+        float ta = (lo - o) * inv;
+        float tb = (hi - o) * inv;
+        if (ta > tb) {
+            const float tmp = ta;
+            ta = tb;
+            tb = tmp;
+        }
+
+        t0 = ta > t0 ? ta : t0;
+        t1 = tb < t1 ? tb : t1;
+        if (t0 > t1) return false;
+    }
+
+    return t >= t0 * (1.0f - kPad) - kPad && t <= t1 * (1.0f + kPad) + kPad;
+}
+
 // Möller–Trumbore。det 很小时视为平行；t 必须落在 [tMin, tMax]。
 QUARRY_HD inline bool intersectTriangle(const Ray& ray, const Tri& tri, float& tOut) {
     constexpr float kEps = 1e-7f;
@@ -128,6 +163,13 @@ QUARRY_HD inline bool intersectTriangle(const Ray& ray, const Tri& tri, float& t
 
     const float t = dot(e2, q) * inv;
     if (t < ray.tMin || t > ray.tMax) return false;
+
+    // 叉积在远距离、大坐标下会大幅抵消，Möller–Trumbore 的 u/v 判断可能把
+    // 边界外的点判进三角形（城市场景实测重心坐标误差约 2e-4）。这样的"命中"
+    // 点在三角形自包围盒之外：BVH 的紧叶盒会先把它剪掉，而暴力法直接测三角形
+    // 会接受——CPU/GPU/暴力法之间就不一致了。这里把命中参数收口到三角形自盒
+    // 的 slab 区间内，保证"命中 ⇒ 命中点在盒内"，三方结论才逐位相同。
+    if (!hitParamInsideBox(ray, tri.bounds(), t)) return false;
 
     tOut = t;
     return true;
@@ -263,7 +305,10 @@ QUARRY_HD inline bool intersectAABB(const Ray& ray, const AABB& box, float tMax,
 
         t0 = ta > t0 ? ta : t0;
         t1 = tb < t1 ? tb : t1;
-        if (t0 > t1) return false;
+        // 零厚度盒（轴对齐的墙/地面）会把区间压成一个点，与相邻轴边界的差可能
+        // 超过几个 ulp。这里留一点相对余量：宁可多访问一个节点，也不要把擦边的
+        // 真实命中剪掉——CPU 叶子里三角形更多、盒更松，否则两边结果会对不上。
+        if (t0 > t1 * (1.0f + 1e-6f) + 1e-6f) return false;
     }
 
     tEnter = t0;
