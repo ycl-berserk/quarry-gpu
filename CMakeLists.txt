@@ -1,9 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-project(quarry LANGUAGES CXX)
+project(quarry VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+include(GNUInstallDirs)
+
+option(QUARRY_BENCH "Build the benchmark, CLI, tests and tutorial binaries" ON)
+option(QUARRY_INSTALL "Generate CMake install and package-config rules" ON)
+option(QUARRY_PYTHON "Build the Python bindings when pybind11 is available" ON)
 
 if(MSVC)
     # 只给 CXX：裸的 /W4 /permissive- 会被 nvcc 当成自己的参数，直接报错。
@@ -23,28 +29,46 @@ add_library(quarry_core STATIC
     src/cpu/gauss_bvh.cpp
     src/cpu/selftest.cpp
 )
-target_include_directories(quarry_core PUBLIC src)
+add_library(quarry::core ALIAS quarry_core)
+set_target_properties(quarry_core PROPERTIES
+    EXPORT_NAME core
+    POSITION_INDEPENDENT_CODE ON)
+target_include_directories(quarry_core PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/quarry>)
+target_compile_features(quarry_core PUBLIC cxx_std_17)
+# 公共头里有中文注释：MSVC 默认按本地代码页解析，GBK 尾字节可能吞掉换行。
+# 把 /utf-8 作为接口选项传下去，消费者不用再自己加。
+if(MSVC)
+    target_compile_options(quarry_core PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+endif()
 
-add_executable(quarry src/cli/main.cpp)
-target_link_libraries(quarry PRIVATE quarry_core)
+if(QUARRY_BENCH)
+    add_executable(quarry src/cli/main.cpp)
+    target_link_libraries(quarry PRIVATE quarry_core)
 
-add_executable(test_brute tests/test_brute.cpp)
-target_link_libraries(test_brute PRIVATE quarry_core)
+    add_executable(test_brute tests/test_brute.cpp)
+    target_link_libraries(test_brute PRIVATE quarry_core)
 
-enable_testing()
-add_test(NAME selftest COMMAND test_brute)
+    enable_testing()
+    add_test(NAME selftest COMMAND test_brute)
 
-# 教程配套单文件：只保证能编译（CI 会构建全部 target），不参与 CTest 性能测量。
-foreach(lesson 01_bruteforce 02_bvh 03_lbvh)
-    add_executable(learn_${lesson} learn/${lesson}.cpp)
-endforeach()
+    # 教程配套单文件：只保证能编译（CI 会构建全部 target），不参与 CTest 性能测量。
+    foreach(lesson 01_bruteforce 02_bvh 03_lbvh)
+        add_executable(learn_${lesson} learn/${lesson}.cpp)
+    endforeach()
+endif()
 
 # GPU 后端。没有 CUDA 工具链的机器（CI、纯 CPU 环境）跳过整个块，
 # CPU 参考实现和教程代码不受影响。
 option(QUARRY_GPU "Build the CUDA backend when a toolkit is available" ON)
 set(QUARRY_CUDA_ARCH "89" CACHE STRING "CUDA target architecture (e.g. 89, 86, 75)")
+set(QUARRY_CUDA_COMPILER "" CACHE FILEPATH "Path to nvcc; empty lets CMake search PATH")
 
 if(QUARRY_GPU)
+    if(QUARRY_CUDA_COMPILER)
+        set(CMAKE_CUDA_COMPILER "${QUARRY_CUDA_COMPILER}")
+    endif()
     include(CheckLanguage)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
@@ -56,34 +80,40 @@ if(QUARRY_GPU)
             src/gpu/raycast.cu
             src/gpu/query.cu
         )
-        target_include_directories(quarry_gpu PUBLIC src)
-        target_link_libraries(quarry_gpu PUBLIC quarry_core PRIVATE CUDA::cudart)
+        add_library(quarry::gpu ALIAS quarry_gpu)
         set_target_properties(quarry_gpu PROPERTIES
+            EXPORT_NAME gpu
+            POSITION_INDEPENDENT_CODE ON
             CUDA_STANDARD 17
             CUDA_STANDARD_REQUIRED ON
             CUDA_ARCHITECTURES ${QUARRY_CUDA_ARCH}
         )
+        target_include_directories(quarry_gpu PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/quarry>)
+        target_link_libraries(quarry_gpu PUBLIC quarry_core PRIVATE CUDA::cudart)
         # 关掉乘加融合：CPU 侧是纯 IEEE 乘加，两个后端的 t 值要能逐位对拍。
         # 源码里有中文注释，主机编译器需要 /utf-8。
         target_compile_options(quarry_gpu PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false --expt-relaxed-constexpr -Xcompiler=/utf-8>
         )
 
-        add_executable(gpu_bench bench/gpu_bench.cpp)
-        target_link_libraries(gpu_bench PRIVATE quarry_gpu)
+        if(QUARRY_BENCH)
+            add_executable(gpu_bench bench/gpu_bench.cpp)
+            target_link_libraries(gpu_bench PRIVATE quarry_gpu)
 
-        add_executable(gpu_query_bench bench/gpu_query_bench.cpp)
-        target_link_libraries(gpu_query_bench PRIVATE quarry_gpu)
+            add_executable(gpu_query_bench bench/gpu_query_bench.cpp)
+            target_link_libraries(gpu_query_bench PRIVATE quarry_gpu)
 
-        add_executable(gpu_cloud_bench bench/gpu_cloud_bench.cpp)
-        target_link_libraries(gpu_cloud_bench PRIVATE quarry_gpu)
+            add_executable(gpu_cloud_bench bench/gpu_cloud_bench.cpp)
+            target_link_libraries(gpu_cloud_bench PRIVATE quarry_gpu)
 
-        add_executable(gpu_gauss_bench bench/gpu_gauss_bench.cpp)
-        target_link_libraries(gpu_gauss_bench PRIVATE quarry_gpu)
+            add_executable(gpu_gauss_bench bench/gpu_gauss_bench.cpp)
+            target_link_libraries(gpu_gauss_bench PRIVATE quarry_gpu)
+        endif()
 
         # Python 绑定：pybind11 由 pip 安装时不是系统包，向解释器要 cmakedir。
         # 没装就跳过，CI（无 CUDA）和纯 C++ 构建都不受影响。
-        option(QUARRY_PYTHON "Build the Python bindings when pybind11 is available" ON)
         if(QUARRY_PYTHON)
             find_package(Python COMPONENTS Interpreter Development.Module QUIET)
             if(Python_FOUND)
@@ -99,6 +129,7 @@ if(QUARRY_GPU)
             if(pybind11_FOUND)
                 pybind11_add_module(quarry_py MODULE bindings/python/quarry_py.cpp)
                 target_link_libraries(quarry_py PRIVATE quarry_gpu)
+                target_compile_definitions(quarry_py PRIVATE QUARRY_VERSION="${PROJECT_VERSION}")
                 set_target_properties(quarry_py PROPERTIES
                     OUTPUT_NAME quarry
                     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python
@@ -111,6 +142,15 @@ if(QUARRY_GPU)
                         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                                 ${QUARRY_CUDART_DLLS} $<TARGET_FILE_DIR:quarry_py>)
                 endif()
+                set(QUARRY_PYTHON_INSTALL_DIR "." CACHE STRING
+                    "Install directory for the Python extension, relative to the prefix")
+                install(TARGETS quarry_py
+                    LIBRARY DESTINATION ${QUARRY_PYTHON_INSTALL_DIR}
+                    RUNTIME DESTINATION ${QUARRY_PYTHON_INSTALL_DIR})
+                if(QUARRY_CUDART_DLLS)
+                    install(FILES ${QUARRY_CUDART_DLLS}
+                        DESTINATION ${QUARRY_PYTHON_INSTALL_DIR})
+                endif()
                 message(STATUS "Python ${Python_VERSION}: building quarry bindings")
             else()
                 message(STATUS "pybind11 not found: skipping Python bindings")
@@ -121,4 +161,46 @@ if(QUARRY_GPU)
     else()
         message(STATUS "CUDA not found: building CPU-only")
     endif()
+endif()
+
+if(QUARRY_INSTALL)
+    set(QUARRY_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/quarry)
+
+    install(TARGETS quarry_core EXPORT quarryTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+    if(TARGET quarry_gpu)
+        set(QUARRY_WITH_CUDA ON)
+        install(TARGETS quarry_gpu EXPORT quarryTargets
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    else()
+        set(QUARRY_WITH_CUDA OFF)
+    endif()
+
+    # 头文件保持 src/ 下的相对布局：消费者写 #include <gpu/gpu_bvh.h>，
+    # 头内部再按 "core/..." 找同级目录。
+    foreach(incdir core cpu gpu)
+        install(DIRECTORY src/${incdir} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/quarry
+            FILES_MATCHING PATTERN "*.h")
+    endforeach()
+
+    include(CMakePackageConfigHelpers)
+    configure_package_config_file(
+        cmake/quarryConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/quarryConfig.cmake
+        INSTALL_DESTINATION ${QUARRY_CMAKE_DIR})
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/quarryConfigVersion.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion)
+
+    install(EXPORT quarryTargets NAMESPACE quarry:: DESTINATION ${QUARRY_CMAKE_DIR})
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/quarryConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/quarryConfigVersion.cmake
+        DESTINATION ${QUARRY_CMAKE_DIR})
 endif()

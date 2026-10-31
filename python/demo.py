@@ -1,8 +1,9 @@
 """最短的 Python 用法：建场景 → 查询 → 读结果。
 
+    py -3.13 -m pip install .
     py -3.13 python/demo.py
 
-扩展模块在 build/python/ 下；build.bat 会连同 CUDA 运行时一起放好。
+也可以直接用 build/python/ 下的开发构建（先跑 build.bat）。
 """
 
 import sys
@@ -11,8 +12,11 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build" / "python"))
-import quarry  # noqa: E402
+try:
+    import quarry
+except ImportError:  # 未安装 wheel 时退回开发构建
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build" / "python"))
+    import quarry
 
 
 def main():

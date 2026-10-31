@@ -18,6 +18,10 @@
 #include "core/scene.h"
 #include "gpu/gpu_bvh.h"
 
+#ifndef QUARRY_VERSION
+#define QUARRY_VERSION "0.0.0"
+#endif
+
 namespace py = pybind11;
 
 namespace {
@@ -880,6 +884,7 @@ py::tuple demoMesh(const std::string& kind, int grid, int randomTris, uint64_t s
 
 PYBIND11_MODULE(quarry, m) {
     m.doc() = "GPU spatial queries: LBVH build, ray casting, closest / kNN / radius";
+    m.attr("__version__") = QUARRY_VERSION;
 
     m.def(
         "describe",

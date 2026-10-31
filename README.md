@@ -14,6 +14,53 @@ Morton 序重排（`--query-sort` / Python 的 `order="morton"`），二叉节�
 （`--sah` / Python 的 `builder="sah"`）——三者默认关闭，可以互相叠加。
 没有 CUDA 工具链时自动降级为纯 CPU 构建，CI 与本文档的 CPU 数字不受影响。
 
+## 安装
+
+两条路径，都从源码构建；发布包尚未上传 PyPI。
+
+### Python
+
+需要 CUDA 12.x（`nvcc` 在 PATH 里，或下面用 `QUARRY_CUDA_COMPILER` 指定）、Python ≥ 3.9、
+本机 C++ 编译器。Windows 上请在 **x64 Native Tools Command Prompt for VS 2022** 里执行
+（或先 `call vcvars64.bat`），否则 Ninja 找不到 `cl.exe`。
+
+```bat
+py -3.13 -m pip install .
+py -3.13 -c "import quarry; print(quarry.describe())"
+```
+
+`pip` 会从源码编译扩展，并把 `cudart64_*.dll` 放在扩展旁边，第一次约 1–3 分钟。
+换架构（例如 sm_86）或显式指定 nvcc：
+
+```bat
+py -3.13 -m pip install . --config-settings=cmake.define.QUARRY_CUDA_ARCH=86
+py -3.13 -m pip install . --config-settings=cmake.define.QUARRY_CUDA_COMPILER=D:/CUDA/bin/nvcc.exe
+```
+
+装完直接看 `python/demo.py` 的用法；不再需要 `sys.path.insert`。
+
+### C++ / CMake
+
+```bat
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix C:\quarry
+```
+
+消费端：
+
+```cmake
+find_package(quarry 1.0 CONFIG REQUIRED)
+target_link_libraries(app PRIVATE quarry::gpu)   # 只用 CPU 参考实现就换成 quarry::core
+```
+
+```cpp
+#include <gpu/gpu_bvh.h>
+```
+
+没有 CUDA 时 `quarry::gpu` 不存在，`quarry::core` 仍然可用；`-DQUARRY_BENCH=OFF`
+可以跳过 CLI、基准与测试，只编译库。
+
 ## 现在能跑什么
 
 ```bat

@@ -24,3 +24,27 @@ jobs:
 
       - name: Selftest
         run: ctest --test-dir build -C Release -V
+
+      - name: Install
+        run: cmake --install build --config Release --prefix install
+
+      - name: Check package config
+        run: Get-ChildItem install/lib/cmake/quarry
+
+  linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUARRY_GPU=OFF -DQUARRY_PYTHON=OFF
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Selftest
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install
+        run: cmake --install build --prefix install

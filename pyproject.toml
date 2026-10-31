@@ -1,0 +1,37 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12", "ninja>=1.11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "quarry-gpu"
+version = "1.0.0"
+description = "GPU-native spatial queries: BVH build, raycast, closest, kNN and radius for triangles, point clouds and Gaussian splats"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "ycl-berserk" }]
+keywords = ["cuda", "bvh", "raytracing", "knn", "point-cloud", "gaussian-splatting", "spatial-query"]
+classifiers = [
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dependencies = ["numpy>=1.21"]
+
+[project.urls]
+Homepage = "https://github.com/ycl-berserk/quarry-gpu"
+
+[tool.scikit-build]
+cmake.version = ">=3.20"
+cmake.args = ["-G", "Ninja"]
+wheel.packages = []
+build-dir = "build/{wheel_tag}"
+sdist.exclude = ["build/**", "out/**", "python/__pycache__/**", "**/__pycache__/**"]
+
+[tool.scikit-build.cmake.define]
+QUARRY_BENCH = "OFF"
+QUARRY_INSTALL = "OFF"
+QUARRY_PYTHON = "ON"
+QUARRY_GPU = "ON"
+QUARRY_CUDA_ARCH = "89"
