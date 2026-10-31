@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "core/fingerprint.h"
@@ -242,6 +243,57 @@ void testBVHShape() {
     check(allLeavesNonEmpty, "leaves non-empty");
     check(allInternalHaveRight, "internal nodes have right child");
     check(bvhDepth(bvh) < 64, "BVH depth fits traversal stack");
+}
+
+// 城市场景：地面 + 每栋 10 个三角形；尺度非均匀、斜射线会穿过多层楼。
+void testCityScene() {
+    SceneSpec spec;
+    spec.kind = "city";
+    spec.buildings = 64;
+    spec.seed = 7;
+    const Scene city = buildScene(spec);
+
+    check(city.tris.size() == 128 * 128 * 2 + 64 * 10, "city: ground + 10 tris per building");
+
+    bool nonDegenerate = true;
+    for (const Tri& t : city.tris) {
+        nonDegenerate &= length(cross(t.b - t.a, t.c - t.a)) >= 1e-4f;
+    }
+    check(nonDegenerate, "city: no degenerate triangles");
+    check(city.bounds.extent().y > 10.0f, "city: buildings give vertical extent");
+
+    const Scene again = buildScene(spec);
+    bool deterministic = again.tris.size() == city.tris.size();
+    for (size_t i = 0; deterministic && i < city.tris.size(); ++i) {
+        deterministic = std::memcmp(&city.tris[i], &again.tris[i], sizeof(Tri)) == 0;
+    }
+    check(deterministic, "city: same seed gives bit-identical triangles");
+
+    const BVH bvh = buildBVH(city);
+    auto rayBits = [](const RayHit& h) {
+        uint32_t bits = 0;
+        if (h.hit) std::memcpy(&bits, &h.t, sizeof(bits));
+        return (static_cast<uint64_t>(h.hit ? 1u : 0u) << 32) | bits;
+    };
+    for (const RayMode mode : {RayMode::Down, RayMode::Random}) {
+        const std::vector<Ray> rays = makeRays(city.bounds, mode, 64, 11);
+        bool raysOk = true;
+        for (const Ray& r : rays) {
+            raysOk &= rayBits(raycastBVH(bvh, r)) == rayBits(raycastBrute(city, r));
+        }
+        check(raysOk, mode == RayMode::Down ? "city: down rays BVH = brute"
+                                            : "city: random rays BVH = brute");
+    }
+
+    const std::vector<Vec3> points = makeQueryPoints(city.bounds, 32, 13);
+    bool closestOk = true;
+    for (const Vec3& p : points) {
+        const ClosestHit a = closestPointBVH(bvh, p);
+        const ClosestHit b = closestPointBrute(city, p);
+        closestOk &= a.found == b.found && a.triangle == b.triangle &&
+                     std::memcmp(&a.dist2, &b.dist2, sizeof(float)) == 0;
+    }
+    check(closestOk, "city: closest BVH = brute");
 }
 
 // 点云 kd-tree 与暴力法：距离、索引、并列顺序三者都要一致。
@@ -487,6 +539,7 @@ bool runSelfTest() {
     testBruteEqualsBVH();
     testQueryBruteEqualsBVH();
     testBVHShape();
+    testCityScene();
     testPointKdEqualsBrute();
     testGaussians();
     testDeterminism();

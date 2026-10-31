@@ -21,6 +21,7 @@ struct Options {
     std::string queryType = "closest";  // closest | knn | radius
     int grid = 256;
     int randomTris = 0;
+    int buildings = 65536;
     int rays = -1;    // -1 = 按引擎给默认值
     int points = -1;  // 查询点数，-1 = 按引擎给默认值
     int k = 16;
@@ -40,9 +41,10 @@ void printUsage() {
         "  quarry query [options]\n"
         "\n"
         "options:\n"
-        "  --scene terrain|random|mixed   default terrain\n"
+        "  --scene terrain|random|mixed|city   default terrain\n"
         "  --grid N                       terrain 边长（格数），default 256 → 131072 三角形\n"
         "  --random-tris N                random/mixed 的随机三角形数\n"
+        "  --buildings N                  city 的楼数（每栋 10 个三角形），default 65536\n"
         "  --engine brute|bvh             default bvh\n"
         "  --runs N                       计时重复次数，default 5（取中位数）\n"
         "  --seed N                       default 1\n"
@@ -89,6 +91,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             const char* v = needValue("--random-tris");
             if (!v) return false;
             opt.randomTris = std::atoi(v);
+        } else if (arg == "--buildings") {
+            const char* v = needValue("--buildings");
+            if (!v) return false;
+            opt.buildings = std::atoi(v);
         } else if (arg == "--rays") {
             const char* v = needValue("--rays");
             if (!v) return false;
@@ -129,7 +135,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
         }
     }
 
-    if (opt.scene != "terrain" && opt.scene != "random" && opt.scene != "mixed") {
+    if (opt.scene != "terrain" && opt.scene != "random" && opt.scene != "mixed" &&
+        opt.scene != "city") {
         std::fprintf(stderr, "unknown scene: %s\n", opt.scene.c_str());
         return false;
     }
@@ -154,7 +161,7 @@ int runBenchmark(Options opt) {
     if (opt.scene == "random" && opt.randomTris == 0) opt.randomTris = 200000;
     if (opt.scene == "mixed" && opt.randomTris == 0) opt.randomTris = 50000;
 
-    const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed};
+    const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed, opt.buildings};
 
     const double t0 = nowMs();
     const Scene scene = buildScene(spec);
@@ -222,7 +229,7 @@ int runQuery(Options opt) {
     if (opt.scene == "random" && opt.randomTris == 0) opt.randomTris = 200000;
     if (opt.scene == "mixed" && opt.randomTris == 0) opt.randomTris = 50000;
 
-    const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed};
+    const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed, opt.buildings};
 
     const double t0 = nowMs();
     const Scene scene = buildScene(spec);

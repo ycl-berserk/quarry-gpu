@@ -1,5 +1,6 @@
 #include "core/scene.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include "core/rng.h"
@@ -12,11 +13,10 @@ float terrainHeight(float x, float z) {
 
 namespace {
 
-Scene makeTerrain(int grid) {
+Scene makeTerrain(int grid, float half = 50.0f) {
     Scene scene;
     scene.tris.reserve(static_cast<size_t>(2) * grid * grid);
 
-    const float half = 50.0f;
     const float step = (2.0f * half) / static_cast<float>(grid);
 
     for (int zi = 0; zi < grid; ++zi) {
@@ -67,6 +67,62 @@ Scene makeRandomTriangles(int count, uint64_t seed) {
     return scene;
 }
 
+// 一栋楼 = 4 面墙 + 屋顶，10 个三角形（没有底面：射线从内部穿出时不需要）。
+void appendBox(std::vector<Tri>& out, float cx, float y0, float cz, float w, float h, float d) {
+    const float x0 = cx - 0.5f * w;
+    const float x1 = cx + 0.5f * w;
+    const float z0 = cz - 0.5f * d;
+    const float z1 = cz + 0.5f * d;
+    const float y1 = y0 + h;
+
+    const Vec3 b00{x0, y0, z0}, b10{x1, y0, z0}, b11{x1, y0, z1}, b01{x0, y0, z1};
+    const Vec3 t00{x0, y1, z0}, t10{x1, y1, z0}, t11{x1, y1, z1}, t01{x0, y1, z1};
+
+    out.push_back({b00, t00, t10});
+    out.push_back({b00, t10, b10});
+    out.push_back({b10, t10, t11});
+    out.push_back({b10, t11, b11});
+    out.push_back({b11, t11, t01});
+    out.push_back({b11, t01, b01});
+    out.push_back({b01, t01, t00});
+    out.push_back({b01, t00, b00});
+    out.push_back({t00, t01, t11});
+    out.push_back({t00, t11, t10});
+}
+
+// 城市：起伏地面上的一群盒子楼。楼在抖动网格上排布，间距基本固定；
+// 高度按 u^3 分布（多数矮楼、少数塔），地面三角形边长比楼大一个量级，
+// 所以图元尺度强烈非均匀，斜射线还会连续穿过好几栋楼。
+Scene makeCity(int buildings, uint64_t seed) {
+    if (buildings <= 0) return makeTerrain(128);
+
+    const int side = std::max(1, static_cast<int>(std::ceil(std::sqrt(
+                                    static_cast<double>(buildings)))));
+    const float spacing = 8.0f;
+    const float half = 0.5f * spacing * static_cast<float>(side);
+
+    Scene scene = makeTerrain(128, half);
+    scene.tris.reserve(scene.tris.size() + static_cast<size_t>(buildings) * 10);
+
+    Pcg32 rng(seed, 4);
+    for (int i = 0; i < buildings; ++i) {
+        const int bx = i % side;
+        const int bz = i / side;
+        const float cx = -half + (static_cast<float>(bx) + 0.5f) * spacing +
+                         rng.uniform(-1.2f, 1.2f);
+        const float cz = -half + (static_cast<float>(bz) + 0.5f) * spacing +
+                         rng.uniform(-1.2f, 1.2f);
+        const float w = rng.uniform(1.5f, 5.0f);
+        const float d = rng.uniform(1.5f, 5.0f);
+        const float u = rng.uniform01();
+        const float h = 4.0f + 56.0f * u * u * u;
+        appendBox(scene.tris, cx, terrainHeight(cx, cz) - 0.6f, cz, w, h, d);
+    }
+
+    scene.updateBounds();
+    return scene;
+}
+
 }  // namespace
 
 Scene buildScene(const SceneSpec& spec) {
@@ -81,6 +137,8 @@ Scene buildScene(const SceneSpec& spec) {
         scene.updateBounds();
         return scene;
     }
+
+    if (spec.kind == "city") return makeCity(spec.buildings, spec.seed);
 
     return Scene{};
 }

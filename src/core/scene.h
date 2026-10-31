@@ -17,10 +17,13 @@ struct Scene {
 };
 
 struct SceneSpec {
-    std::string kind = "terrain";  // terrain | random | mixed
+    std::string kind = "terrain";  // terrain | random | mixed | city
     int grid = 256;                // terrain 的边长（格数），三角形数 = 2 * grid^2
     int randomTris = 0;            // random / mixed 的随机三角形数
     uint64_t seed = 1;
+    // city：楼的数量，每栋 10 个三角形（4 面墙 + 屋顶）；地面固定 128x128 地形。
+    // 场地边长随 sqrt(buildings) 放大，楼间距基本固定（8 个世界单位）。
+    int buildings = 65536;
 };
 
 Scene buildScene(const SceneSpec& spec);

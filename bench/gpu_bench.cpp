@@ -30,6 +30,7 @@ struct Options {
     std::string scene = "terrain";
     int grid = 256;
     int randomTris = 0;
+    int buildings = 65536;
     int rays = 1000000;
     RayMode mode = RayMode::Down;
     int runs = 5;
@@ -49,9 +50,10 @@ void printUsage() {
     std::printf(
         "gpu_bench - GPU LBVH build + ray traversal vs CPU reference BVH\n"
         "\n"
-        "  --scene terrain|random|mixed   default terrain\n"
+        "  --scene terrain|random|mixed|city   default terrain\n"
         "  --grid N                       terrain 边长（格数），default 256 → 131072 三角形\n"
         "  --random-tris N                random/mixed 的随机三角形数\n"
+        "  --buildings N                  city 的楼数（每栋 10 个三角形），default 65536\n"
         "  --rays N                       default 1000000\n"
         "  --mode down|random             default down\n"
         "  --runs N                       计时轮数，取中位数，default 5\n"
@@ -91,6 +93,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             const char* v = needValue("--random-tris");
             if (!v) return false;
             opt.randomTris = std::atoi(v);
+        } else if (arg == "--buildings") {
+            const char* v = needValue("--buildings");
+            if (!v) return false;
+            opt.buildings = std::atoi(v);
         } else if (arg == "--rays") {
             const char* v = needValue("--rays");
             if (!v) return false;
@@ -140,7 +146,8 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             return false;
         }
     }
-    if (opt.scene != "terrain" && opt.scene != "random" && opt.scene != "mixed") {
+    if (opt.scene != "terrain" && opt.scene != "random" && opt.scene != "mixed" &&
+        opt.scene != "city") {
         std::fprintf(stderr, "unknown scene: %s\n", opt.scene.c_str());
         return false;
     }
@@ -199,7 +206,7 @@ int main(int argc, char** argv) {
     if (opt.scene == "random" && opt.randomTris == 0) opt.randomTris = 200000;
     if (opt.scene == "mixed" && opt.randomTris == 0) opt.randomTris = 50000;
 
-    const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed};
+    const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed, opt.buildings};
     const Scene scene = buildScene(spec);
     const std::vector<Ray> rays = makeRays(scene.bounds, opt.mode, opt.rays, opt.seed);
 

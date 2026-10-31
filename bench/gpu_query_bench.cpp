@@ -38,6 +38,7 @@ struct Options {
     float radius = 2.0f;
     int grid = 256;
     int randomTris = 0;
+    int buildings = 65536;
     int points = 20000;
     int runs = 5;
     uint64_t seed = 1;
@@ -64,12 +65,13 @@ void printUsage() {
     std::printf(
         "gpu_query_bench - GPU point queries vs CPU reference BVH\n"
         "\n"
-        "  --scene terrain|random|mixed   default terrain\n"
+        "  --scene terrain|random|mixed|city   default terrain\n"
         "  --query closest|knn|radius     default closest\n"
         "  --k N                          kNN 的 k，1..32，default 8\n"
         "  --radius R                     radius 查询的世界空间半径，default 2.0\n"
         "  --grid N                       terrain 边长（格数），default 256 → 131072 三角形\n"
         "  --random-tris N                random/mixed 的随机三角形数\n"
+        "  --buildings N                  city 的楼数（每栋 10 个三角形），default 65536\n"
         "  --points N                     查询点数，default 20000\n"
         "  --runs N                       计时轮数，取中位数，default 5\n"
         "  --warmup-ms N                  计时前持续负载毫秒数，default 3000\n"
@@ -127,6 +129,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             const char* v = needValue("--random-tris");
             if (!v) return false;
             opt.randomTris = std::atoi(v);
+        } else if (arg == "--buildings") {
+            const char* v = needValue("--buildings");
+            if (!v) return false;
+            opt.buildings = std::atoi(v);
         } else if (arg == "--points") {
             const char* v = needValue("--points");
             if (!v) return false;
@@ -599,7 +605,7 @@ int main(int argc, char** argv) {
     if (opt.scene == "random" && opt.randomTris == 0) opt.randomTris = 200000;
     if (opt.scene == "mixed" && opt.randomTris == 0) opt.randomTris = 50000;
 
-    const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed};
+    const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed, opt.buildings};
     const Scene scene = buildScene(spec);
     const std::vector<Vec3> points = makeQueryPoints(scene.bounds, opt.points, opt.seed);
     const QueryOrder order = opt.querySort ? QueryOrder::Morton : QueryOrder::Input;

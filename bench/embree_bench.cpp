@@ -23,6 +23,7 @@ namespace {
 struct Options {
     int grid = 1024;
     int randomTris = 0;
+    int buildings = 65536;
     std::string scene = "terrain";
     std::string query = "rays";  // rays | closest
     int rays = 200000;
@@ -38,9 +39,10 @@ struct Options {
 void printUsage() {
     std::printf(
         "embree_bench [options]\n"
-        "  --scene terrain|random|mixed   default terrain\n"
+        "  --scene terrain|random|mixed|city   default terrain\n"
         "  --grid N                       三角形数 = 2*N^2\n"
         "  --random-tris N\n"
+        "  --buildings N                  city 的楼数（每栋 10 个三角形），default 65536\n"
         "  --query rays|closest           default rays\n"
         "  --rays N                       default 200000\n"
         "  --points N                     closest 模式的查询点数，default 20000\n"
@@ -73,6 +75,10 @@ bool parseArgs(int argc, char** argv, Options& opt) {
             const char* v = value();
             if (!v) return false;
             opt.randomTris = std::atoi(v);
+        } else if (arg == "--buildings") {
+            const char* v = value();
+            if (!v) return false;
+            opt.buildings = std::atoi(v);
         } else if (arg == "--rays") {
             const char* v = value();
             if (!v) return false;
@@ -237,7 +243,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed};
+    const SceneSpec spec{opt.scene, opt.grid, opt.randomTris, opt.seed, opt.buildings};
     const Scene scene = buildScene(spec);
     const std::vector<Ray> rays =
         opt.query == "rays" ? makeRays(scene.bounds, opt.mode, opt.rays, opt.seed)

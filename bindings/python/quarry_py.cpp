@@ -854,12 +854,14 @@ py::tuple demoGaussians(const std::string& kind, int count, uint64_t seed) {
     return py::make_tuple(means, rot, scale);
 }
 
-py::tuple demoMesh(const std::string& kind, int grid, int randomTris, uint64_t seed) {
+py::tuple demoMesh(const std::string& kind, int grid, int randomTris, uint64_t seed,
+                   int buildings) {
     SceneSpec spec;
     spec.kind = kind;
     spec.grid = grid;
     spec.randomTris = randomTris;
     spec.seed = seed;
+    spec.buildings = buildings;
     const ::Scene scene = buildScene(spec);
 
     const py::ssize_t m = static_cast<py::ssize_t>(scene.tris.size());
@@ -895,7 +897,7 @@ PYBIND11_MODULE(quarry, m) {
         "CUDA device string, or an empty string when no GPU is available");
 
     m.def("demo_mesh", &demoMesh, py::arg("kind") = "terrain", py::arg("grid") = 64,
-          py::arg("random_tris") = 0, py::arg("seed") = 1,
+          py::arg("random_tris") = 0, py::arg("seed") = 1, py::arg("buildings") = 65536,
           "Return (vertices (N,3) float32, indices (M,3) int32) for a demo scene");
 
     m.def("demo_gaussians", &demoGaussians, py::arg("kind") = "sheet", py::arg("count") = 131072,
