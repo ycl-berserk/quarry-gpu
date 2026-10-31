@@ -31,6 +31,11 @@ jobs:
       - name: Check package config
         run: Get-ChildItem install/lib/cmake/quarry
 
+      - name: Build example consumer
+        run: |
+          cmake -S examples -B examples/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/install"
+          cmake --build examples/build --config Release
+
   linux:
     runs-on: ubuntu-latest
 
@@ -48,3 +53,9 @@ jobs:
 
       - name: Install
         run: cmake --install build --prefix install
+
+      # CPU-only 安装没有 quarry::gpu，示例应自动退回 quarry::core。
+      - name: Build example consumer
+        run: |
+          cmake -S examples -B examples/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/install"
+          cmake --build examples/build -j
