@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/ycl-berserk/quarry-gpu/actions/workflows/build.yml/badge.svg)](https://github.com/ycl-berserk/quarry-gpu/actions/workflows/build.yml)
 
-GPU 原生空间查询引擎：构建加速结构（BVH / 八叉树 / 哈希网格），支持射线求交、kNN、半径查询、AABB 查询，图元覆盖三角形、点云、高斯，并支持增量更新。
+GPU 原生空间查询引擎：在 GPU 上并行构建层次包围盒（LBVH，可选分箱 SAH），支持射线求交、
+closest、kNN 与半径查询，图元覆盖三角形、点云、高斯，并支持增量更新（refit 与增删改拓扑）。
 
 许可证 Apache-2.0（见 `LICENSE`）。CPU 参考实现已完整；GPU 侧（CUDA 12.4，sm_89）已有
 并行 LBVH 构建、光线遍历、closest / kNN / radius 三条点查询路径，拓扑冻结的增量更新
