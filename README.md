@@ -65,7 +65,15 @@ target_link_libraries(app PRIVATE quarry::gpu)   # 只用 CPU 参考实现就换
 
 完整签名与语义见 [docs/api.md](docs/api.md)；[examples/](examples/) 是一个独立
 CMake 工程，只依赖安装前缀，`cmake -S examples -B examples/build
--DCMAKE_PREFIX_PATH=C:\quarry` 即可编译，同时演示 CPU 对拍与 GPU 建树 / 查询 / refit。
+-DCMAKE_PREFIX_PATH=C:\quarry` 即可编译，产出两个程序：
+
+- `quarry_example`：CPU 真值 vs GPU 建树 / 射线 / 最近点对拍，以及局部 refit 后校验；
+- `dynamic_scene`：80 帧动态场景（131k 三角形地形 + 漂浮八面体碎片）。72 帧只
+  移动走 refit，8 帧生灭走拓扑手术；逐帧跑 2 万条射线与 2000 个最近点，每 10 帧
+  用 CPU BVH 对拍，最后要求增量树的查询结果与全新构建逐位相同。
+
+RTX 4060 Laptop 上的参考数字：refit 中位数约 0.2 ms，全新构建约 1.6–2.3 ms；
+拓扑手术约 2.3–3.6 ms——这个规模下 relayout 是 O(n)，不比重建快，但结果逐位精确。
 为什么这么设计、哪些方案被否决，见 [docs/design.md](docs/design.md)。
 
 ## 现在能跑什么
@@ -97,6 +105,12 @@ build\gpu_gauss_bench.exe --gaussians 131072 --queries 20000                :: �
 build\gpu_gauss_bench.exe --gaussians 1048576 --queries 20000 --query knn --k 8
 build\gpu_gauss_bench.exe --kind volume --gaussians 1048576 --query radius --radius 1.0
 build\gpu_gauss_bench.exe --gaussians 1048576 --refit --refit-dirty 0.01 --refit-motion coherent
+
+:: 外部消费端示例（先 cmake --install build --prefix C:\quarry）
+cmake -S examples -B examples\build -DCMAKE_PREFIX_PATH=C:\quarry
+cmake --build examples\build --config Release
+examples\build\quarry_example.exe
+examples\build\dynamic_scene.exe
 ```
 
 输出包含一个**正确性指纹**（每条射线的命中标志 + t 值，按 FNV-1a 折叠）：
