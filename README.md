@@ -61,6 +61,10 @@ target_link_libraries(app PRIVATE quarry::gpu)   # 只用 CPU 参考实现就换
 没有 CUDA 时 `quarry::gpu` 不存在，`quarry::core` 仍然可用；`-DQUARRY_BENCH=OFF`
 可以跳过 CLI、基准与测试，只编译库。
 
+完整签名与语义见 [docs/api.md](docs/api.md)；[examples/](examples/) 是一个独立
+CMake 工程，只依赖安装前缀，`cmake -S examples -B examples/build
+-DCMAKE_PREFIX_PATH=C:\quarry` 即可编译，同时演示 CPU 对拍与 GPU 建树 / 查询 / refit。
+
 ## 现在能跑什么
 
 ```bat
@@ -478,7 +482,8 @@ py -3.13 python/test_quarry.py   :: 与 numpy 暴力法对拍（84 项检查）
   墙钟中位数 1.44 ms，内核 1.29 ms，**Python 侧固定开销约 0.14 ms**。
 - 进程里**第一个** `Scene` 还要付一次 CUDA 模块懒加载，约 0.5 s 墙钟，而它报告
   的 `build_ms` 只有 2 ms——计时数字对得上内核，对不上你的 `time.perf_counter()`。
-- 每个查询调用内部同步一次，返回即可读；还没有异步 API。
+- 每个查询调用内部同步一次，返回即可读；还没有异步 API。完整参数、返回格式与
+  C++ 对应关系见 [docs/api.md](docs/api.md)。
 
 ## 增量更新（refit）
 
@@ -658,6 +663,8 @@ src/gpu/      CUDA：并行 LBVH（lbvh.cu，按 Ops 服务三角形 / 点 / 高
 src/cli/      quarry 命令行
 bindings/     pybind11 绑定（quarry_py.cpp）
 bench/        Embree 对照、Warp / scipy 对照与 gpu_*_bench（同一份输入，二进制转储互通）
+examples/     独立 CMake 消费端示例（只依赖安装前缀）
+docs/         API 参考与基准记录
 python/       Python 侧的用法示例与 numpy 对拍
 tests/        自测入口
 learn/        教程配套的单文件练习
