@@ -400,6 +400,36 @@ hit, t = scene.closest(points, order="morton")   # 默认 order="input"
 scene = quarry.Scene(v, f, builder="sah")   # 默认 builder="lbvh"
 ```
 
+## 与 Warp / cuBQL 同场对照（2026-10-31）
+
+同一份地形（quarry 的 `demo_mesh`）、同一批 20k 查询，三方各走官方路径：Warp
+1.13.0（`wp.Mesh` + Warp 自己的遍历）、NVIDIA cuBQL（`bench/cubql_bench.cu` 直接
+链头文件，原生构建与遍历）、quarry（Python 绑定，CUDA events 计时）。5 轮中位数、
+同会话成对测量；完整口径与 131k 数据见 `docs/baseline.md`。
+
+| 2.1M 三角形 | quarry SAH | cuBQL median | cuBQL SAH | Warp median | Warp sah |
+|---|---|---|---|---|---|
+| 构建 | **11.5–12.1 ms** | 22.5–25.0 | 163–164 | 696–727 | 954–963 |
+| closest 20k | 7.6 | 7.2 | 6.3 | **4.6–4.8** | 4.6 |
+| ray 20k | 0.35–0.37 | **0.083–0.098** | 0.083 | 0.43 | 0.43–0.49 |
+
+- **构建是明确优势**：2M 比 cuBQL 默认构建器快 2×、比其 SAH 快 14×、比 Warp 快
+  60–80×（131k 上与 cuBQL 的默认构建器打平，仍比 Warp 快 17–23×）。
+- **closest 与 cuBQL 打平，落后 Warp 1.4–1.6×**：Warp 是 SAH + 每叶 4 图元。
+- **ray 落后原生 cuBQL 3.5–4.4×**，但比 Warp 的遍历快 1.2–1.4×（2M）。cuBQL 的射线
+  遍历是专门实现，我们不在这一格宣称领先；卖点是构建、统一接口与增量更新。
+- Warp 的 `cubql` 后端只是**构建器**且仅支持射线查询（closest 走它会静默返回
+  miss），所以 closest 没有 cubql 列；Warp 的 "cubql" 构建仍比原生 cuBQL 慢 7–8×。
+- 校验和：命中数与距离/t 之和与 quarry 一致；Warp 侧距离最大误差 3.3e-6。
+
+```bat
+py -3.13 -m pip install warp-lang==1.13.0
+py -3.13 bench\head2head_warp.py --grid 1024 --points 20000 --backend sah
+git clone --depth 1 https://github.com/NVIDIA/cuBQL out\vendor\cuBQL
+bench\build_cubql.bat
+py -3.13 bench\head2head_cubql.py --grid 256 1024
+```
+
 ## Python 绑定
 
 有 Python 3.8+ 和 `pip install pybind11 numpy` 时，`build.bat` 会顺带把扩展模块建到
@@ -641,8 +671,9 @@ learn/        教程配套的单文件练习
 - GPU 射线排序已实现，但只对相干主射线有效；非相干射线需要两遍遍历（先取命中点
   再排序），未做。内联子节点包围盒（64B 布局）实测为负结果，已回退
 - 场景类型只有地形网格和随机三角形，缺非均匀模型（Dragon/Lucy）与多层遮挡
-- closest 已和 Embree 32 线程（3.0–16.3×）与 Warp 1.6.2（0.72–1.15×）对拍；
-  kNN / 半径在两家外部库里都没有原生入口，只有自家 CPU 参考
+- closest 已和 Embree 32 线程（3.0–16.3×）、Warp 1.6.2（0.72–1.15×）与 Warp 1.13
+  / cuBQL（2026-10-31 节）对拍；kNN / 半径在两家外部库里都没有原生入口，只有
+  自家 CPU 参考
 - 点云查询没有 Embree 对照物（`rtcPointQuery` 只吃三角形）；基线是自写的单线程
   kd-tree，另有 scipy `cKDTree` 作第二把尺子。scipy 在 2D 流形数据上会退化
   （10M 慢 72×），所以 headline 倍数只用自家 kd
@@ -665,7 +696,9 @@ learn/        教程配套的单文件练习
   1.7× 同场景新鲜树），靠深度上限触发整树重建兜底，"升一级切分"未做
 - BVH 每叶 1 个三角形，2M 场景 419 万节点；Morton 叶子批量（4–8 个/叶）实测
   遍历更慢（射线 2.2×、kNN 1.8×），已回退。BVH4 宽节点（`--wide`）与自顶向下
-  分箱 SAH（`--sah`）都已落地，查询侧已追平 Warp，剩余差距在构建速度；
+  分箱 SAH（`--sah`）都已落地：对 Warp 1.13 是 closest 落后 1.4–1.6×、ray 领先
+  1.2–1.4×、构建领先 14–80×；对 cuBQL 是构建领先、closest 打平、ray 落后
+  3.5–4.4×。
   每叶 4 个图元（Warp 的形态）未做
 - 宽节点 + refit 已接：局部路径重发脏祖先所在的宽节点，小树/大改动走整层重发；
   代价是每次 refit 多 0.13–2.0 ms（2M 全量约 1.4 ms）。射线已 Morton 排序时

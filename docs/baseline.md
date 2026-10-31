@@ -1045,6 +1045,75 @@ build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind
 build\gpu_query_bench.exe --grid 256 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.05 --topo-mix mixed --topo-rounds 100
 ```
 
+## 外部对照：Warp 1.13 与 cuBQL（2026-10-31）
+
+三方用同一份地形（quarry 的 `demo_mesh`）与同一批 20k 查询：131k 三角形
+（`--grid 256`）与 2.1M（`--grid 1024`）。closest 查询点均匀落在包围盒内；射线从
+包围盒内出发、方向为随机单位向量（约一半不命中）。5 轮中位数，同一次会话内成对跑。
+
+- **quarry**：`bench/head2head_warp.py` / `bench/head2head_cubql.py`。查询是
+  `last_query_ms`（CUDA events，不含拷贝）；构建是第二次 `Scene(...)` 的墙钟
+  （已排除 CUDA 模块加载）。
+- **Warp 1.13.0**：`wp.Mesh` + Warp 自己的遍历（`wp.mesh_query_point_no_sign` /
+  `wp.mesh_query_ray`）。构建是 `wp.Mesh(...)` 的墙钟（含上传），3 轮中位数。
+  选 1.13 而不是最新 1.18：1.18 要求驱动 13.0，本机是 12.6。
+- **cuBQL**：`bench/cubql_bench.cu` 直接链 NVIDIA/cuBQL 头文件（原生，不经过
+  Warp）。构建计时含每图元盒生成与 `gpuBuilder`；查询是 CPAT（closest）与
+  `shrinkingRayQuery` + Möller–Trumbore（ray）的 kernel 时间。默认
+  SPATIAL_MEDIAN 与 `--sah` 两种构建器都测。
+
+### 构建（ms）
+
+| 三角形 | quarry SAH | cuBQL median | cuBQL SAH | Warp median | Warp sah | Warp cubql |
+|---|---|---|---|---|---|---|
+| 131k | 1.7–2.3 | 1.9–2.5 | 16.4–17.1 | 36.1–36.8 | 49.4–51.3 | 16.5 |
+| 2.1M | 11.5–12.1 | 22.5–25.0 | 163–164 | 696–727 | 954–963 | 171–177 |
+
+小场景与 cuBQL 的 median 打平（2.1 vs 1.9），2M 上快 2.0–2.2×；对 cuBQL 的 SAH
+快 14–15×；对 Warp 的三种构建器快 14–80×。Warp 的 `cubql` 构建器仍比原生 cuBQL
+慢 7–8×，时间花在 Warp 自己的 mesh 预处理上，不是 cuBQL 构建。
+
+### 查询（ms / 20k）
+
+closest：
+
+| 三角形 | quarry | cuBQL median | cuBQL SAH | Warp median | Warp sah |
+|---|---|---|---|---|---|
+| 131k | 1.29–1.44 | 1.48–1.71 | 1.39–1.61 | 0.79 | 0.81 |
+| 2.1M | 6.5–7.6 | 6.31–7.23 | 6.31 | 4.59–4.78 | 4.59 |
+
+ray：
+
+| 三角形 | quarry | cuBQL median | cuBQL SAH | Warp median | Warp sah | Warp cubql |
+|---|---|---|---|---|---|---|
+| 131k | 0.25–0.35 | 0.072–0.076 | 0.063–0.069 | 0.27–0.29 | 0.27–0.29 | 0.27 |
+| 2.1M | 0.34–0.37 | 0.098 | 0.083 | 0.43 | 0.43–0.49 | 0.255 |
+
+读法：
+
+1. **closest 与 cuBQL 打平（0.85–1.05×），落后 Warp 1.4–1.6×**。Warp 是每叶
+   4 图元 + SAH，这正是此前量过的树质量差距；我们的遍历骨架没有问题。
+2. **ray 落后原生 cuBQL 3.5–4.4×**，但比 Warp 自己的遍历快 1.2–1.4×（2M）。cuBQL 的
+   射线遍历是 Ingo Wald 的主赛道，不应在此宣称领先；对外叙事仍应落在"构建 +
+   统一查询 + 增量更新"。
+3. **Warp 的 `cubql` 构建器只支持射线查询**（`warp/_src/types.py`：
+   "only ray query APIs are supported"），closest 走该后端会静默返回 miss，所以
+   closest 表没有 cubql 列。Warp 的 "cubql" 指构建器；遍历仍是 Warp 自己的。
+4. **口径**：quarry 构建是墙钟（含上传/分配），cuBQL 是 events（含盒生成、不含
+   上传），Warp 是墙钟（含上传）。跨实现只能看量级，同会话倍数才是结论。
+5. 校验和门槛：两种查询、两个规模、两个 cuBQL 构建器，命中数与距离/ t 之和
+   与 quarry 一致（`checks ok`）；Warp 侧距离最大误差 3.3e-6、射线 t 最大误差
+   3.8e-5，命中集合完全一致。
+
+复现：
+
+```bat
+out\venv\Scripts\python.exe bench\head2head_warp.py --grid 256 --points 20000 --backend sah
+out\venv\Scripts\python.exe bench\head2head_warp.py --grid 1024 --points 20000 --query ray --backend cubql
+out\build_cubql.bat
+out\venv\Scripts\python.exe bench\head2head_cubql.py --grid 256 1024
+```
+
 ## 结论
 
 1. **CPU 吞吐随场景大小塌陷一个数量级。** 13 万三角形受缓存保护，32 线程能到 96 Mrays/s；200 万三角形掉到 19.7，属于结构性访存受限，增加线程无用。
@@ -1107,6 +1176,10 @@ build\gpu_query_bench.exe --grid 256 --points 20000 --no-cpu --topo --topo-kind 
     高斯三条查询 1.24–1.38×。结构上对齐 Embree 的 BVH4 传统，但仍是单射线/单查询
     与 Morton 划分，不能据此宣称追平 Embree。refit 也接上了：结束时重发受影响的
     宽节点，2M 局部多付 0.40 ms、全量多付 1.37 ms，之后查询仍有 1.4–1.5×。
+17. **与最新外部实现的定位**（2026-10-31，Warp 1.13 / NVIDIA cuBQL）：构建是
+    我们的强项（2M 比 cuBQL median 快 2×、比其 SAH 快 14×、比 Warp 快 60–80×）；
+    closest 与 cuBQL 打平、落后 Warp 1.4–1.6×；ray 落后 cuBQL 3.5–4.4×、领先 Warp
+    1.2–1.4×。不要再用"查询全面领先"的表述；空位在"构建 + 多图元统一接口 + 增量更新"。
 
 
 ## 正确性交叉核对
@@ -1248,9 +1321,11 @@ py -3.13 bench\warp_query_bench.py --dump out\qry_2m.bin --runs 5
 - 射线排序已完成（原点/方向 Morton 序），但只对相干主射线有效；非相干射线需要
   "先粗遍历取命中点、再按命中点排序"的两遍方案，未做
 - 内联子节点包围盒（64B 布局）实测是负结果，已回退；131k 的差距靠射线排序解决
-- 外部 GPU 对照：射线侧只有 CPU 的 Embree，Warp `bvh.ray_trace` 对照待 M1
-- 点查询外部对照只有 closest（Embree `rtcPointQuery` 与 Warp `mesh_query_point`）；
-  kNN / radius 在 Embree 和 Warp 里都没有原生入口
+- 外部 GPU 对照已补 Warp 1.13 与原生 cuBQL（2026-10-31 节）：cuBQL 的构建、
+  closest、ray 都有数；Warp 1.18 因驱动 13.0 要求暂不可用，只能停在 1.13
+- 点查询外部对照只有 closest（Embree `rtcPointQuery`、Warp `mesh_query_point`、
+  cuBQL CPAT）；kNN / radius 在 Embree 和 Warp 里都没有原生入口，cuBQL 只有
+  "半径内是否存在"（`anyWithinRadius`），语义不同，未纳入对照
 - 点云查询**没有 Embree / Warp 基线**（两者都没有点云图元）。分母是自写中位数切分
   kd-tree 与 scipy `cKDTree`；后者在 2D 流形点云（sheet）上退化，只有体积点云上是
   正常对照
@@ -1260,8 +1335,8 @@ py -3.13 bench\warp_query_bench.py --dump out\qry_2m.bin --runs 5
 - 高斯每个 40 字节，10M 是 400 MB 载荷 + 640 MB 节点内存；无叶子批量
 - 椭球距离固定 14 轮、无提前退出（CPU/GPU 逐位一致的代价），最差距离误差 1.7e-7
 - Morton 叶子批量（4–8 图元/叶）实测负结果，已回退到每叶 1 个；BVH4 宽节点与
-  自顶向下分箱 SAH 都已落地，查询侧追平 Warp；差距剩在构建（Warp 每叶 4 图元、
-  构建快 3–8 倍）
+  自顶向下分箱 SAH 都已落地。对 Warp 1.13：closest 落后 1.6×、ray 领先 1.2×，
+  构建领先 14–80×；对 cuBQL：构建领先、closest 打平、ray 落后 3.5–4.4×
 - SAH 只在 1 叶 1 图元下验证；每叶 4 图元要改叶子盒、四条查询内核的叶子分支与
   校验器，未做。分箱在 2M 占构建的 43%，仍是每层全数组扫描
 - 查询排序只在 ≥10 万查询的三角形场景证明有效；20k 低占用下的延迟假说未做单独
