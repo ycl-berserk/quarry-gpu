@@ -16,7 +16,9 @@ Morton 序重排（`--query-sort` / Python 的 `order="morton"`），二叉节�
 
 ## 安装
 
-两条路径，都从源码构建；发布包尚未上传 PyPI。
+两条路径。v1.0.0 的 Windows wheel（CPython 3.13、sm_89）挂在
+[Releases](https://github.com/ycl-berserk/quarry-gpu/releases/tag/v1.0.0)；其余平台
+与显卡架构从源码构建，尚未上传 PyPI。
 
 ### Python
 
@@ -64,6 +66,7 @@ target_link_libraries(app PRIVATE quarry::gpu)   # 只用 CPU 参考实现就换
 完整签名与语义见 [docs/api.md](docs/api.md)；[examples/](examples/) 是一个独立
 CMake 工程，只依赖安装前缀，`cmake -S examples -B examples/build
 -DCMAKE_PREFIX_PATH=C:\quarry` 即可编译，同时演示 CPU 对拍与 GPU 建树 / 查询 / refit。
+为什么这么设计、哪些方案被否决，见 [docs/design.md](docs/design.md)。
 
 ## 现在能跑什么
 
@@ -664,7 +667,7 @@ src/cli/      quarry 命令行
 bindings/     pybind11 绑定（quarry_py.cpp）
 bench/        Embree 对照、Warp / scipy 对照与 gpu_*_bench（同一份输入，二进制转储互通）
 examples/     独立 CMake 消费端示例（只依赖安装前缀）
-docs/         API 参考与基准记录
+docs/         API 参考、设计决策与基准记录
 python/       Python 侧的用法示例与 numpy 对拍
 tests/        自测入口
 learn/        教程配套的单文件练习
