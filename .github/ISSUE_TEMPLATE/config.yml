@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/ycl-berserk/quarry-gpu/blob/main/docs/api.md
+    about: API reference, design rationale and the measurement log
+  - name: Security report
+    url: https://github.com/ycl-berserk/quarry-gpu/security/advisories/new
+    about: Please report vulnerabilities privately

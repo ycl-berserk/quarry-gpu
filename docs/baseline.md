@@ -1045,6 +1045,90 @@ build\gpu_query_bench.exe --grid 1024 --points 20000 --no-cpu --topo --topo-kind
 build\gpu_query_bench.exe --grid 256 --points 20000 --no-cpu --topo --topo-kind cluster --topo-frac 0.05 --topo-mix mixed --topo-rounds 100
 ```
 
+## 城市场景：非均匀尺度 + 多层遮挡（2026-10-31）
+
+前面所有场景都是"一个地形面 + 随机朝向"或"随机三角形汤"：尺度均匀，命中率要么
+100% 要么约 1/3，没有真正的遮挡层次。城市场景补上这一块：起伏地面上按抖动网格
+排楼，每栋 10 个三角形（4 面墙 + 屋顶，无底面），高度 `4 + 56u³`（u 均匀，
+所以高楼下少、上多），footprint 1.5–5，楼间距 8，场地边长随 `sqrt(楼数)` 放大。
+默认 131,072 栋 = 1,343,488 个三角形，跨度约 ±1452。射线从高处打下来会连续穿过
+多栋楼，这是 LBVH 与 SAH 差距最大的形态。
+
+`gpu_bench.exe --scene city --buildings 131072 --rays 1000000`，RTX 4060 Laptop，
+3 s DVFS 预热，5 轮中位数。**所有配置逐条对拍 `hit_mismatch=0 t_mismatch=0`。**
+
+构建：
+
+| 指标 | LBVH | 分箱 SAH | Embree 4.4.1 |
+|---|---|---|---|
+| 构建总时间 | **7.6–8.2 ms** | 24.4–26.5 ms | 30.0–46.6 ms |
+| 其中建树 | 0.9 ms | 19.4–20.6 ms | — |
+| 树深 | 29 | 23 | — |
+| 节点数 | 2,686,975 | 2,686,975 | — |
+
+射线（1M 条，输入序；SAH 行是同一次会话内成对跑）：
+
+| 配置 | 遍历 | 吞吐 | 平均节点测试 | 平均三角形测试 |
+|---|---|---|---|---|
+| LBVH down | 29.36 ms | 34.06 Mrays/s | 173.3 | 2.1 |
+| LBVH random | 19.10 ms | 52.35 Mrays/s | — | — |
+| LBVH random + ray-sort | 16.73 ms | 59.78 Mrays/s | — | — |
+| LBVH down + wide | 22.25 ms | 44.95 Mrays/s | — | — |
+| **SAH down** | **4.25 ms** | **235.26 Mrays/s** | **28.4** | 2.1 |
+| SAH random | 5.22 ms | 191.72 Mrays/s | — | — |
+| SAH random + ray-sort | 5.34 ms | 187.13 Mrays/s | — | — |
+| Embree 1T down | 240.89 ms | 4.15 Mrays/s | — | — |
+| Embree 32T packet down | 14.54 ms | 68.79 Mrays/s | — | — |
+| Embree 1T random | 139.02 ms | 7.19 Mrays/s | — | — |
+| Embree 32T packet random | 11.76 ms | 85.03 Mrays/s | — | — |
+
+- **同一个指纹**：LBVH 与 SAH 的 `hash=0xa4ab101bbfac8439`（down，hits=1,000,000）
+  完全相同，SAH 的收益完全来自树质量。节点测试 173.3 → 28.4，遍历 6.2×。
+- **城市是 SAH 的主场**：SAH 比 Embree 32T packet 快 3.42×（down）/ 2.25×（random），
+  比 1T 快 57× / 27×。地形上 LBVH 与 SAH 只在 1.1–3.7× 内，城市拉到 6.9×
+  （down）——遮挡让平衡划分的回报远大于 Morton 序。
+- **LBVH 仍然适合"建得快"**：7.6 ms 建 1.34M 三角形，是 SAH 的 1/3、Embree 的
+  1/4–1/6；但输入序遍历只有 Embree 32T 的 0.50×（down）/ 0.62×（random）。
+  默认路径不装 SAH，正是这个取舍。
+- 射线排序在 SAH 上无收益（191.72 → 187.13），树够好时相干性已经不是瓶颈。
+- 宽节点（4 宽，基于 LBVH）把 down 从 34.06 提到 44.95 Mrays/s；树质量差的树
+  收益来自减少节点测试次数，与前面的宽节点结论一致。
+
+点查询（20,000 点，默认 LBVH）：
+
+| 查询 | GPU | CPU 参考 | 加速 | Embree 1T | Embree 32T | 对 32T |
+|---|---|---|---|---|---|---|
+| closest | 0.996 ms (20.08 Mq/s) | 53.76 ms (0.37) | 54× | 0.70 Mq/s | 4.19 Mq/s | **4.8×** |
+| kNN k=8 | 1.966 ms (10.17 Mq/s) | 91.87 ms (0.22) | 46.7× | — | — | — |
+| radius r=2.0 | 0.916 ms (21.82 Mq/s) | 11.61 ms (1.72) | 12.7× | — | — | — |
+
+`tri_mismatch=0 dist2_mismatch=0 count_mismatch=0`。Embree 构建为 31.4–34.4 ms，
+closest 同一次会话内成对跑。城市与地形的 closest 关系不同：地形 131k 上
+quarry 对 Embree 32T 是 4.2×，城市 1.34M 上仍是 4.8×，说明遮挡没有削弱 GPU
+点查询的优势。
+
+### 求交的一个鲁棒性修正
+
+城市的第一版在 random 1M 里出现 1 条 CPU/GPU 不一致：CPU 与暴力法选中三角形
+103892（t=6543.13），GPU 选中旁边屋顶的 103896（t=6543.59）。复现后确认根因不是
+遍历，而是 **Möller–Trumbore 在远距离、大坐标下的叉积抵消**：这条射线的命中点
+实际落在墙顶边上 0.0126 个世界单位之外，`tv × dir` 的抵消让 u/v 判断把它判成
+命中；三角形自包围盒（轴对齐、精确）判 miss，GPU 的单三角形紧叶盒据此把它剪掉，
+CPU 的多三角形松叶盒则测到了它。
+
+修法两步，都在 `src/core/geometry.h`：
+
+1. `intersectAABB` 的区间判空留相对余量（`t0 > t1*(1+1e-6)+1e-6`），避免零厚度
+   墙/地面的舍入把擦边命中剪掉；
+2. `intersectTriangle` 在通过 u/v/t 后，再要求命中参数落在**三角形自包围盒的 slab
+   区间**内（`hitParamInsideBox`）。这把"命中 ⇒ 点在盒内"变成谓词的一部分，
+   紧叶盒不可能剪掉暴力法会报告的命中。
+
+第 2 步让那次误判被 CPU、GPU、暴力法**一致地拒绝**（hits 从 328756 降到 328755），
+三方指纹重新逐位相同。代价是每次成功求交多一次 slab 测试（3 次除法），实测在
+DVFS 噪声内（同一二进制自身都有 89–106 Mrays/s 的波动）。对拍不再有容差：
+城市三档射线、地形/随机/混合、动态场景全部 `0/1M`。
+
 ## 外部对照：Warp 1.13 与 cuBQL（2026-10-31）
 
 三方用同一份地形（quarry 的 `demo_mesh`）与同一批 20k 查询：131k 三角形
@@ -1313,8 +1397,9 @@ py -3.13 bench\warp_query_bench.py --dump out\qry_2m.bin --runs 5
 
 ## 已知缺口
 
-- 只有两种几何（地形网格、随机三角形），缺非均匀模型（Stanford Dragon / Lucy）
-- 命中率只有 100%（垂直向下）和约 31%（远处随机朝向），缺多层遮挡
+- 有三种程序化几何（地形网格、随机三角形、城市楼群），但缺真实扫描/重建网格
+  （Stanford Dragon / Lucy 等）；城市场景已覆盖非均匀尺度与多层遮挡，命中率
+  100%（down）与 32.9%（random）
 - 只有一个 GPU 型号，每瓦数据要等 M1
 - GPU 侧已覆盖射线求交与 closest / kNN / radius；kNN 的 k 上限 32（每线程定长表），
   radius 每条查询的结果数不设上限但长段会退回 CUB 分段排序

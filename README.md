@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/ycl-berserk/quarry-gpu/actions/workflows/build.yml/badge.svg)](https://github.com/ycl-berserk/quarry-gpu/actions/workflows/build.yml)
 
+**English**：[README.en.md](README.en.md)
+
 GPU 原生空间查询引擎：在 GPU 上并行构建层次包围盒（LBVH，可选分箱 SAH），支持射线求交、
 closest、kNN 与半径查询，图元覆盖三角形、点云、高斯，并支持增量更新（refit 与增删改拓扑）。
 
@@ -80,7 +82,7 @@ RTX 4060 Laptop 上的参考数字：refit 中位数约 0.2 ms，全新构建约
 
 ```bat
 build.bat                                  :: CMake + Ninja（用 VS 2022 自带的，无需另装）
-build\quarry.exe selftest                  :: 正确性自测（43 项）
+build\quarry.exe selftest                  :: 正确性自测（50 项）
 build\quarry.exe run --scene terrain --grid 256 --rays 1000000 --engine bvh
 build\quarry.exe query --type closest --grid 256 --points 20000 --stats
 build\quarry.exe query --type knn --k 16 --grid 256 --points 20000
@@ -95,6 +97,9 @@ build\gpu_query_bench.exe --grid 1024 --points 100000 --query-sort           :: 
 build\gpu_bench.exe --grid 1024 --rays 1000000 --runs 5 --wide              :: 4 宽节点折叠后再遍历（--ray-sort 叠加）
 build\gpu_query_bench.exe --grid 1024 --points 100000 --wide --query-sort   :: 宽节点 + 查询重排（可叠加）
 build\gpu_query_bench.exe --grid 1024 --points 20000 --runs 5 --sah --stats :: 自顶向下分箱 SAH 建树（默认 LBVH），查询逐点对拍 CPU
+build\gpu_bench.exe --scene city --buildings 131072 --rays 1000000 --runs 5 :: 城市楼群（1.34M 三角形，非均匀尺度 + 多层遮挡）
+build\gpu_bench.exe --scene city --buildings 131072 --rays 1000000 --sah    :: 城市上 SAH vs LBVH，遍历 6.9×
+build\gpu_query_bench.exe --scene city --buildings 131072 --points 20000 --query knn --k 8
 
 build\gpu_cloud_bench.exe --points 131072 --queries 20000                   :: 点云 closest，GPU 对 kd-tree
 build\gpu_cloud_bench.exe --points 1048576 --queries 20000 --query knn --k 8
@@ -209,6 +214,47 @@ Embree `rtcPointQuery`、Warp 1.6.2（`wp.mesh_query_point_no_sign`）对照；k
   kNN / radius 的 CPU 参考是 0.2–1.8 Mq/s，GPU 快 6–21×。
 - **注意精度口径**：quarry 的结果与 CPU 参考逐位相同；Warp 用 float32 重建最近点，
   选中的三角形一致但距离末几位不同（200 个采样点上 `suboptimal=0`）。
+
+## 城市场景：非均匀尺度 + 多层遮挡（2026-10-31）
+
+前面的场景都是"一个地形面 + 随机朝向"或"随机三角形汤"，尺度均匀、没有真正的遮挡
+层次。城市场景补上这一块：起伏地面上按抖动网格排楼，每栋 10 个三角形（4 面墙 +
+屋顶），高度 `4 + 56u³`，footprint 1.5–5，楼间距 8。默认 131,072 栋 =
+1,343,488 个三角形，跨度约 ±1452；射线会连续穿过多栋楼。
+
+```bat
+build\gpu_bench.exe --scene city --buildings 131072 --rays 1000000 --runs 5
+build\gpu_bench.exe --scene city --buildings 131072 --rays 1000000 --runs 5 --sah
+build\gpu_query_bench.exe --scene city --buildings 131072 --points 20000
+```
+
+RTX 4060 Laptop，1M 射线，5 轮中位数，所有配置逐条对拍 CPU：
+
+| 配置 | 遍历 | 吞吐 | 构建 |
+|---|---|---|---|
+| LBVH down | 29.36 ms | 34.06 Mrays/s | **7.6–8.2 ms** |
+| LBVH random | 19.10 ms | 52.35 Mrays/s | 7.6–8.2 ms |
+| LBVH random + ray-sort | 16.73 ms | 59.78 Mrays/s | 7.6–8.2 ms |
+| **SAH down** | **4.25 ms** | **235.26 Mrays/s** | 24.4–26.5 ms |
+| SAH random | 5.22 ms | 191.72 Mrays/s | 24.4–26.5 ms |
+| Embree 32T packet down / random | 14.54 / 11.76 ms | 68.79 / 85.03 Mrays/s | 30–47 ms |
+
+- **城市是 SAH 的主场**：同一棵树换 SAH，down 的遍历从 34.06 提到 235.26 Mrays/s
+  （6.9×），平均节点测试 173.3 → 28.4，指纹逐位不变。地形上 SAH 与 LBVH 只差
+  1.1–3.7×，遮挡把平衡划分的回报放大了。
+- SAH 比 Embree 32T packet 快 **3.42×（down）/ 2.25×（random）**，比 1T 快
+  57× / 27×；LBVH 只赢构建（7.6 ms vs 30–47 ms）。
+- 点查询（20k 点）：closest 0.996 ms（对 CPU 54×、对 Embree 32T **4.8×**）、
+  kNN k=8 1.97 ms（46.7×）、radius r=2.0 0.916 ms（12.7×），全部
+  `mismatch=0`。
+- **顺带修掉一个求交鲁棒性问题**：首版 random 1M 里有 1 条射线 CPU/GPU 不一致。
+  根因是 Möller–Trumbore 在大坐标下的叉积抵消把一个在墙顶边外 0.0126 的点判成
+  命中，而紧叶盒（精确 AABB）判 miss。现在 `intersectTriangle` 会要求命中参数
+  落在三角形自包围盒的 slab 区间内，三方形（CPU BVH / GPU / 暴力法）一致拒绝
+  这个误判；全部场景重新回到 `0/1M`。细节见
+  [docs/baseline.md](docs/baseline.md#城市场景非均匀尺度--多层遮挡2026-10-31)。
+
+Python 侧同一份场景：`quarry.demo_mesh("city", buildings=131072)`。
 
 ## 点云（M2 前半，2026-10-29）
 

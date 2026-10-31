@@ -1,0 +1,56 @@
+name: Bug report
+description: Something is wrong, crashes, or a CPU/GPU result mismatches
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security issues, use private reporting instead: see SECURITY.md.
+        A mismatch (`mismatch != 0`) is the most valuable bug report you can send.
+  - type: input
+    id: version
+    attributes:
+      label: quarry version / commit
+      placeholder: v1.0.0 or git rev-parse HEAD
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      placeholder: RTX 4060 Laptop 8 GB, driver 566.36, CUDA 12.4
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or snippet
+      description: Exact command line or Python snippet, including scene size and seed.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: Paste the relevant output lines (histograms, mismatch counters, crashes).
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Build flags, custom scenes, whether it reproduces on other seeds/sizes.
+    validations:
+      required: false

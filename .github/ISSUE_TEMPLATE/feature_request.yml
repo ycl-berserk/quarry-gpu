@@ -1,0 +1,42 @@
+name: Feature request
+description: Propose a scene, query, backend or performance improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that quarry makes hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: API shape, kernel change, new scene, or measurement you would like to see.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Build (LBVH / SAH)
+        - Ray traversal
+        - Point / kNN / radius
+        - Incremental updates (refit / topology)
+        - Gaussians
+        - Python bindings
+        - Benchmarks / scenes
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Especially existing libraries or workarounds (Embree, Warp, cuBQL, ...).
+    validations:
+      required: false

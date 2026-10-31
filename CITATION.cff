@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use quarry in academic work, please cite it as below."
+title: "quarry: GPU-native spatial queries with incremental updates"
+abstract: >-
+  A GPU-native spatial query engine that builds BVHs (Karras LBVH or binned SAH) on the
+  device and answers ray, closest-point, kNN and radius queries over triangles, point
+  clouds and Gaussians. Supports refit and topology edits, and verifies results
+  bit-for-bit against a CPU reference.
+type: software
+authors:
+  - name: "ycl-berserk"
+repository-code: "https://github.com/ycl-berserk/quarry-gpu"
+url: "https://github.com/ycl-berserk/quarry-gpu"
+license: Apache-2.0
+version: 1.0.0
+date-released: "2026-10-31"
+keywords:
+  - bvh
+  - cuda
+  - ray-tracing
+  - nearest-neighbor
+  - point-cloud
+  - gaussian-splatting
+  - spatial-index

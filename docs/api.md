@@ -37,11 +37,18 @@ CPU/GPU 结果逐位一致。
 结果排序统一按 `(dist2, 场景索引)` 升序（`closerHit`）——距离并列时顺序也唯一，
 这是 CPU/GPU 指纹能对上的前提。
 
+`intersectTriangle` 除了 u/v/t 判断，还要求命中参数落在**三角形自包围盒**的 slab
+区间内。这不是额外的可见性规则，而是把"Möller–Trumbore 的浮点误差可能把盒外的点
+判进"收口：命中点必须在盒内，BVH 的紧叶盒才不会剪掉暴力法会报告的结果。大坐标、
+远距离的掠射射线会因此少掉极少数伪命中（实测约 1e-6），换来的是一致的 CPU/GPU
+结论。实现见 `hitParamInsideBox`。
+
 ### 可复现输入
 
 ```cpp
-SceneSpec spec;             // kind="terrain" | "random" | "mixed"
+SceneSpec spec;             // kind="terrain" | "random" | "mixed" | "city"
 spec.grid = 1024;           // terrain: 三角形数 = 2 * grid^2
+spec.buildings = 131072;    // city: 每栋 10 个三角形 + 128x128 地面
 Scene scene = buildScene(spec);
 
 auto rays = makeRays(scene.bounds, RayMode::Down, 1'000'000, /*seed=*/1);
@@ -282,6 +289,11 @@ print(quarry.describe()) # 设备字符串；空串表示没有 GPU
 ```python
 vertices, indices = quarry.demo_mesh(kind="terrain", grid=256, random_tris=0, seed=1)
 # vertices: (N,3) float32；indices: (M,3) int32
+# kind="terrain" | "random" | "mixed" | "city"
+
+vertices, indices = quarry.demo_mesh(kind="city", buildings=131072, seed=1)
+# 城市楼群：每栋 10 个三角形（4 面墙 + 屋顶），地面固定 128x128 地形。
+# 默认 65,536 栋；131,072 栋约 1.34M 个三角形，跨度约 ±1452。
 
 means, rot, scale = quarry.demo_gaussians(kind="sheet", count=131072, seed=1)
 # means: (N,3)，rot: (N,4) xyzw，scale: (N,3) 半轴
