@@ -430,7 +430,7 @@ int main() {
 
 ## 6. 版本与兼容
 
-- 当前版本 `1.0.0`，CMake 包按 `SameMajorVersion` 兼容（`find_package(quarry 1.0)`）。
+- 当前版本 `1.1.0`，CMake 包按 `SameMajorVersion` 兼容（`find_package(quarry 1.0)`）。
 - `GpuBVH` 内部字段（`d_*`、缓存、内存池）不属于公共 API，升级时可能变化；
   公开面是本文的函数签名、`primCount / nodeCount / depth` 与计时 / 编辑结构体。
 - Python 的 `__version__` 与包版本一致；wheel 的本地构建方式见 README「安装」。

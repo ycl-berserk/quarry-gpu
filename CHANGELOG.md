@@ -6,6 +6,8 @@ All notable changes to quarry are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-31
+
 ### Added
 
 - **City scene**: a rolling 128×128 ground plus tens of thousands of jittered buildings
@@ -47,5 +49,6 @@ First public release.
   (`quarry::core` / `quarry::gpu`) and a standalone consumer example.
 - CI on Windows (CPU + CUDA) and Linux (CPU-only).
 
-[Unreleased]: https://github.com/ycl-berserk/quarry-gpu/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/ycl-berserk/quarry-gpu/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/ycl-berserk/quarry-gpu/releases/tag/v1.1.0
 [1.0.0]: https://github.com/ycl-berserk/quarry-gpu/releases/tag/v1.0.0

@@ -18,8 +18,8 @@ Morton 序重排（`--query-sort` / Python 的 `order="morton"`），二叉节�
 
 ## 安装
 
-两条路径。v1.0.0 的 Windows wheel（CPython 3.13、sm_89）挂在
-[Releases](https://github.com/ycl-berserk/quarry-gpu/releases/tag/v1.0.0)；其余平台
+两条路径。v1.1.0 的 Windows wheel（CPython 3.13、sm_89）挂在
+[Releases](https://github.com/ycl-berserk/quarry-gpu/releases/tag/v1.1.0)；其余平台
 与显卡架构从源码构建，尚未上传 PyPI。
 
 ### Python

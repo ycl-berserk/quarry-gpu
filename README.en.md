@@ -48,7 +48,7 @@ float-robustness fix found by the city scene, are in
 ### Python
 
 A Windows wheel (CPython 3.13, sm_89) is on the
-[Releases](https://github.com/ycl-berserk/quarry-gpu/releases/tag/v1.0.0) page. Other
+[Releases](https://github.com/ycl-berserk/quarry-gpu/releases/tag/v1.1.0) page. Other
 platforms and GPU architectures build from source (CUDA 12.x, Python ≥ 3.9, a C++
 compiler; on Windows run from an **x64 Native Tools Command Prompt** or call
 `vcvars64.bat` first).
